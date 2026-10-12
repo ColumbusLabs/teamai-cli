@@ -212,7 +212,7 @@ Git hook 安装失败时，`hooks inject`、`init` 和单仓库自动初始化�
 
 在 Windows 上，经由 bash 执行的内置 hook 派发命令（如 Claude、Codex、Cursor、Copilot CLI）会以绝对路径引用 Git Bash——先查标准安装位置，再回退到 `HKLM\SOFTWARE\GitForWindows` 注册表——从而避免解析到 WSL 的 `bash.exe`；若找不到 Git Bash，则退回裸 `bash`。
 
-Cursor 也会加载 `~/.claude/settings.json`。Copilot CLI 会加载受信任项目里的 `.claude/settings.json`（self mode 把 hook 写在项目里；Copilot 不加载 `~/.claude/settings.json`）。只有另一边的 teamai hook 已经在磁盘上时，`hook-dispatch --tool claude` 才会退出：`~/.cursor/hooks.json` 或 `$CURSOR_PROJECT_DIR/.cursor/hooks.json` 含有 `--tool cursor`，或 `$COPILOT_PROJECT_DIR/.github/hooks/teamai.json` 含有 `--tool copilot`。写给 `claude` 的团队 hook 命令用同一判断。只启用了 Claude 时，Cursor 里这份 hook 照常运行，因为没有第二份可以接替。`COPILOT_CLI` 不能当信号：
+Cursor 也会加载 `~/.claude/settings.json`。Copilot CLI 会加载受信任项目里的 `.claude/settings.json`（self mode 把 hook 写在项目里；Copilot 不加载 `~/.claude/settings.json`）。只有另一边的 teamai hook 已经在磁盘上时，`hook-dispatch --tool claude` 才会退出：`~/.cursor/hooks.json` 或 `$CURSOR_PROJECT_DIR/.cursor/hooks.json` 含有 `--tool cursor`，或 `$COPILOT_HOME/hooks/`（默认 `~/.copilot/hooks/`）或 `$COPILOT_PROJECT_DIR/.github/hooks/` 中有效且未禁用的 version-1 JSON Hook 文件的命令含有 `--tool copilot`。无效的文件和设置了 `disableAllHooks` 的文件不会让 Claude Hook 退出，因为 Copilot 不会运行它们。self mode 只检查项目的 Copilot 目录：共享的全局内置 hook 会跳过 self 会话，因此不能接替本地的 Claude hook。写给 `claude` 的团队 hook 命令在 Copilot 下只有当 `$COPILOT_PROJECT_DIR/.github/hooks/` 中有效的 version-1 JSON 文件以相同的事件和 matcher 把同一条命令交给 Copilot 时才退出；全局文件不算数，所以只发给 Claude 的 hook，或以其他事件、matcher 发给 Copilot 的 hook，照常运行。只启用了 Claude 时，Cursor 里这份 hook 照常运行，因为没有第二份可以接替。`COPILOT_CLI` 不能当信号：
 
 Copilot 会给每个子进程设置它，包括从它的 shell 里启动的 Claude。Claude Code 不会设置 `CURSOR_VERSION` 或 `COPILOT_PROJECT_DIR`。已经装好的团队 hook 需要再跑一次 `teamai pull` 或 `teamai hooks inject`，才会带上这个判断。
 
@@ -228,7 +228,7 @@ Copilot 会给每个子进程设置它，包括从它的 shell 里启动的 Clau
 
 ### 团队 Hooks 声明
 
-团队可在仓库 `hooks/hooks.yaml` 中声明自定义 hooks，按 namespace 划分的写在 `hooks/<ns>/hooks.yaml`（见 [Env、hooks 与 MCP server 按 namespace 划分](./sharing.md#envhooks-与-mcp-server-按-namespace-划分)），`teamai pull` 会自动分发到支持团队 Hooks 的适配器。`builtin:` 只从 `hooks/hooks.yaml` 读取。Pi 目前仅支持 TeamAI 内置生命周期桥接；此文件中的自定义 Hooks 和内置 Hook 覆盖不会应用到 Pi。
+团队可在仓库 `hooks/hooks.yaml` 中声明自定义 hooks，按 namespace 划分的写在 `hooks/<ns>/hooks.yaml`（见 [Env、hooks 与 MCP server 按 namespace 划分](./sharing.md#envhooks-与-mcp-server-按-namespace-划分)），`teamai pull` 会自动分发到支持团队 Hooks 的适配器。`builtin:` 只从 `hooks/hooks.yaml` 读取。Pi 目前仅支持 TeamAI 内置生命周期桥接；此文件中的自定义 Hooks 和内置 Hook 覆盖不会应用到 Pi。非 self mode 下，Copilot 内置 Hook 由多个项目共用一个用户级文件：各项目的 `builtin.disabled` 在其事件触发时生效，但 `builtin.overrides` 的 timeout 不生效。无法解析的 `hooks/hooks.yaml` 不会禁用任何内置 Hook。
 
 ```yaml
 hooks:
@@ -434,6 +434,8 @@ models: how model: strong resolves for agents implementer, planner:
 
 ### GitHub Copilot CLI
 
+[VS Code Agent Host 中的 Copilot 会话](https://code.visualstudio.com/docs/agent-customization/hooks)与 Copilot CLI 使用同一套 Hook 实现。VS Code 的 Local harness 也会发现 `~/.copilot/hooks`，但事件和负载行为不同；CLI 验证不能替代该运行环境的验证。
+
 GitHub Copilot CLI 已支持其官方自定义指令、Rules、Skills、自定义 Agent、Hooks 和 MCP 配置面，以及 TeamAI Docs 和 Env 下发：
 
 - **作用域。** 用户资源位于 `$COPILOT_HOME`（默认 `~/.copilot`）下，项目资源位于 `<project>/.github` 下。TeamAI 在检测以及所有用户级读写中都会遵循 `COPILOT_HOME`。
@@ -443,7 +445,7 @@ GitHub Copilot CLI 已支持其官方自定义指令、Rules、Skills、自定�
 - **自定义 Agents。** 团队 Agents 会转换为 `$COPILOT_HOME/agents/` 或 `.github/agents/` 下的官方 `<name>.agent.md` 配置。TeamAI 将兼容的工具名映射为 Copilot 主别名，通过 `tool_extras.copilot` 保留 Copilot 专属 frontmatter，并且只删除与团队 Agent 或内置 recall 配置匹配的文件；用户自建配置保持不变。详见 [GitHub 自定义 Agent 配置](https://docs.github.com/zh/copilot/reference/custom-agents-configuration)。
 - **Team Context recall。** 内置 `teamai-recall.agent.md` 只获得 `execute`、`read` 和 `search`。它调用现有的 `teamai recall` 流程，让 Copilot 检索 learnings、codebase 证据和 teamwiki 结果，而不会复制或创建第二套知识库。
 - **Docs 和 Env。** 团队 Docs 同步到配置的本地文档目录（默认 `~/.teamai/docs`；project scope 使用项目内对应路径）。团队环境变量同步到该作用域由 TeamAI 管理的 `env.sh`；请从已 source 此文件的 shell 启动 Copilot。TeamAI 不会把环境变量值复制到 Copilot 配置中。
-- **Hooks 与隐私遥测。** TeamAI 在 `$COPILOT_HOME/hooks/teamai.json` 或 `.github/hooks/teamai.json` 写入独立的 version-1 Hook 文件，使用 Copilot 与 VS Code 兼容的 PascalCase 事件（`SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop` 和 `SessionEnd`），从而保留 TeamAI 所需的 snake_case Hook 负载字段，并生成 `bash`、`powershell` 和后备 `command` 字段。会话 ID、Skill 使用、提示次数、生命周期状态和最终 Token 总数会进入本地 Dashboard；Copilot 提示原文、助手输出、Transcript 路径和请求元数据绝不会被保存。若最终 Token 计数不可用，会话仍会被记录，但不包含 Token 数据。对于恢复的会话，TeamAI 在 SessionStart 时保存不含路径的日志字节边界；
+- **Hooks 与隐私遥测。** TeamAI 将内置 Hook 写入 `$COPILOT_HOME/hooks/teamai.json`（默认 `~/.copilot/hooks/teamai.json`），普通 project scope 安装也使用该文件。自定义团队 Hook 仍放在项目的 `.github/hooks/teamai.json`；self mode 的内置 Hook 也保留在项目中。每个项目下次执行 `init`、`pull` 或 `hooks inject` 时，会移除原先生成的内置 Hook，并保留无关 Hook。self 会话跳过全局副本。其他情况下，会话加载的每个副本（多个全局 JSON 文件，或运行中会话仍持有的旧项目命令）对每个事件竞争认领：最先运行的副本在 `~/.teamai/copilot-hook-claims/` 下认领该事件，其余副本退出，因此无论会话加载了哪些文件，每个事件只执行一次。认领键由事件负载、matcher 以及（若已设置）`COPILOT_AGENT_SESSION_ID` 组成；这依赖 Copilot 把同一份带毫秒 `timestamp` 的负载传给该事件的每个 Hook（依据 Copilot CLI 0.0.411 的实现，未检查更新版本）。负载没有 `timestamp`，或认领无法写入时，所有已加载副本都会执行，事件可能执行两次，但不会丢失。超过两天的认领会被清除。当 Copilot 加载的启用 JSON 文件中不再有任何文件包含该内置 Hook 时，缓存的副本停止执行：全局副本检查 `$COPILOT_HOME/hooks/`，旧项目副本检查该目录及其项目的 `.github/hooks/`。Dispatcher 根据 Hook 的工作目录解析项目配置。项目卸载保留共享全局文件；`hooks remove` 则显式移除 `$COPILOT_HOME/hooks/` 下每个 JSON 文件中的内置 Hook，包括其他项目配置的文件名。文件采用 version-1 格式，使用 Copilot 与 VS Code 兼容的 PascalCase 事件（`SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop` 和 `SessionEnd`），从而保留 TeamAI 所需的 snake_case Hook 负载字段，并生成 `bash`、`powershell` 和后备 `command` 字段。会话 ID、Skill 使用、提示次数、生命周期状态和最终 Token 总数会进入本地 Dashboard；Copilot 提示原文、助手输出、Transcript 路径和请求元数据绝不会被保存。若最终 Token 计数不可用，会话仍会被记录，但不包含 Token 数据。对于恢复的会话，TeamAI 在 SessionStart 时保存不含路径的日志字节边界；
 
   只有此前的运行标记尚未关闭、且未被上次运行使用时，才会采纳该标记。关闭计数必须关联这个标记或边界之后写入的标记。若标记仅在 SessionStart 之后出现，而 SessionEnd 没有提供方时间戳，则无法确认它属于本次运行；会话仍会被记录，但不包含 Token 数据。文件会被幂等合并，且保留无关条目。TeamAI 从不修改 Copilot 的 `settings.json`。
 - **MCP。** `teamai pull` 和 `teamai mcp inject` 使用 Copilot 原生结构，把本地与远程 Server 合并到 `$COPILOT_HOME/mcp-config.json` 或 `.github/mcp.json`。归属信息保存在 Copilot 文件之外，因此重复 pull 保持幂等，`mcp remove` 或卸载只会移除 TeamAI 管理的条目；手写 Server 与 `settings.json` 均保持不变。
