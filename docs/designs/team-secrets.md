@@ -95,7 +95,7 @@ teamai env unset GITHUB_TOKEN [--global]
   A project config that exists but can't be read makes `env set`, `env unset` and `env list` fail with its path and why, rather than use the user scope, whose team may not be this project's.
 - Outside any scope (no project here and no user scope), `env set --global` accepts any valid key name and notes that no team declares it yet, so a member can set a token they reuse across teams ahead of time. `env unset` accepts any key that has a value.
 - `--from-env` warns when the variable is not set in the current shell. While it is unset, the secret is `missing`: the next source in the [order](#resolution) is not used instead, since that could be another account's token.
-- Run `teamai pull` afterwards to update the MCP servers, and `env.sh` for a variable.
+- `env set` and `env unset` reconcile MCP servers for the current scope. Run `teamai pull` afterwards only to update `env.sh`, and only when the key is an env variable. When the team config or the MCP files cannot be read, and nothing was written, the command still says to run `teamai pull`, which updates both. A tool file that does not parse is warned and left as it is. When another tool was updated, the command says so and does not also ask for a pull: pull cannot write the file that does not parse.
 
 ## Storage
 
@@ -181,9 +181,9 @@ Project uninstall keeps and names a recorded MCP server you changed since teamai
 - A server an earlier pull wrote keeps its entry in each tool's config, as it is, and teamai still manages it: a later pull that finds a value updates it.
 - A server no pull has written yet is skipped, as before.
 - The entry is removed when its server leaves `mcp.yaml`, and by `teamai mcp remove`, `teamai uninstall`, and `teamai init` when it moves the Claude Code root.
-- A server that also misses a variable not declared as a secret is removed, as before. Variables that aren't declared as secrets keep today's behaviour.
+- A server that also misses a variable not declared as a secret is removed, as before. Variables that aren't declared as secrets keep today's behaviour. `doctor`'s MCP delivery check names that variable and still points at `env.yaml`. If the variable is a personal token, it also says to declare it with `teamai env add KEY --secret` (no value), then `teamai env set KEY`. A shared value stays in `env.yaml`: declaring it as a secret would ignore that value.
 
-A kept entry holds the value the earlier pull wrote. After a secret is rotated or revoked, the server keeps the old value until a pull finds the new one.
+A kept entry holds the value the earlier pull wrote. After a secret is rotated or revoked, the server keeps the old value until `teamai env set` or `teamai pull` finds the new one.
 
 While the declarations fail, `pull` and `teamai mcp inject` change no MCP server: nothing is added, updated or removed, and `mcp inject` exits 1. `mcp remove` and uninstall still remove every managed server.
 
@@ -244,7 +244,7 @@ Team secrets in this scope: GITHUB_TOKEN (gh and the github MCP server), SENTRY_
 
 ## Rotation
 
-A token that was ever committed to the team repo stays in its git history: rotate it, then declare it here and have each member set the new value. After `teamai env set` with a new value, `teamai pull` writes it to the MCP servers.
+A token that was ever committed to the team repo stays in its git history: rotate it, then declare it here and have each member set the new value. `teamai env set` updates MCP servers for the current scope. Run `teamai pull` afterwards only to update `env.sh`, and only when the key is an env variable.
 
 ## Declarations are absent, valid or failed
 
