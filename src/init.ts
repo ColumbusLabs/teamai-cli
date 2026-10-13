@@ -1434,9 +1434,10 @@ export async function initSelfRepo(options: GlobalOptions & {
   if (!options.dryRun) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
+      const { isPublished } = await import('./utils/branch-worktree.js');
       let isNewSelfMember = false;
       let selfMemberChanged = false;
-      const pushed = await updateReports(localConfig, async (wt) => {
+      const pushed = isPublished(await updateReports(localConfig, async (wt) => {
         const memberDir = path.join(wt, 'members');
         await ensureDir(memberDir);
         const memberPath = path.join(memberDir, `${username}.yaml`);
@@ -1455,7 +1456,7 @@ export async function initSelfRepo(options: GlobalOptions & {
             ? `[teamai] Register member: ${username}`
             : `[teamai] Update member roster: ${username}`,
         };
-      });
+      }));
       if (selfMemberChanged) {
         if (pushed) {
           log.success(isNewSelfMember
@@ -1982,9 +1983,10 @@ export async function init(options: GlobalOptions & {
   if (!options.dryRun) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
+      const { isPublished } = await import('./utils/branch-worktree.js');
       let memberChanged = false;
       let memberProjects: string[] | undefined;
-      const pushed = await updateReports(reportsConfig, async (wt) => {
+      const pushed = isPublished(await updateReports(reportsConfig, async (wt) => {
         const memberDir = path.join(wt, 'members');
         await ensureDir(memberDir);
         const memberPath = path.join(memberDir, `${username}.yaml`);
@@ -2004,7 +2006,7 @@ export async function init(options: GlobalOptions & {
             ? `[teamai] Register member: ${username}`
             : `[teamai] Update member roster: ${username}`,
         };
-      });
+      }));
       if (memberChanged) {
         log.success(isNewMember
           ? `Registered as team member: ${username}`
