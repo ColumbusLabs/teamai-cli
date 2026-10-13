@@ -187,6 +187,11 @@ Generated: do not edit by hand. Regenerate with
   - `--force` — Skip confirmation prompt
   - `--agent <name>` — Only uninstall this agent's resources in this checkout; shared resources, and the project's other checkouts, go only if it is the last tool
 
+## script
+
+- `teamai script` — Run a Node script the team declared in teamai.yaml
+  - `teamai script run <event>` — Run preInit, postInit, prePull, postPull, or postDeploy for this checkout. preInit and postInit need a terminal. postInit then syncs MCP servers.
+
 ## env
 
 - `teamai env` — Manage team environment variables
