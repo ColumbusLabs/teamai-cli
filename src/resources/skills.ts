@@ -20,7 +20,7 @@ import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { openPrDestinations, recordedNamespace } from '../utils/pending-push.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
 import {
-  blockingEntries, deliveredSkillFiles, describeKeptDir, describeMembersDirLeft, describeMembersFile, describeMembersLink, describeSkippedLink, isLink, judgeCopy, keepsEditedCopy, keepsTrackedCopy,
+  blockingEntries, deliveredSkillFiles, describeKeptDir, describeMembersDirLeft, describeMembersFile, describeMembersLink, describeSkippedLink, isLink, judgeCopy, judgeRemoval, keepsEditedCopy, keepsTrackedCopy,
   isRecordedFromTeamSkill, isUneditedSkillCopy, membersLinkAt, ownsSkillDir, recordDelivered, recordedUnder, teamaiSkillFiles,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
@@ -85,6 +85,24 @@ export function codexSkillConflictLine(skillName: string, configuredSkillsPath: 
   const configured = path.posix.join(configuredSkillsPath, skillName);
   return `Codex skill conflict for ${skillName}: ${shared} is not teamai's, so it was left alone; `
     + `the team skill is in ${configured}. Codex now sees two skills named ${skillName}.`;
+}
+
+/**
+ * Whether a tool besides Codex receives skills into the `.agents/skills`
+ * Codex reads: Muse Code in a project. Codex's copy then goes there too, so
+ * the two share one copy instead of Codex seeing a second in `.codex/skills`.
+ */
+async function sharedSkillsDelivered(
+  toolPaths: ReturnType<typeof scopedToolPaths>,
+  localConfig: LocalConfig,
+): Promise<boolean> {
+  const shared = path.resolve(resolveToolBaseDir(CODEX_TOOL, localConfig), SHARED_AGENT_SKILLS_PATH);
+  for (const [tool, toolPath] of Object.entries(toolPaths)) {
+    if (tool === CODEX_TOOL || isAgentExcluded(localConfig, tool)) continue;
+    const dir = await skillsDirForTool(tool, toolPath.skills, localConfig);
+    if (dir !== null && path.resolve(dir) === shared) return true;
+  }
+  return false;
 }
 
 /**
@@ -179,39 +197,63 @@ export async function skillsDirForTool(
   return path.join(resolveToolBaseDir(tool, localConfig), configuredSkillsPath);
 }
 
+/** One skill to place: see `skillTargetsFor`. */
+export interface SkillTargetRequest {
+  tool: string;
+  skillName: string;
+  /** Whether Codex's existing copy in `.agents/skills` is teamai's (`resolveSkillDestination`). */
+  ownsShared: SharedSkillOwnership;
+  /**
+   * The write path's team copy: it lets the Codex shared-directory
+   * reconciliation delete a duplicate it can prove is identical, and name a
+   * conflict. Omit it to resolve a destination without those side effects.
+   */
+  sourcePath?: string;
+}
+
 /**
- * Where `skillName` lands for `tool` on this machine, or null when the tool
- * cannot receive it.
+ * Where a skill lands for a tool of `toolPaths` on this machine, or null when
+ * the tool cannot receive it, for one run over those tools.
  *
  * One place answers that question, so `pull` writes and `doctor` checks the very
  * same paths (#598). A second copy of these gates is how "Synced 12 skills"
  * ends up true for one tool and silently false for another.
- *
- * `ownsShared` decides whether Codex's existing copy in `.agents/skills` is
- * teamai's (`resolveSkillDestination`). `sourcePath` belongs to the write
- * path: it lets the Codex shared-directory reconciliation delete a duplicate
- * it can prove is identical, and name a conflict. Omit it to resolve a
- * destination without those side effects.
  */
-export async function skillTargetForTool(
-  tool: string,
-  configuredSkillsPath: string | undefined,
+export function skillTargetsFor(
+  toolPaths: ReturnType<typeof scopedToolPaths>,
   localConfig: LocalConfig,
-  skillName: string,
-  ownsShared: SharedSkillOwnership,
-  sourcePath?: string,
-): Promise<string | null> {
-  const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
-  if (skillsDir === null || configuredSkillsPath === undefined) return null;
-  // Codex alone can redirect a skill to the shared `.agents/skills` directory,
-  // and only for a skill whose copy there is teamai's — so the destination is
-  // per-skill and the gate above cannot answer it.
-  if (tool === CODEX_TOOL) {
-    const baseDir = resolveToolBaseDir(tool, localConfig);
-    return resolveSkillDestination(tool, configuredSkillsPath, baseDir, skillName, ownsShared, sourcePath);
-  }
+): (request: SkillTargetRequest) => Promise<string | null> {
+  // Asked once per run, and only once a Codex skill needs it.
+  let sharedDelivered: Promise<boolean> | undefined;
+  return async ({ tool, skillName, ownsShared, sourcePath }) => {
+    const configuredSkillsPath = toolPaths[tool]?.skills;
+    const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
+    if (skillsDir === null || configuredSkillsPath === undefined) return null;
+    if (tool !== CODEX_TOOL) return path.join(skillsDir, skillName);
 
-  return path.join(skillsDir, skillName);
+    // Codex alone can redirect a skill to the shared `.agents/skills`
+    // directory: for a skill whose copy there is teamai's, or for any skill
+    // while another tool delivers there — so the destination is per-skill and
+    // the gate above cannot answer it.
+    const baseDir = resolveToolBaseDir(tool, localConfig);
+    const sharedDestination = path.join(baseDir, SHARED_AGENT_SKILLS_PATH, skillName);
+    sharedDelivered ??= sharedSkillsDelivered(toolPaths, localConfig);
+    if (await sharedDelivered && !await pathExists(sharedDestination) && await ownsShared(sharedDestination)) {
+      // Codex's earlier copy in its own directory goes once the team history
+      // proves it teamai's, so the move does not leave Codex a second version.
+      const configuredDestination = path.join(baseDir, configuredSkillsPath, skillName);
+      if (sourcePath && await pathExists(configuredDestination)) {
+        if (await judgeRemoval(undefined, configuredDestination, skillOrigin(localConfig.repo.localPath, skillName)) !== 'remove') {
+          log.warn(`Codex skill conflict for ${skillName}: keeping different copies in ${SHARED_AGENT_SKILLS_PATH} and ${configuredSkillsPath}`);
+        } else if (!await keepsTrackedCopy(configuredDestination, sharedDestination) && await mayDeleteSkillCopy(localConfig, configuredDestination)) {
+          await remove(configuredDestination);
+          log.debug(`Removed TeamAI skill ${skillName} from ${configuredSkillsPath}: Codex reads it from ${SHARED_AGENT_SKILLS_PATH}`);
+        }
+      }
+      return sharedDestination;
+    }
+    return resolveSkillDestination(tool, configuredSkillsPath, baseDir, skillName, ownsShared, sourcePath);
+  };
 }
 
 /**
@@ -1116,10 +1158,12 @@ export class SkillsHandler extends ResourceHandler {
   ): Promise<DeliveryTarget[]> {
     const origin = skillOrigin(localConfig.repo.localPath, item.name);
     const targets: DeliveryTarget[] = [];
-    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    const toolPaths = scopedToolPaths(teamConfig, localConfig);
+    const skillTarget = skillTargetsFor(toolPaths, localConfig);
+    for (const tool of Object.keys(toolPaths)) {
       if (isAgentExcluded(localConfig, tool)) continue;
 
-      const skillsDir = await skillsDirForTool(tool, toolPath.skills, localConfig);
+      const skillsDir = await skillsDirForTool(tool, toolPaths[tool].skills, localConfig);
       if (!skillsDir) continue;
       const guard = await skillsGuardBase(resolveBaseDir(localConfig), skillsDir);
       if (!await allowsSkillDirectory(guard, path.join(skillsDir, item.name), { keepSkillLink: true })) {
@@ -1128,7 +1172,7 @@ export class SkillsHandler extends ResourceHandler {
       }
       const ownsShared = async (dest: string): Promise<boolean> =>
         await allowsSkillDirectory(guard, dest) && (await judgeCopy(previous, item, { tool, dest, origin })).kind !== 'member';
-      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, ownsShared, sourcePath);
+      const dest = await skillTarget({ tool, skillName: item.name, ownsShared, sourcePath });
       if (dest) targets.push({ tool, dest, origin });
     }
     return targets;

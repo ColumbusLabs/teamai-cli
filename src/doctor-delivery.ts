@@ -4,15 +4,15 @@ import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe, readJsonObject } from './utils/fs.js';
 import {
-  CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, isGitExcludeEnabled, managedMcpManifestKey,
+  CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, isGitExcludeEnabled, managedMcpManifestKey, MUSE_TOOL_ID,
   resolveToolBaseDir, resolveToolRootDir, scopedToolPaths,
 } from './types.js';
-import type { DeliveryTarget, LocalConfig, ManagedMcpManifest, ResourceItem, TeamaiConfig } from './types.js';
+import type { DeliveryTarget, LocalConfig, ManagedMcpManifest, McpServerDef, ResourceItem, TeamaiConfig } from './types.js';
 import type { EntryLayout, EntryResolution } from './namespaced-entries.js';
 import { splitFrontmatter } from './utils/frontmatter.js';
 import { isToolInstalledForConfig, type ResourceHandler } from './resources/base.js';
 import type { Check, DoctorContext } from './doctor.js';
-import type { DesiredMcpContext } from './mcp-reconcile.js';
+import type { DesiredMcpContext, McpTarget } from './mcp-reconcile.js';
 import type { ResolvedMcpFile } from './mcp-resolved-files.js';
 import {
   findEnvBlockFor,
@@ -909,56 +909,97 @@ function declareSecretHint(keys: readonly string[]): string {
  * skipped — an unresolved `${VAR}` is the reason behind "MCP does not work"
  * that no other output points at (#662).
  */
-export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[]> {
+/**
+ * The team MCP servers doctor judges and the targets it judges them in: none
+ * when nothing is owed (no team config, an HTTP-backed team, or `autoApply`
+ * off), unreadable when the team's MCP files cannot be read.
+ */
+type TeamMcpForDoctor =
+  | { kind: 'none' }
+  | { kind: 'unreadable'; fix: string }
+  | { kind: 'read'; teamConfig: TeamaiConfig; teamDefs: McpServerDef[]; targets: McpTarget[] };
+
+async function teamMcpForDoctor(ctx: DoctorContext): Promise<TeamMcpForDoctor> {
   const { localConfig, teamConfig } = ctx;
-  if (!teamConfig) return [];
+  if (!teamConfig) return { kind: 'none' };
   // HTTP-backed teams have no repo tree: servers arrive through the local-agent
   // install channel, and the desired set here would always be empty.
-  if (localConfig.repo.kind === 'http') return [];
-
-  const sharing = getMcpSharing(teamConfig);
+  if (localConfig.repo.kind === 'http') return { kind: 'none' };
   // Nothing was promised automatically, so nothing is owed until the member
   // runs `teamai mcp inject`.
-  if (!sharing.autoApply) return [];
+  if (!getMcpSharing(teamConfig).autoApply) return { kind: 'none' };
 
-  const {
-    resolveMcpTargets, buildDesiredMcpContext, desiredMcpForTarget,
-    mcpTargetExcluded, installedMcpEntries, memberMcpServers, describeKeptMemberServer,
-  } = await import('./mcp-reconcile.js');
-  const { carriesResolvedValue, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
+  const { resolveMcpTargets, mcpTargetExcluded } = await import('./mcp-reconcile.js');
   const { mcpEntryReader, teamMcpToDef } = await import('./resources/mcp.js');
   const { describeEntryFailure, resolveEntriesFor } = await import('./namespaced-entries.js');
+  const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
+  if (resolution.kind === 'failed') return { kind: 'unreadable', fix: describeEntryFailure(resolution.failure) };
+  const teamDefs = resolution.entries.map((entry) => teamMcpToDef(entry.entry));
+  if (teamDefs.length === 0) return { kind: 'none' };
+  const targets = (await resolveMcpTargets(teamConfig, localConfig)).filter((target) => !mcpTargetExcluded(localConfig, target));
+  return { kind: 'read', teamConfig, teamDefs, targets };
+}
 
+/** The team servers `target` gets none of because its format cannot express their transport, less those the member excluded. */
+async function unsupportedTransportServers(localConfig: LocalConfig, target: McpTarget, teamDefs: McpServerDef[]): Promise<McpServerDef[]> {
+  const { supportsTransport } = await import('./resources/mcp-format.js');
+  const { mcpTargetTakes } = await import('./mcp-reconcile.js');
+  const excludedByUser = new Set(localConfig.excludedSkills ?? []);
+  return teamDefs.filter((def) => mcpTargetTakes(target, def.tools)
+    && !excludedByUser.has(def.name) && !supportsTransport(target.format, def.transport));
+}
+
+/**
+ * A team server a tool cannot use over its transport, such as an sse server
+ * for Muse Code or Pi. Its tool skips it on every pull, and no pull or
+ * `teamai` command can change that, so it is a note, not a failed delivery.
+ */
+export async function mcpTransportNotes(ctx: DoctorContext): Promise<string[]> {
+  const team = await teamMcpForDoctor(ctx);
+  if (team.kind !== 'read') return [];
+  const { mcpTargetAgent } = await import('./mcp-reconcile.js');
+  const notes: string[] = [];
+  for (const target of team.targets) {
+    const unsupported = await unsupportedTransportServers(ctx.localConfig, target, team.teamDefs);
+    if (unsupported.length === 0) continue;
+    const agent = mcpTargetAgent(target);
+    notes.push(`MCP servers ${agent} cannot use: ${unsupported.map((def) => `${def.name} (${def.transport})`).join(', ')} `
+      + `in ${target.file}, over a transport ${agent} does not support.`);
+  }
+  return notes;
+}
+
+export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig } = ctx;
   // A file that does not parse, or a server name defined twice, is not a team
   // without MCP: the pull logs the reason once and changes nothing in any tool,
   // and every later run is silent. Flattening it to an empty desired set is
   // what let `doctor --json` answer `ok: true` over a team whose MCP is stuck.
-  const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
-  if (resolution.kind === 'failed') {
-    return [{
-      name: 'Team MCP servers can be read',
-      source: 'local',
-      check: async () => false,
-      fix: describeEntryFailure(resolution.failure),
-    }];
+  const team = await teamMcpForDoctor(ctx);
+  if (team.kind === 'none') return [];
+  if (team.kind === 'unreadable') {
+    return [{ name: 'Team MCP servers can be read', source: 'local', check: async () => false, fix: team.fix }];
   }
+  const { teamConfig, teamDefs, targets } = team;
 
-  const teamDefs = resolution.entries.map((entry) => teamMcpToDef(entry.entry));
-  if (teamDefs.length === 0) return [];
+  const {
+    resolveMcpTargets, buildDesiredMcpContext, desiredMcpForTarget,
+    mcpTargetAgent, mcpTargetAgents, installedMcpEntries, memberMcpServers, describeKeptMemberServer,
+  } = await import('./mcp-reconcile.js');
+  const { carriesResolvedValue, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
 
-  const targets = await resolveMcpTargets(teamConfig, localConfig);
   const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig, { teamEnv: ctx.teamEnv });
   const excludedByUser = new Set(localConfig.excludedSkills ?? []);
 
   const checks: Check[] = [];
   for (const target of targets) {
-    if (mcpTargetExcluded(localConfig, target)) continue;
-
     const { desired, skipped, kept } = desiredMcpForTarget(target, teamDefs, desiredContext);
-    // A server skipped only for a missing declared secret (#875) is a note
-    // doctor prints with the command that fixes it, not a failed delivery.
+    // A server skipped only for a missing declared secret (#875), or for a
+    // transport its tool cannot use (`mcpTransportNotes`), is a note doctor
+    // prints, not a failed delivery.
+    const unsupported = new Set((await unsupportedTransportServers(localConfig, target, teamDefs)).map((def) => def.name));
     const blocked = skipped
-      .filter((change) => !excludedByUser.has(change.server) && !kept.has(change.server))
+      .filter((change) => !excludedByUser.has(change.server) && !kept.has(change.server) && !unsupported.has(change.server))
       .map((change) => `${change.server} (${change.reason ?? 'skipped'})`);
 
     const problems: string[] = [];
@@ -991,6 +1032,24 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
     }
     if (blocked.length > 0) problems.push(`skipped: ${nameList(blocked)}`);
 
+    // Muse Code rejects a config holding one sse server and then loads no MCP
+    // server at all, so an sse entry in a file it reads breaks Muse's MCP as a
+    // whole. In a project that is the .mcp.json the claude target writes.
+    const museReads = mcpTargetAgents(target).includes(MUSE_TOOL_ID);
+    if (museReads && installed) {
+      const sse = [...installed]
+        .filter(([, entry]) => typeof entry === 'object' && entry !== null && (entry as { type?: unknown }).type === 'sse')
+        .map(([name]) => name);
+      checks.push({
+        name: 'MCP servers load in muse',
+        source: 'local',
+        check: async () => sse.length === 0,
+        fix: `In ${target.file}, ${nameList(sse)} ${sse.length === 1 ? 'uses' : 'use'} the sse transport, which Muse Code rejects, `
+          + 'so it loads no MCP server at all. If the server speaks streamable HTTP, set `transport: http` for it in the team\'s '
+          + 'mcp.yaml and run `teamai pull`. Otherwise Muse Code has no MCP servers while this file holds it.',
+      });
+    }
+
     if (problems.length === 0 && !withheld && desired.size === 0) continue;
 
     // A pull keeps a server of the member's own under a team name, and names it (#993).
@@ -1008,7 +1067,7 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
       ...member.map((name) => describeKeptMemberServer(name, target.file)),
       ...member.length > 0 ? ['Or run `teamai mcp inject --force` to replace it with the team\'s.'] : []];
     checks.push({
-      name: `MCP servers delivered to ${target.tool}`,
+      name: `MCP servers delivered to ${mcpTargetAgent(target)}`,
       source: 'local',
       check: async () => problems.length === 0 && !withheld,
       fix: [...withheld ? [withheld] : [], ...delivery].join(' '),

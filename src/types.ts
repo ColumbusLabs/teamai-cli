@@ -652,6 +652,21 @@ export const TeamaiConfigBaseSchema = z.object({
       mcpProject: 'opencode.json',
       userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents' },
     },
+    // Muse Code (Meta, binary `muse`) keeps its user config in ~/.config/muse
+    // and reads user skills from ~/.config/muse/skills, ahead of the
+    // ~/.claude/skills and ~/.agents/skills it also scans. Hooks take Codex's
+    // shape: user hooks in the `hooks` block of ~/.config/muse/settings.json,
+    // which runs in every workspace, project hooks in <root>/.muse/hooks.json,
+    // which runs only in a trusted one.
+    muse: {
+      skills: '.agents/skills',
+      settings: '.muse/hooks.json',
+      // User MCP servers sit in the same settings.json. A project's come from
+      // the <root>/.mcp.json the claude target writes, as for tclaude.
+      mcp: '.config/muse/settings.json',
+      agents: '.agents/agents',
+      userScope: { skills: '.config/muse/skills', settings: '.config/muse/settings.json', agents: '.config/muse/agents' },
+    },
   }),
 });
 
@@ -1894,8 +1909,8 @@ export interface ContributeState {
   promptSummary?: string;
   /**
    * A generated share-learnings hint awaiting delivery via UserPromptSubmit
-   * (used only for tools whose Stop hook ignores stdout — see
-   * STOP_STDOUT_UNSUPPORTED_TOOLS). Cleared once injected. Absent for tools
+   * (used only for tools whose Stop hook cannot take the payload — see
+   * stopStdoutUnsupported). Cleared once injected. Absent for tools
    * that deliver the hint directly through the Stop hook.
    */
   pendingHint?: string;
@@ -2187,6 +2202,9 @@ export const CLAUDE_TOOL_ID = 'claude';
 export const DEFAULT_CLAUDE_ROOT = '.claude';
 
 export const CODEX_TOOL_ID = 'codex';
+
+/** Muse Code (Meta), whose CLI binary is `muse`. */
+export const MUSE_TOOL_ID = 'muse';
 
 /** The `toolPaths.codex` root segment Codex uses when `CODEX_HOME` is unset. */
 export const DEFAULT_CODEX_ROOT = '.codex';
