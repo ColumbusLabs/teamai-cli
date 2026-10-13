@@ -76,10 +76,10 @@ export interface TeamScriptOptions {
 
 /**
  * Environment every team script sees. `TEAMAI_PROJECT` is the resolver's
- * `projectAnchor`: the same value for every worktree of one repo. When that
- * anchor is a checkout, `TEAMAI_MAIN_CHECKOUT` is the same path. Scripts use
- * these instead of walking worktrees themselves. A bare anchor is an identity
- * only, not a checkout to write into.
+ * `projectAnchor`: the same value for every worktree of one repo.
+ * `TEAMAI_MAIN_CHECKOUT` is `mainCheckout` when TeamAI resolved one. Scripts
+ * use these instead of walking worktrees themselves. A bare anchor is an
+ * identity only, not a checkout to write into.
  */
 export async function teamScriptEnv(localConfig: LocalConfig): Promise<NodeJS.ProcessEnv> {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -92,7 +92,7 @@ export async function teamScriptEnv(localConfig: LocalConfig): Promise<NodeJS.Pr
     env.TEAMAI_CHECKOUT = anchors?.workspaceRoot ?? localConfig.projectRoot;
     if (anchors?.projectAnchor) {
       env.TEAMAI_PROJECT = anchors.projectAnchor;
-      if (!anchors.projectAnchorIsBare) env.TEAMAI_MAIN_CHECKOUT = anchors.projectAnchor;
+      if (anchors.mainCheckout) env.TEAMAI_MAIN_CHECKOUT = anchors.mainCheckout;
     }
   }
   return env;
@@ -153,8 +153,8 @@ export async function runTeamScript(
 
 /**
  * One MCP reconcile after `postInit`, so a token the script just collected is
- * in the tool config without a second command. A git init does not call this:
- * its closing pull is that reconcile.
+ * in the tool config without a second command. Init calls this because it
+ * does not pull team resources before it exits.
  */
 export async function syncMcpAfterPostInit(localConfig: LocalConfig): Promise<void> {
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
