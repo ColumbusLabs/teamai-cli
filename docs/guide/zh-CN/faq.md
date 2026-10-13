@@ -8,6 +8,8 @@
 
 `teamai uninstall` 删除 TeamAI 装上去的资源。你自己建的文件会留下。
 
+使用共享数据分区的项目中，完整卸载会先移除所有 checkout 的共享 hooks 和注册，再删除分区。`uninstall --agent <tool>` 只移除当前 checkout 中该工具的 hooks 和注册；若该工具是分区中最后一个工具，则会删除分区以及所有 checkout 的 hooks。bare 仓库的 worktree 分别拥有自己的 hook 文件。
+
 即使没有本地文件需要删除，排除项目中的指定工具也需要确认或 `--force`。`--dry-run` 或拒绝确认不会修改项目配置。
 
 ```bash
@@ -56,9 +58,9 @@ teamai init --repo https://github.com/your-org/your-repo --force
 
 **Q: 在项目里执行 `teamai init` 后没有 `.claude/`（或 `.cursor/`、`.codebuddy/`）目录？**
 
-对内置工具而言，`init` 未带 `--agent` 且没有终端（不弹选择器）时这是预期行为：它不知道你会打开哪个 Agent。执行 `teamai init <repo> --agent claude`（或 `cursor`、`codebuddy` 等）会在 init 结束前创建该工具的根目录并填充；或者在项目中打开该工具：SessionStart hook 会创建该工具的项目根目录并随后 pull。单独执行 `teamai pull` 不会为缺失的 Agent 根目录建目录。例外是仅在 `teamai.yaml` 的 `toolPaths` 中定义的自定义 Agent（不属于内置工具）
+对于内置工具，如果 `init` 没带 `--agent`，且在非交互终端中运行（不会显示选择器），它不会创建工具根目录，因为你还没有选择 Agent。执行 `teamai init <repo> --agent claude`（或其他 Agent ID），可在 `init` 结束前创建并填充该工具的根目录。你也可以在项目中打开该工具。它的 SessionStart hook 会创建根目录并拉取资源。
 
-——`init --agent <id>` 会自行创建该 Agent 的根目录，因为没有其他流程会为它创建。这仅在 git 模式的 init（默认或 `--self`）下生效：HTTP init（`--http`）不会在本地克隆 `teamai.yaml`，因此没有自定义路径可供创建，只会为已安装的内置工具创建根目录。
+`teamai pull` 不会创建缺失的 Agent 根目录。例外是在继承配置的子模块克隆中首次 pull，它会根据原始子模块配置创建根目录（见[项目 checkout](./distribution.md#项目-checkout)）。对于只在 `teamai.yaml` 的 `toolPaths` 中定义的自定义 Agent，git 模式的 init 会通过 `init --agent <id>` 创建其根目录。HTTP init 无法读取本地 `teamai.yaml` 路径，因此只会为已安装的内置 Agent 创建根目录。
 
 **Q: Hooks 没有自动触发？**
 

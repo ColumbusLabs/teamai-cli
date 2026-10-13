@@ -7,7 +7,7 @@ import {
 } from './resources/desired.js';
 import type { IndexedSkills, UnreadableFile } from './utils/search-index.js';
 import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
-import { pullRepo, getHeadRev, createGit, getDefaultBranch, completeWorktreeList, gitCommonDir, isLiveCheckout, listWorktrees } from './utils/git.js';
+import { pullRepo, getHeadRev, createGit, getDefaultBranch, completeWorktreeList, gitCommonDir, isLiveCheckout, isLiveProjectCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { pendingLearningsDir } from './utils/pending-learnings.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
@@ -26,7 +26,7 @@ import {
   resolveDesiredDocs, resolveDocsDestination,
 } from './resources/docs.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
-import { CODEX_TOOL, SHARED_AGENT_SKILLS_PATH, skillOrigin, skillsDirForTool } from './resources/skills.js';
+import { CODEX_TOOL, mayDeleteSkillCopy, SHARED_AGENT_SKILLS_PATH, skillOrigin, skillsDirForTool } from './resources/skills.js';
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
@@ -351,6 +351,7 @@ export async function cleanupInactiveNamespaceSkills(
         continue;
       }
       if (await keepsTrackedCopy(localSkillDir)) continue;
+      if (!await mayDeleteSkillCopy(localConfig, localSkillDir)) continue;
 
       await remove(localSkillDir);
       removed.add(skillName);
@@ -389,6 +390,7 @@ async function sweepSharedSkillCopies(
       continue;
     }
     if (await keepsTrackedCopy(dir)) continue;
+    if (!await mayDeleteSkillCopy(localConfig, dir)) continue;
     await remove(dir);
     if (ledger) forgetDelivered(ledger.hashes, dir);
     removed.push(name);
@@ -642,6 +644,7 @@ async function cleanupTombstonedResources(
             continue;
           }
           if (await keepsTrackedCopy(localPath)) continue;
+          if (type === 'skills' && !await mayDeleteSkillCopy(localConfig, localPath)) continue;
           await remove(localPath);
           forgetDelivered(ledger.hashes, localPath);
           log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
@@ -792,10 +795,12 @@ export async function liveCheckoutRecords(
   if (!records) return undefined;
   const commonDir = await gitCommonDir(projectRoot);
   if (!commonDir) return records;
+  const identity = (await resolveAnchors(projectRoot))?.projectAnchor;
   const kept = await Promise.all(Object.entries(records).map(async ([key, record]) => {
     const { root } = record;
     const live = root === undefined
-      || (await isLiveCheckout(root, commonDir) && await checkoutKey(root) === key);
+      || ((await isLiveCheckout(root, commonDir) || (identity && await isLiveProjectCheckout(root, identity)))
+        && await checkoutKey(root) === key);
     return live ? [key, record] as const : null;
   }));
   return Object.fromEntries(kept.filter((entry) => entry !== null));
@@ -1125,6 +1130,7 @@ function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<strin
       ...(record.delivered ? { delivered: record.delivered } : {}),
       ...(record.agentModels ? { agentModels: record.agentModels } : {}),
       ...(record.gitExcludePaths ? { gitExcludePaths: record.gitExcludePaths } : {}),
+      ...(record.rootsSeeded ? { rootsSeeded: true } : {}),
     };
     return [key, pushBaseRevs.length === 0 ? reset : { ...reset, pushBaseRevs }];
   }));
@@ -1487,6 +1493,25 @@ async function pullForScope(
     modelCatalogHint = await syncTeamModelProfiles(localConfig, { dryRun: options.dryRun });
   } catch (error) {
     log.warn(`[${scopeLabel}] Team model profiles were not updated: ${(error as Error).message}`);
+  }
+
+  // Before anything probes which tools this checkout has; once, like a new
+  // worktree's post-checkout. A record saved before seeding existed reads as
+  // never seeded; a missing original checkout leaves the marker unset so a
+  // later pull retries when that checkout is restored.
+  let rootsSeeded = false;
+  if (workspaceKey && localConfig.projectRoot && !options.dryRun) {
+    const state = await loadStateForScope(localConfig);
+    const record = state.lastPullByWorkspace?.[workspaceKey];
+    if (!record?.rootsSeeded) {
+      const { seedInheritedCheckoutRoots } = await import('./project-agent-root.js');
+      const seedResult = await seedInheritedCheckoutRoots(localConfig.projectRoot);
+      rootsSeeded = seedResult !== 'source-missing';
+      if (rootsSeeded && record) {
+        record.rootsSeeded = true;
+        await saveStateForScope(state, localConfig);
+      }
+    }
   }
 
   // Step 1b: Skip sync if the repo version hasn't changed since last pull
@@ -1932,6 +1957,7 @@ async function pullForScope(
           continue;
         }
         if (await keepsTrackedCopy(skillDir)) continue;
+        if (!await mayDeleteSkillCopy(localConfig, skillDir)) continue;
         await remove(skillDir);
         if (excludedSkills.has(dir)) {
           log.debug(`Removed excluded skill ${dir} from ${tool}`);
@@ -1961,6 +1987,7 @@ async function pullForScope(
               continue;
             }
             if (await keepsTrackedCopy(nestedSkillDir)) continue;
+            if (!await mayDeleteSkillCopy(localConfig, nestedSkillDir)) continue;
             await remove(nestedSkillDir);
             forgetDelivered(ledger.hashes, nestedSkillDir);
             log.debug(`Removed excluded skill ${namespace}/${skillName} from ${tool}`);
@@ -2080,6 +2107,7 @@ async function pullForScope(
         ? await userScopeRecord(state)
         : state.lastPullByWorkspace?.[recordKey] ?? { rev: FORCED_FULL_SYNC_REV, targets: syncedTargets };
       if (localConfig.scope === 'project' && localConfig.projectRoot) record.root = localConfig.projectRoot;
+      if (rootsSeeded) record.rootsSeeded = true;
       addPushBaseRev(record, deliveredRev);
       record.delivered = ledger.hashes;
       setAgentModels(record, ledger.agentModels);
@@ -2106,12 +2134,14 @@ async function pullForScope(
       // The delivered paths are rewritten after the last writer of this pull
       // (see syncDeliveredGitExclude): until then, the checkout's previous ones.
       const gitExcludePaths = state.lastPullByWorkspace?.[recordKey]?.gitExcludePaths;
+      const seeded = rootsSeeded || state.lastPullByWorkspace?.[recordKey]?.rootsSeeded;
       const record: CheckoutRecord = {
         rev: deliveredRev,
         ...(localConfig.scope === 'project' && localConfig.projectRoot ? { root: localConfig.projectRoot } : {}),
         targets: syncedTargets,
         delivered: ledger.hashes,
         ...(gitExcludePaths ? { gitExcludePaths } : {}),
+        ...(seeded ? { rootsSeeded: true } : {}),
       };
       setAgentModels(record, ledger.agentModels);
       state.lastPullByWorkspace = {

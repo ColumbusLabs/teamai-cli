@@ -105,7 +105,7 @@ import {
   type TeamaiConfig,
 } from './types.js';
 import { getUserHome } from './utils/home.js';
-import { completeWorktreeList, gitCommonDir, isLiveCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
+import { checkoutForProjectAnchor, gitCommonDir, isLiveCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
 import {
   ensure as ensureGitExclude, gitExcludeFile, gitTracks, gitUntracked, remove as removeGitExclude, report as reportGitExclude, stateHomeRecord,
   sync as syncGitExclude, type GitExcludeOwner,
@@ -1279,7 +1279,7 @@ async function promptForProjectBinding(
  * Persist a ClawPro binding decision for the current checkout.
  *
  * Binding is a per-project decision, so it is recorded on the `projectAnchor`
- * (the main checkout, shared by a repo and all of its git worktrees — issue
+ * (the repository identity, shared by a repo and all of its git worktrees — issue
  * #374 / #387). It is ALSO stamped on the current `workspaceRoot` so this
  * checkout is reported with the project_id immediately and its resources land
  * in the current worktree (#387's workspaceRoot model — every AI tool discovers
@@ -1315,7 +1315,7 @@ async function persistWorkspaceBinding(
 }
 
 /**
- * If the current checkout is an unbound git worktree whose main checkout
+ * If the current checkout is unbound and its project identity
  * (`projectAnchor`) is already bound or skipped, copy that decision onto the
  * current `workspaceRoot` and report success — so a repo is never re-prompted
  * for binding once per new worktree (a `--skip` on the main checkout silences
@@ -3131,10 +3131,16 @@ export async function localAgentCheckouts(): Promise<string[]> {
   const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath()).catch(() => null)) ?? {};
   const installed = Object.keys((await loadManifest().catch(() => null))?.scopes ?? {}).flatMap((key) => parseScopeKey(key).workspacePath ?? []);
   const workspaces = new Set([...Object.keys(config?.workspaceBindings ?? {}), ...Object.keys(manifest.workspaceModels ?? {}), ...installed]);
-  const roots = new Set(workspaces);
+  const roots = new Set<string>();
   for (const workspace of workspaces) {
-    const commonDir = await gitCommonDir(workspace);
-    for (const root of commonDir ? await completeWorktreeList(workspace, commonDir) ?? [] : []) roots.add(root);
+    const checkout = await pathExists(path.join(workspace, '.git')) ? workspace
+      : await checkoutForProjectAnchor(workspace);
+    if (!checkout) {
+      if (!await gitCommonDir(workspace)) roots.add(workspace);
+      continue;
+    }
+    roots.add(checkout);
+    for (const root of await listWorktrees(checkout)) roots.add(root);
   }
   return [...roots];
 }

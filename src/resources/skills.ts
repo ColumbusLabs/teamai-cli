@@ -1,13 +1,14 @@
 import path from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
 import YAML from 'yaml';
 import { isToolInstalledForConfig, ResourceHandler, type ScanForPushOptions } from './base.js';
 import type { CopyOrigin, PendingPush, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
-import { getPushignorePath, isAgentExcluded, resolveToolBaseDir, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
+import { getPushignorePath, isAgentExcluded, resolveBaseDir, resolveToolBaseDir, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { listDirs, listFilesRecursive, pathExists, copyDir, remove, pruneEmptyDirs, dirContentEqual, dirTeamSubsetEqual, fileContentEqual, fileHash, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { warnOnce } from '../utils/warn-once.js';
-import { getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
-import { isCliOwnedSkillName, ownedSkillFiles, prunedWhole, removeOwnedFiles } from '../builtin-skills.js';
+import { getFileContentWhenAdded, isPastVersionOf, resolveAnchors } from '../utils/git.js';
+import { isCliOwnedSkillName, ownedSkillFiles, prunedWhole, removeOwnedFiles, skillsGuardBase } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
 import { getHermesHome } from '../hermes-home.js';
 import {
@@ -29,6 +30,45 @@ const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 const SKILL_MD = 'SKILL.md';
 export const CODEX_TOOL = 'codex';
 export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
+
+/**
+ * Root links may share skills under the base within one repository (its checkouts share a project
+ * identity); a skill's own link remains the member's.
+ * Delivery and every team-skill delete apply it, so a root redirected outside the checkout is neither written nor emptied.
+ */
+export async function allowsSkillDirectory(baseDir: string, target: string, { keepSkillLink = false } = {}): Promise<boolean> {
+  const relative = path.relative(baseDir, target);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+  let walked = baseDir;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    walked = path.join(walked, segment);
+    const entry = await lstat(walked).catch((e: NodeJS.ErrnoException) => e.code === 'ENOENT' ? null : Promise.reject(e));
+    if (!entry) break;
+    if (!entry.isSymbolicLink()) continue;
+    // Team-skill ownership checks name and preserve a leaf link without following it.
+    if (walked === target) return keepSkillLink;
+    const resolved = await realpath(walked).catch(() => null);
+    if (!resolved) return false;
+    const base = await realpath(baseDir);
+    const rel = path.relative(base, resolved);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return false;
+    const [from, to] = await Promise.all([resolveAnchors(base), resolveAnchors(resolved)]);
+    // Outside Git (a user-scope home), staying under the base is enough.
+    if (from && from.projectAnchor !== to?.projectAnchor) return false;
+  }
+  return true;
+}
+
+/** Whether a team-skill delete may reach `skillDir` by the delivery rule; warns and keeps it when not. */
+export async function mayDeleteSkillCopy(localConfig: LocalConfig, skillDir: string): Promise<boolean> {
+  if (await allowsSkillDirectory(await skillsGuardBase(resolveBaseDir(localConfig), path.dirname(skillDir)), skillDir)) return true;
+  warnOnce(describeOutsideSkillLink(skillDir));
+  return false;
+}
+
+export function describeOutsideSkillLink(skillDir: string): string {
+  return `Kept ${skillDir}: its skills directory is a link that leaves this checkout, so TeamAI does not delete through it.`;
+}
 
 /**
  * Whether the existing copy at `sharedDir`, in Codex's shared `.agents/skills`,
@@ -75,7 +115,7 @@ export async function resolveSkillDestination(
     // `doctor` and the post-pull pass would otherwise warn about a conflict
     // on every skill, for copies the write path treats as identical.
     if (!sourcePath) return sharedDestination;
-    if (await pathExists(configuredDestination)) {
+    if (await pathExists(configuredDestination) && resolveReal(sharedDestination) !== resolveReal(configuredDestination)) {
       // A link there is the member's: never deleted as a duplicate (#993).
       if (await isLink(configuredDestination)) {
         log.warn(describeMembersLink(configuredDestination, `skills/${skillName}`));
@@ -163,7 +203,6 @@ export async function skillTargetForTool(
 ): Promise<string | null> {
   const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
   if (skillsDir === null || configuredSkillsPath === undefined) return null;
-
   // Codex alone can redirect a skill to the shared `.agents/skills` directory,
   // and only for a skill whose copy there is teamai's — so the destination is
   // per-skill and the gate above cannot answer it.
@@ -1080,8 +1119,15 @@ export class SkillsHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
 
+      const skillsDir = await skillsDirForTool(tool, toolPath.skills, localConfig);
+      if (!skillsDir) continue;
+      const guard = await skillsGuardBase(resolveBaseDir(localConfig), skillsDir);
+      if (!await allowsSkillDirectory(guard, path.join(skillsDir, item.name), { keepSkillLink: true })) {
+        log.warn(`Skipped ${item.name} (${tool}): the skill path leaves this checkout or is a member-owned link. Point the skill directory inside the same repository.`);
+        continue;
+      }
       const ownsShared = async (dest: string): Promise<boolean> =>
-        (await judgeCopy(previous, item, { tool, dest, origin })).kind !== 'member';
+        await allowsSkillDirectory(guard, dest) && (await judgeCopy(previous, item, { tool, dest, origin })).kind !== 'member';
       const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, ownsShared, sourcePath);
       if (dest) targets.push({ tool, dest, origin });
     }
@@ -1176,6 +1222,7 @@ export class SkillsHandler extends ResourceHandler {
       }
       for (const skillDir of skillDirs) {
         if (!await pathExists(skillDir)) continue;
+        if (!await mayDeleteSkillCopy(localConfig, skillDir)) continue;
         // A link is the member's even at a built-in's name, so it is judged before the name.
         // A built-in's name loses the team's files and those a release packaged there, as on uninstall:
         // anything the member added stays.

@@ -69,7 +69,7 @@ import {
 } from './builtin-skills.js';
 import { getHermesHome } from './hermes-home.js';
 import { CODEX_TOOL_IDS } from './utils/tool-names.js';
-import { CODEX_TOOL, SHARED_AGENT_SKILLS_PATH, skillOrigin } from './resources/skills.js';
+import { allowsSkillDirectory, CODEX_TOOL, describeOutsideSkillLink, SHARED_AGENT_SKILLS_PATH, skillOrigin } from './resources/skills.js';
 import { describeKeptDir, describeMembersDirLeft, isLink, keepsTrackedCopy, ownsSkillDir, teamaiSkillFiles } from './resources/delivered-copies.js';
 import { clearInstructionFile, instructionTargetFile, readsTeamRulesFromFile, retiredInstructionFiles, resolveInstructionTargets, userRulesFile } from './instruction-targets.js';
 import {
@@ -173,7 +173,7 @@ interface RemovalPlan {
   /** This project's checkouts, live by record or listed by git (every recorded root when git cannot list them all). */
   checkouts: string[];
   /** teamai's git hook in the project repository: config sections and hook scripts holding its block. */
-  gitHook: { repoDir: string; entries: string[] } | null;
+  gitHook: { repoDir: string; entries: string[]; checkouts?: string[] } | null;
   /** The .teamai home directory path. */
   teamaiHome: string;
   /** Whether teamaiHome exists on disk. */
@@ -633,19 +633,19 @@ async function discoverToolResources(
   if (toolPath.skills) {
     // Skills root → the base the link guard starts from.
     const configuredSkills = path.join(baseDir, toolPath.skills);
-    const skillRoots = new Map([[configuredSkills, skillsGuardBase(scopeRoot, configuredSkills)]]);
+    const skillRoots = new Map([[configuredSkills, await skillsGuardBase(scopeRoot, configuredSkills)]]);
     // OpenClaw and Hermes receive skills where team sync and the stub put them
     // (`skillsDirForTool`): the workspace, and HERMES_HOME.
     if (tool === 'openclaw') {
       const workspaceDir = await resolveOpenclawWorkspaceDir();
       if (workspaceDir) {
         const workspaceSkills = path.join(workspaceDir, 'skills');
-        skillRoots.set(workspaceSkills, skillsGuardBase(scopeRoot, workspaceSkills));
+        skillRoots.set(workspaceSkills, await skillsGuardBase(scopeRoot, workspaceSkills));
       }
     }
     if (tool === 'hermes') {
       const hermesSkills = path.join(getHermesHome(), 'skills');
-      skillRoots.set(hermesSkills, skillsGuardBase(scopeRoot, hermesSkills));
+      skillRoots.set(hermesSkills, await skillsGuardBase(scopeRoot, hermesSkills));
     }
     // `resolveSkillDestination` writes Codex's copy into the shared
     // .agents/skills root when teamai's copy already lives there, so uninstall
@@ -653,7 +653,7 @@ async function discoverToolResources(
     // does. Codex only: another tool's pass must not reach into it.
     if (tool === CODEX_TOOL) {
       const sharedSkills = path.join(baseDir, SHARED_AGENT_SKILLS_PATH);
-      skillRoots.set(sharedSkills, skillsGuardBase(scopeRoot, sharedSkills));
+      skillRoots.set(sharedSkills, await skillsGuardBase(scopeRoot, sharedSkills));
     }
     // A team skill's name is no proof: only teamai's copies go (#993).
     for (const [skillsDir, rootBase] of skillRoots) {
@@ -662,6 +662,11 @@ async function discoverToolResources(
         for (const dir of dirs) {
           if (!teamSkillNames.has(dir)) continue;
           const skillDir = path.join(skillsDir, dir);
+          // Delivery's rule: a root linked out of the checkout is not deleted through.
+          if (!await allowsSkillDirectory(rootBase, skillDir, { keepSkillLink: true })) {
+            res.keptSkillDirs.push(describeOutsideSkillLink(skillDir));
+            continue;
+          }
           if (await ownsSkill(skillDir, dir, tool)) {
             res.skillDirs.push({ dir: skillDir, baseDir: rootBase });
             continue;
@@ -830,6 +835,7 @@ async function buildRemovalPlan(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
   agentFilter?: string,
+  siblingCheckouts = !agentFilter,
 ): Promise<RemovalPlan> {
   const baseDir = resolveBaseDir(localConfig);
   const teamaiHome = getDataHome(localConfig);
@@ -926,13 +932,11 @@ async function buildRemovalPlan(
   // The project's Claude and Codex team hooks, in the main checkout (#955).
   const mainCheckout = await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths);
   const mainCheckouts = mainCheckout ? [mainCheckout] : [];
-  // A bare anchor has no shared checkout file. Uninstall removes the shared
-  // data home, so collect every live workspace's hooks before deleting ownership.
-  if (mainCheckout?.worktreeScoped) {
-    for (const root of await listWorktrees(localConfig.projectRoot!)) {
-      if (root === mainCheckout.root) continue;
+  // Shared partitions also cover submodule clones with distinct Git common dirs.
+  if (mainCheckout && localConfig.projectRoot && siblingCheckouts) {
+    for (const root of await projectCheckouts(localConfig)) {
       const target = await resolveMainCheckoutHooks({ ...localConfig, projectRoot: root }, teamConfig.toolPaths);
-      if (target?.worktreeScoped) mainCheckouts.push(target);
+      if (target && !mainCheckouts.some((existing) => existing.root === target.root)) mainCheckouts.push(target);
     }
   }
   for (const target of mainCheckouts) {
@@ -1384,8 +1388,19 @@ async function buildRemovalPlan(
       // (h) teamai's git hook, in the config every worktree shares.
       if (localConfig.projectRoot) {
         const { removeGitHook } = await import('./git-hook.js');
-        const entries = await removeGitHook(localConfig.projectRoot, { dryRun: true }).catch(() => []);
-        if (entries.length > 0) plan.gitHook = { repoDir: localConfig.projectRoot, entries };
+        const checkouts: string[] = [];
+        let entries: string[] = [];
+        const seen = new Set<string>();
+        for (const root of plan.checkouts) {
+          const common = await gitCommonDir(root);
+          if (!common || seen.has(common)) continue;
+          seen.add(common);
+          const owned = await removeGitHook(root, { dryRun: true }).catch(() => []);
+          if (owned.length === 0) continue;
+          checkouts.push(root);
+          entries = [...new Set([...entries, ...owned])];
+        }
+        if (checkouts.length > 0) plan.gitHook = { repoDir: checkouts[0], entries, checkouts };
       }
     }
   }
@@ -1557,7 +1572,7 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.gitHook) {
-    console.log(`   Git hook in ${plan.gitHook.repoDir} (teamai's entries and blocks):`);
+    console.log(`   Git hook in ${(plan.gitHook.checkouts ?? [plan.gitHook.repoDir]).join(', ')} (teamai's entries and blocks):`);
     for (const entry of plan.gitHook.entries) console.log(`     ${entry}`);
     console.log('');
   }
@@ -1774,7 +1789,11 @@ async function planHomeGitExcludeBlocks(home: string): Promise<HomeGitExcludeBlo
       for (const file of Object.values(state?.gitExcludeFiles ?? {}).flat()) files.add(file);
       for (const { root } of Object.values(state?.lastPullByWorkspace ?? {})) if (root) candidates.add(root);
       const anchor = dataHome === home ? null : await readAnchorFile(dataHome);
-      if (anchor) candidates.add(anchor);
+      if (anchor) {
+        const { checkoutForProjectAnchor } = await import('./utils/git.js');
+        const checkout = await checkoutForProjectAnchor(anchor);
+        if (checkout) candidates.add(checkout);
+      }
     }
   } catch (e) {
     log.warn(`Could not read where teamai's git exclude blocks are: ${(e as Error).message}`);
@@ -1808,8 +1827,10 @@ async function removeHomeLocalScopeMcpServers(skip: readonly string[] = []): Pro
     const dataHome = path.join(projectsRootDir(), dir);
     if (skip.includes(dataHome)) continue;
     const anchor = await readAnchorFile(dataHome);
-    const toolRoots = anchor && await pathExists(anchor)
-      ? await resolveMemberToolRoots(anchor, { selfHeal: false })
+    const { checkoutForProjectAnchor } = await import('./utils/git.js');
+    const checkout = anchor ? await checkoutForProjectAnchor(anchor) : null;
+    const toolRoots = checkout
+      ? await resolveMemberToolRoots(checkout, { selfHeal: false })
       : (await loadLocalConfig())?.toolRoots;
     for (const file of await removeLocalScopeMcpServers(dataHome, toolRoots)) left.add(file);
   }
@@ -1974,11 +1995,11 @@ async function executeRemoval(
   const filesLeft: string[] = [...alreadyLeft.files ?? []];
   if (plan.gitHook) {
     const { removeGitHook } = await import('./git-hook.js');
-    try {
-      await removeGitHook(plan.gitHook.repoDir);
-      log.info(`Removed the teamai git hook from ${plan.gitHook.repoDir}`);
+    for (const repoDir of plan.gitHook.checkouts ?? [plan.gitHook.repoDir]) try {
+      await removeGitHook(repoDir);
+      log.info(`Removed the teamai git hook from ${repoDir}`);
     } catch (e) {
-      log.warn(`Could not remove the teamai git hook from ${plan.gitHook.repoDir}: ${(e as Error).message}. `
+      log.warn(`Could not remove the teamai git hook from ${repoDir}: ${(e as Error).message}. `
         + 'Remove it yourself: `git config --local --remove-section hook.teamai-post-checkout` (and hook.teamai-post-merge and hook.teamai-post-rewrite), '
         + 'and the `# >>> teamai git hook` block in .git/hooks/post-checkout, post-merge and post-rewrite.');
     }
@@ -2419,7 +2440,13 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     }
     // An index an older release left in the tree still owns Copilot's team hooks (#993).
     if (!opts.dryRun) await migrateLegacyManagedHooks(localConfig);
-    const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
+    let plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
+    // The other checkouts of this identity are touched only with the data they share:
+    // a tool-only uninstall acts on this checkout unless it removes that data too.
+    if (agentKey && plan.includeShared) {
+      const withSiblings = await buildRemovalPlan(localConfig, teamConfig, agentKey, true);
+      if (withSiblings.includeShared) plan = withSiblings;
+    }
     // Uninstall never removes these, so they are named whatever happens next.
     await keepTrackedCopies(plan);
     for (const { files, entry } of plan.keptRuleFiles) log.warn(keptLegacyCopiesWarning(files, entry));
@@ -2606,7 +2633,9 @@ async function removeConfirmed(
 
   // Codex team hooks that ran from the dispatcher in ~/.codex/hooks.json (#915),
   // before the data home goes: a dispatcher left running keeps the records for the retry.
-  const dispatchLeft = !agentKey || agentKey === 'codex' ? await stopCodexDispatch(teamConfig, localConfig) : null;
+  const dispatchLeft = !agentKey || agentKey === 'codex' || plan.includeShared
+    ? await stopCodexDispatch(teamConfig, localConfig, plan.includeShared)
+    : null;
   const { pendingOpencode, hooksLeft, blocksLeft, filesLeft } = await executeRemoval(plan, heldMcp, {
     hooks: dispatchLeft ? [{ what: `the Codex team-hook dispatchers in ${dispatchLeft}`, tool: 'codex' }] : [],
     files: [...httpSourceLeft, ...plan.keptUnjudged],
@@ -2658,9 +2687,9 @@ async function removeConfirmed(
  * Stop the project's Codex team hooks that run from the dispatcher in
  * ~/.codex/hooks.json (#915). The file that keeps them running, or null.
  */
-async function stopCodexDispatch(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string | null> {
+async function stopCodexDispatch(teamConfig: TeamaiConfig, localConfig: LocalConfig, retireIdentity = false): Promise<string | null> {
   try {
-    return await stopCodexTeamHookDispatch(teamConfig, localConfig);
+    return await stopCodexTeamHookDispatch(teamConfig, localConfig, retireIdentity);
   } catch (e) {
     const index = path.join('~', '.teamai', 'codex-team-hooks.json');
     log.warn(`Failed to remove the Codex team-hook dispatchers: ${(e as Error).message}.`);

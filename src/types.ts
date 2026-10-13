@@ -924,6 +924,10 @@ export const StateSchema = z.object({
    * (#915). It is kept whatever `sharing.gitExclude` says. A record without
    * it, saved by an older CLI, misses the fast path, so the next pull is a
    * full sync that writes it. A writer id this CLI does not know is kept.
+   * `rootsSeeded` marks that pull's root-seeding step completed or did not
+   * apply (#1041), so a root its member removes afterwards is not recreated.
+   * An unavailable original checkout leaves it absent for a later retry. A
+   * record without it, saved before seeding existed, reads as never seeded.
    */
   lastPullByWorkspace: z.record(z.string(), z.object({
     rev: z.string(),
@@ -933,6 +937,7 @@ export const StateSchema = z.object({
     delivered: z.record(z.string(), z.string()).optional(),
     agentModels: z.record(z.string(), z.record(z.string(), RecordedAgentModelSchema)).optional(),
     gitExcludePaths: z.record(z.string(), z.array(z.string())).optional(),
+    rootsSeeded: z.boolean().optional(),
   })).optional(),
   /**
    * The exclude files holding each git exclude owner's block that this
@@ -1000,6 +1005,8 @@ export const StateSchema = z.object({
    * inputs still match skips spawning `codex app-server`. Absent = run it.
    */
   codexTrustFingerprint: z.string().optional(),
+  /** Project grants this installation actually created; pre-existing user choices are never recorded. */
+  codexProjectTrust: z.array(z.object({ home: z.string(), project: z.string() })).optional(),
   /**
    * OpenCode configs whose `instructions` entry for teamai's context file
    * teamai added, as `{ config, entry }`, so uninstall removes the entry even
@@ -1608,7 +1615,7 @@ export interface DashboardEvent {
    */
   dataHome?: string;
   /**
-   * Main checkout of the git repo holding `cwd` (`resolveAnchors().projectAnchor`),
+   * Stable identity of the git repo holding `cwd` (`resolveAnchors().projectAnchor`),
    * shared by all of its worktrees, so a session is attributed to its repo even
    * after its worktree is removed (#809). An event whose `cwd` no longer exists
    * carries the session's last anchor (#810). Absent outside git, on events that
@@ -2128,8 +2135,7 @@ export type CultureFrontmatter = z.infer<typeof CultureFrontmatterSchema>;
  * workspace root (subdirectory/worktree aware via `resolveAnchors`).
  *
  * This is deliberately separate from the per-project machine-data home: a later
- * phase (P1) keys machine-local data by the shared `projectAnchor` (the main
- * checkout) under `~/.teamai/projects/<slug>/`, while resources continue to land
+ * phase (P1) keys machine-local data by the shared `projectAnchor` (the repository identity) under `~/.teamai/projects/<slug>/`, while resources continue to land
  * at the workspace root returned here. This function only ever governs resource
  * landing, never machine-data location.
  */
