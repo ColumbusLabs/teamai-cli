@@ -33,6 +33,26 @@ steps:
     });
   });
 
+  it('parses inline and file prompts with optional agents', () => {
+    const result = parse(`schemaVersion: v1alpha1
+name: build
+description: Review and summarize.
+steps:
+  - id: review
+    prompt: Review this repository.
+    agent: reviewer
+  - id: summarize
+    prompt_file: prompts/summary.md
+`);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.definition.steps).toEqual([
+      { id: 'review', prompt: 'Review this repository.', agent: 'reviewer' },
+      { id: 'summarize', promptFile: 'prompts/summary.md' },
+    ]);
+    expect(result.promptFileLocations[1]?.line).toBe(9);
+  });
+
   it('names the file, line, and field when the header does not match', () => {
     const result = parse(`schemaVersion: v1
 name: other
@@ -66,20 +86,63 @@ steps:
     expect(formatDiagnostic(duplicate!)).toContain(`${FILE}:7:`);
   });
 
-  it('rejects a step that is not exactly one command', () => {
+  it('rejects multiple actions and an agent on a command', () => {
     const result = parse(`schemaVersion: v1alpha1
 name: build
 description: Build it.
 steps:
   - id: one
     command: echo one
+    prompt: Review it.
     agent: reviewer
 `);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.diagnostics).toEqual([
-      expect.objectContaining({ file: FILE, line: 7, field: 'steps[0].agent', message: 'a step has exactly one command' }),
-    ]);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: 'steps[0]', message: 'a step has exactly one action: command, prompt, or prompt_file' }),
+      expect.objectContaining({ field: 'steps[0].agent', message: 'agent is only allowed on a prompt or prompt_file step' }),
+    ]));
+  });
+
+  it('rejects empty prompts and unsafe prompt_file paths', () => {
+    const result = parse(`schemaVersion: v1alpha1
+name: build
+description: Build it.
+steps:
+  - id: one
+    prompt: ''
+  - id: two
+    prompt_file: ../secret.md
+  - id: three
+    prompt_file: .git/config
+`);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: 'steps[0].prompt', message: 'prompt must be a non-empty string' }),
+      expect.objectContaining({ field: 'steps[1].prompt_file', message: 'prompt_file must be a relative path under prompts/' }),
+      expect.objectContaining({ field: 'steps[2].prompt_file', message: 'prompt_file must be a relative path under prompts/' }),
+    ]));
+  });
+
+  it('names a step key this version does not know', () => {
+    const result = parse(`schemaVersion: v1alpha1
+name: build
+description: Build it.
+steps:
+  - id: one
+    command: npm test
+    if: success
+`);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'unknown_key',
+        field: 'steps[0].if',
+        message: 'workflows/build.yaml uses `if`, which this teamai does not know. Update teamai.',
+      }),
+    ]));
   });
 
   it('rejects a YAML syntax error with the file and line', () => {

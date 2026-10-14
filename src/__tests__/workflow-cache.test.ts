@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LocalConfig } from '../types.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
+import { loadCachedWorkflow, syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, startRun } from '../workflow/engine.js';
 import { readRun } from '../workflow/store.js';
 
@@ -56,6 +56,86 @@ afterEach(() => {
 });
 
 describe('workflow cache', () => {
+  it('caches prompt_file bytes and snapshots them into a run', async () => {
+    const config = testConfig();
+    fs.mkdirSync(path.join(config.repo.localPath, 'prompts'));
+    const promptFile = path.join(config.repo.localPath, 'prompts', 'review.md');
+    fs.writeFileSync(promptFile, 'first prompt');
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt_file: prompts/review.md
+`);
+    await syncWorkflowDefinitions(config);
+    const first = await loadCachedWorkflow(config, 'build');
+    expect(first?.definition.steps[0]).toMatchObject({ promptFile: 'prompts/review.md', prompt: 'first prompt' });
+
+    const started = await startRun(config, 'build');
+    if ('error' in started) throw new Error(started.error.message);
+    fs.writeFileSync(promptFile, 'second prompt');
+    const changed = await syncWorkflowDefinitions(config);
+    const second = await loadCachedWorkflow(config, 'build');
+    expect(second?.sourceHash).not.toBe(first?.sourceHash);
+    expect(changed.cached).toContain('build');
+    fs.rmSync(promptFile);
+
+    const run = await readRun(config, String(started.data.run));
+    if (typeof run !== 'object') throw new Error('run was not stored');
+    expect(run.definition.steps[0]).toMatchObject({ prompt: 'first prompt', promptFile: 'prompts/review.md' });
+
+    const invalid = await syncWorkflowDefinitions(config);
+    expect(invalid.kept).toEqual(['build']);
+    expect((await loadCachedWorkflow(config, 'build'))?.definition.steps[0]?.prompt).toBe('second prompt');
+  });
+
+  it('rejects symlinked prompt files that escape the team repo', async () => {
+    const config = testConfig();
+    const outside = path.join(path.dirname(config.repo.localPath), 'outside-prompt.md');
+    fs.writeFileSync(outside, 'secret');
+    const prompts = path.join(config.repo.localPath, 'prompts');
+    fs.mkdirSync(prompts);
+    fs.symlinkSync(outside, path.join(prompts, 'prompt.md'));
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt_file: prompts/prompt.md
+`);
+
+    const result = await syncWorkflowDefinitions(config);
+
+    expect(result.cached).toEqual([]);
+    expect(result.unrunnable).toEqual(['workflows/build.yaml']);
+    expect(result.invalid[0]).toMatchObject({
+      file: 'workflows/build.yaml',
+      line: 6,
+      field: 'steps[0].prompt_file',
+      message: expect.stringContaining('prompts/'),
+    });
+  });
+
+  it('does not cache a prompt_file outside prompts/', async () => {
+    const config = testConfig();
+    fs.mkdirSync(path.join(config.repo.localPath, '.git'));
+    fs.writeFileSync(path.join(config.repo.localPath, '.git', 'config'), 'oauth2:token@host');
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt_file: .git/config
+`);
+
+    const result = await syncWorkflowDefinitions(config);
+
+    expect(result.cached).toEqual([]);
+    expect(result.unrunnable).toEqual(['workflows/build.yaml']);
+    expect(await loadCachedWorkflow(config, 'build')).toBeNull();
+  });
+
   it('caches a valid workflow and leaves a new invalid file unrunnable', async () => {
     const config = testConfig();
     writeWorkflow(config, 'build', VALID);
@@ -141,6 +221,21 @@ describe('workflow cache', () => {
     expect(cachedText(config)).not.toContain('outside-only.js');
     const started = await startRun(config, 'build');
     expect(started).toMatchObject({ error: { code: 'workflow_not_found' } });
+  });
+
+  it('drops the last valid version when a revision uses a key this version does not know', async () => {
+    const config = testConfig();
+    writeWorkflow(config, 'build', VALID);
+    await syncWorkflowDefinitions(config);
+    expect(await loadCachedWorkflow(config, 'build')).not.toBeNull();
+
+    writeWorkflow(config, 'build', VALID.replace('command: node compile.js', 'command: node compile.js\n    if: success'));
+    const synced = await syncWorkflowDefinitions(config);
+
+    expect(synced.unrunnable).toContain('workflows/build.yaml');
+    expect(synced.kept).not.toContain('build');
+    expect(await loadCachedWorkflow(config, 'build')).toBeNull();
+    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('keeps each self-mode checkout on its own cache', async () => {
