@@ -177,6 +177,21 @@ teamai projects set checkout
 teamai pull
 ```
 
+## 把技能限定给部分成员
+
+Namespace 只对设置了角色的成员过滤：`primaryRole` 未设置的成员会同步全部技能，因此只有 `manifest/roles.yaml` 并不限定任何人。`teamai init` 会让新成员选择角色；manifest 之前入队的成员需要执行一次 `teamai roles set <role-id>`。之后的 pull 会收回新 namespace 之外、由 teamai 下发的副本（本地改过的保留）。
+
+要提醒一直没设角色的成员，可以用强制规则让 agent 检查 `teamai roles list` 并催促设置——强制规则成员不可删除：
+
+```yaml
+# teamai.yaml
+sharing:
+  rules:
+    enforced: [set-your-role]
+```
+
+标签从不做限定：订阅只会额外拉取匹配标签的技能。限定用 namespace + 角色，标签用于自愿加法。
+
 ## 标签
 
 标签打在 skill 或 rule 上，存在团队仓库的 `tags.yaml`。成员在自己机器上订阅。没订阅任何标签时，标签不参与。订阅之后，带这些标签的 skill 和 rule 也会拉下来。没打标签的仍按角色和项目发。
