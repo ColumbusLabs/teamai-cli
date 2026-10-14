@@ -43,3 +43,22 @@ teamai session save --push --force
 ```
 
 本地写到 `~/.teamai/session-logs/<年-月>.md`。`--push` 把有摩擦或用了至少 3 种工具的会话交到团队的 `teamai-reports` 分支。默认不带 prompt 原文。
+
+## Session 同步与迁移
+
+`teamai session` 在工具之间迁移完整会话，或归档到团队仓库。`session save` 仍是脱敏摘要。
+
+平台：`claude-code`、`codex`、`codebuddy`、`codebuddy-ide`、`cursor`、`workbuddy`。`teamai session platforms` 查看本机已安装的。
+
+```bash
+teamai session migrate <sessionId> -s codebuddy-ide -t claude-code
+teamai session migrate --all -s codebuddy -t claude-code   # --limit 可限量
+teamai session rollback <id> --platform claude-code
+teamai session push --source codebuddy                     # --all：该平台全部工作区
+teamai session pull
+teamai session list                                        # --all：全部项目
+teamai session search <query>
+teamai session resume <name> --platform claude-code
+```
+
+`--dry-run` 只预览。`--scrub` 先脱敏再归档；不加时，交互运行会询问，脚本需要 `-y`。`--all` 超过 10 条要确认（push 为 5 条）。归档在 `sessions/repos/<repo>/<author>/`，按会话自己的 git remote；否则归入 `_unattributed`。
