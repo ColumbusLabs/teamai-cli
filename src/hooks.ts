@@ -124,6 +124,8 @@ interface CursorHooksJson {
 interface CodexHookEntry {
   type: string;
   command: string;
+  /** The command Codex runs instead on Windows, where its hook shell is PowerShell. */
+  commandWindows?: string;
   timeout?: number;
   additionalContextLimit?: number;
 }
@@ -1517,11 +1519,13 @@ function toCursorEntry(def: HookDef): CursorHookEntry {
 }
 
 function toCodexEntry(def: HookDef): CodexHookMatcher {
+  const commandWindows = codexWindowsCommand(def.command);
   const entry: CodexHookMatcher = {
     hooks: [
       {
         type: 'command',
         command: def.command,
+        ...(commandWindows !== undefined ? { commandWindows } : {}),
         ...(def.timeout !== undefined ? { timeout: def.timeout } : {}),
         ...(def.additionalContextLimit !== undefined ? { additionalContextLimit: def.additionalContextLimit } : {}),
       },
@@ -1533,12 +1537,28 @@ function toCodexEntry(def: HookDef): CodexHookMatcher {
 
 // getDispatchCommand() prefixes the launcher with a quoted, forward-slash Git
 // Bash path on Windows and keeps bare `bash` everywhere else (and on Windows
-// machines where Git Bash cannot be found).
-const COPILOT_BUILTIN_COMMAND_RE = /^("[^"]+"|bash) -lc "(teamai hook-dispatch [^"]+) 2>\/dev\/null" \|\| true$/;
+// machines where Git Bash cannot be found, and for the Codex tools, which get
+// their Windows form through `commandWindows`).
+const BUILTIN_DISPATCH_COMMAND_RE = /^("[^"]+"|bash) -lc "(teamai hook-dispatch [^"]+) 2>\/dev\/null" \|\| true$/;
+
+/**
+ * The `commandWindows` of a built-in Codex entry: the PowerShell form of its
+ * dispatch (the contract of getPwshDispatchCommand in builtin-hooks.ts), since
+ * Codex runs hook commands in PowerShell on Windows (#1074). Carrying it in
+ * Codex' Windows-only override instead of in `command` keeps `command` the POSIX
+ * form on every platform, so a project `.codex/hooks.json` a repository commits
+ * reads the same after a Windows pull and after a Linux pull. A team hook keeps
+ * the single command its author wrote.
+ */
+function codexWindowsCommand(command: string): string | undefined {
+  const match = command.match(BUILTIN_DISPATCH_COMMAND_RE);
+  if (!match) return undefined;
+  return `${match[2]} 2>$null; exit 0`;
+}
 
 /** Render a valid PowerShell equivalent for TeamAI's generated bash wrapper. */
 function copilotPowershellCommand(command: string): string {
-  const match = command.match(COPILOT_BUILTIN_COMMAND_RE);
+  const match = command.match(BUILTIN_DISPATCH_COMMAND_RE);
   if (!match) return command;
   // PowerShell needs the call operator before a quoted executable path, and
   // `|| true` maps to `; exit 0`. The dispatch command inside is
@@ -3352,7 +3372,7 @@ interface CodexTrustTargets {
   /** The checkout whose hook layers are listed (HOME in user scope). */
   cwd: string;
   /** Exact generated Codex entries, including Codex's file/event/position key. */
-  hooks: Array<{ file: string; command: string; key: string }>;
+  hooks: Array<{ file: string; command: string; commandWindows?: string; key: string }>;
   /** The main checkout, when Codex has to read its `.codex/` layer. */
   project?: string;
   /** The files whose bytes a trust pass depends on. */
@@ -3373,7 +3393,13 @@ async function teamaiCodexHooks(file: string, manifestPath: string): Promise<Cod
       def.event === event && def.command === command && toCodexEntry(def).matcher === group.matcher));
     if (typeof command !== 'string' || !(builtin || records.some((r) => ownsCodexEntry(r, event, index, groups)))) return [];
     const snake = event.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
-    return [{ file, command, key: `${canonicalProjectRoot(file)}:${snake}:${index}:0` }];
+    const commandWindows = group.hooks?.[0]?.commandWindows;
+    return [{
+      file,
+      command,
+      ...(commandWindows !== undefined ? { commandWindows } : {}),
+      key: `${canonicalProjectRoot(file)}:${snake}:${index}:0`,
+    }];
   }));
 }
 
