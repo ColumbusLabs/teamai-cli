@@ -14,6 +14,7 @@ import { reconcilePlacementRecords, dropClosedPendingPushes,
 import { syncTeamUpdatesToLocal } from './utils/pre-push-sync.js';
 import { getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
+import { getUserHome } from './utils/home.js';
 import { getHandler } from './resources/index.js';
 import { createSkillPushItem, scanTeamRepoNamespaces } from './resources/skills.js';
 import { AgentsHandler } from './resources/agents.js';
@@ -851,10 +852,15 @@ async function pushGroup(args: {
   }
 }
 
-/** The `--skill` path as given (`~` expanded, made absolute), and the skill directory it resolves to. */
-async function resolveRequestedSkill(skill: string): Promise<{ requestedPath: string; skillPath: string }> {
-  const os = await import('node:os');
-  const requestedPath = skill.startsWith('~') ? path.join(os.homedir(), skill.slice(1)) : path.resolve(skill);
+/**
+ * The `--skill` path as given (`~` expanded, made absolute), and the skill
+ * directory it resolves to.
+ *
+ * `~` goes through `getUserHome()` like every other home-relative path, so
+ * `push --skill ~/...` reads the same home the scan and the credentials use.
+ */
+function resolveRequestedSkill(skill: string): { requestedPath: string; skillPath: string } {
+  const requestedPath = skill.startsWith('~') ? path.join(getUserHome(), skill.slice(1)) : path.resolve(skill);
   return { requestedPath, skillPath: resolveReal(requestedPath) };
 }
 
@@ -1397,7 +1403,7 @@ async function pushCore(
   const openPushes = await dropClosedPendingPushes(localConfig.repo.localPath, recordedPushes);
 
   // The copy `--skill` names. The skills scan leaves its outcome to --skill below.
-  const requestedSkill = options.skill ? await resolveRequestedSkill(options.skill) : undefined;
+  const requestedSkill = options.skill ? resolveRequestedSkill(options.skill) : undefined;
 
   for (const type of pushableTypes) {
     const handler = getHandler(type);

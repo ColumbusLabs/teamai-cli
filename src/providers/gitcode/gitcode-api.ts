@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { GITCODE_HOST } from './repo-url.js';
+import { getUserHome, legacyUserHome } from '../../utils/home.js';
 import { sanitizeGitUrl } from '../../utils/redact.js';
 
 /**
@@ -71,20 +71,49 @@ function authHeaders(token: string): Record<string, string> {
 // Entry format: `machine gitcode.com login oauth2 password <token>`.
 
 function netrcPath(): string {
-  return path.join(os.homedir(), '.netrc');
+  return path.join(getUserHome(), '.netrc');
+}
+
+/**
+ * Every `~/.netrc` that may hold the token, most current first.
+ *
+ * `netrcPath()` follows `getUserHome()`; before that it followed
+ * `os.homedir()`. A user whose `HOME` points elsewhere already has their token
+ * in the older location, so reads fall back to it rather than reporting
+ * "unauthenticated" and making them paste the token again. Writes always target
+ * `netrcPath()`, so re-authenticating consolidates onto the current home.
+ *
+ * Returns an empty list when no home resolves at all — the same "no credential
+ * found" outcome the caller had before, rather than an exception from a getter
+ * that used to swallow everything.
+ */
+function netrcReadPaths(): string[] {
+  let current: string;
+  try {
+    current = netrcPath();
+  } catch {
+    return [];
+  }
+  const paths = [current];
+  const legacy = legacyUserHome();
+  if (legacy) paths.push(path.join(legacy, '.netrc'));
+  return paths;
 }
 
 /** Read the gitcode.com token from ~/.netrc, or null when absent/unreadable. */
 export function readNetrcToken(): string | null {
-  try {
-    const content = fs.readFileSync(netrcPath(), 'utf-8');
-    const match = content.match(
-      new RegExp(`machine\\s+${GITCODE_HOST.replace('.', '\\.')}\\s+.*?password\\s+(\\S+)`),
-    );
-    return match?.[1] ?? null;
-  } catch {
-    return null;
+  const pattern = new RegExp(
+    `machine\\s+${GITCODE_HOST.replace('.', '\\.')}\\s+.*?password\\s+(\\S+)`,
+  );
+  for (const file of netrcReadPaths()) {
+    try {
+      const match = fs.readFileSync(file, 'utf-8').match(pattern);
+      if (match?.[1]) return match[1];
+    } catch {
+      // Missing or unreadable here — try the next location.
+    }
   }
+  return null;
 }
 
 /**
