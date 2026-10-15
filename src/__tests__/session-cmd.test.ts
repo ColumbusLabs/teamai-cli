@@ -29,9 +29,13 @@ const mocks = vi.hoisted(() => ({
   pushError: '',
   gitCalls: [] as Array<{ args: string[]; cwd?: string }>,
   adaptersByPlatform: {} as Record<string, unknown>,
-  /** migrate.js mock 的 preview/migrate 返回值 */
+  /** migrate.js mock 的 preview 返回值（Error 时抛出）；agent-session.js mock 的 copy 返回值 */
   previewResult: null as unknown,
-  migrateResult: null as unknown,
+  copyResult: null as unknown,
+  /** The OS the commands' `noAdapter` checks judge by; this machine's when unset. */
+  os: undefined as NodeJS.Platform | undefined,
+  /** When set, the session archive lock reports this path as held by another command. */
+  heldArchiveLock: '',
   /** readline mock：ask() 等待输入时捕获的 'line' 回调 */
   lineCb: null as ((line: string) => void) | null,
   lineArmed: null as (() => void) | null,
@@ -100,6 +104,16 @@ vi.mock('../session-flow/adapters/index.js', () => ({
   },
   listAvailablePlatforms: () => Object.keys(mocks.adaptersByPlatform),
   listInstalledPlatforms: () => [],
+  // AgentSession looks adapters up here.
+  ADAPTER_REGISTRY: new Proxy(
+    {},
+    {
+      get: (_registry, platform) =>
+        typeof platform === 'string' && mocks.adaptersByPlatform[platform]
+          ? () => mocks.adaptersByPlatform[platform]
+          : undefined,
+    },
+  ),
 }));
 
 vi.mock('../session-flow/migrate.js', () => ({
@@ -108,18 +122,41 @@ vi.mock('../session-flow/migrate.js', () => ({
       public readonly source: string,
       public readonly target: string,
     ) {}
-    async preview(): Promise<unknown> {
+    preview(): unknown {
       return mocks.previewResult;
     }
-    async migrate(): Promise<unknown> {
-      return mocks.migrateResult;
-    }
   },
+  resolveTargetCwd: (explicit: string | undefined, sourceCwd: string | undefined) => explicit ?? sourceCwd,
 }));
+
+vi.mock('../session-flow/sync.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import('../session-flow/sync.js');
+  return {
+    ...actual,
+    withSessionIndexLock: (async (repo, fn) =>
+      mocks.heldArchiveLock
+        ? { status: 'busy', lockPath: mocks.heldArchiveLock }
+        : actual.withSessionIndexLock(repo, fn)) as typeof actual.withSessionIndexLock,
+  };
+});
+
+vi.mock('../session-flow/agent-session.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import('../session-flow/agent-session.js');
+  return {
+    ...actual,
+    AgentSession: {
+      ...actual.AgentSession,
+      copy: async (request: unknown): Promise<unknown> =>
+        typeof mocks.copyResult === 'function' ? mocks.copyResult(request) : mocks.copyResult,
+    },
+    noAdapter: (platform: string, use: 'read' | 'write') => actual.noAdapter(platform, use, mocks.os),
+  };
+});
 
 import { registerSessionFlowCommands } from '../session-flow/session-cmd.js';
 import { SyncManager, defaultSyncMeta } from '../session-flow/sync.js';
 import type { Session } from '../session-flow/ir.js';
+import { ToolUnavailableError, type SessionReadRef } from '../session-flow/adapters/base.js';
 import { ClaudeCodeAdapter } from '../session-flow/adapters/claude-code.js';
 import { CodeBuddyAdapter } from '../session-flow/adapters/codebuddy.js';
 import { CursorAdapter } from '../session-flow/adapters/cursor.js';
@@ -145,7 +182,9 @@ beforeEach(() => {
   mocks.gitCalls.length = 0;
   mocks.adaptersByPlatform = {};
   mocks.previewResult = null;
-  mocks.migrateResult = null;
+  mocks.copyResult = null;
+  mocks.os = undefined;
+  mocks.heldArchiveLock = '';
   mocks.lineArmed = null;
   vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
     out.push(a.map(String).join(' '));
@@ -199,8 +238,11 @@ function mkSession(o: Partial<Session> = {}): Session {
 /** 注册一个假适配器（listConversations/readSession 都是 spy），返回 adapter 供断言。 */
 function fakeAdapter(sessions: Session[], platform = 'fakeplat') {
   const byId = new Map(sessions.map((s) => [s.sessionId, s]));
+  const fileOf = (s: Session): string => `/fake/${s.sessionId}.jsonl`;
+  const byFile = new Map(sessions.map((s) => [fileOf(s), s]));
   const adapter = {
     platform,
+    isReady: () => true,
     listConversations: vi.fn(async () =>
       sessions.map((s) => ({
         sessionId: s.sessionId,
@@ -210,13 +252,14 @@ function fakeAdapter(sessions: Session[], platform = 'fakeplat') {
         createdAt: s.createdAt,
         updatedAt: s.updatedAt,
         messageCount: s.messages.length,
-        filePath: '/tmp/x',
+        filePath: fileOf(s),
         sizeBytes: 100,
       })),
     ),
-    readSession: vi.fn(async (id: string) => {
-      const s = byId.get(id);
-      if (!s) throw new Error(`session not found: ${id}`);
+    // Same contract as the real adapters: the listed file wins over the id.
+    readSession: vi.fn(async ({ sessionId, filePath }: SessionReadRef) => {
+      const s = filePath ? byFile.get(filePath) : byId.get(sessionId);
+      if (!s) throw new Error(`session not found: ${filePath ?? sessionId}`);
       return s;
     }),
   };
@@ -297,6 +340,25 @@ describe('session pull --all', () => {
   });
 });
 
+describe('session pull', () => {
+  it.each([
+    ['pull --all', ['--all']],
+    ['pull', ['--cwd', '/run/alpha']],
+  ])('a second %s leaves _index.json byte-identical', async (_name, args) => {
+    seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment alpha');
+    seed('github.com/org/alpha', 'bob', 'b-1', 'refunds', 'refund notes');
+    mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
+    const idxPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
+
+    await runSession('pull', ...args, '--repo-root', repoRoot);
+    const first = fs.readFileSync(idxPath, 'utf-8');
+    await runSession('pull', ...args, '--repo-root', repoRoot);
+
+    expect(errored).toEqual([]);
+    expect(fs.readFileSync(idxPath, 'utf-8')).toBe(first);
+  });
+});
+
 describe('session search --all', () => {
   it('searches every repo including _unattributed without double-loading the current one', async () => {
     seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
@@ -315,6 +377,32 @@ describe('session search --all', () => {
     // 恰好 3 次：当前 repo 不会因为同时也在 --all 清单里被加载两遍
     expect(loadSpy).toHaveBeenCalledTimes(3);
     expect(text).not.toMatch(CJK);
+  });
+
+  it('prints a nonzero score for a session that matches only in tool output', async () => {
+    seed('github.com/org/alpha', 'alice', 'a-1', 'docs', 'fix the readme');
+    new SyncManager(repoRoot).saveSession(
+      mkSession({
+        sessionId: 'b-1',
+        title: 'build',
+        platform: 'claude-code',
+        cwd: '/proj/seed',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'run the build' }] },
+          { role: 'user', content: [{ type: 'tool_result', callId: 't1', content: 'error TS2304: Cannot find name ZZTOP', isError: true }] },
+        ],
+      }),
+      defaultSyncMeta(
+        { platform: 'claude-code', author: 'bob', cwd: '/proj/seed', sessionId: 'b-1', repoIdentity: 'github.com/org/alpha' },
+        '2026-01-02T00:00:00.000Z',
+      ),
+    );
+    mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
+
+    await runSession('search', 'ZZTOP', '--repo-root', repoRoot, '--cwd', '/run/alpha');
+
+    const score = /Score: (\S+)/.exec(out.join('\n'))?.[1];
+    expect(Number(score)).toBeGreaterThan(0);
   });
 
   it('scopes search to the current repo without --all', async () => {
@@ -348,7 +436,7 @@ describe('session push --all', () => {
 
     expect(adapter.readSession).toHaveBeenCalledTimes(8);
     // --all 枚举全部工作区：listConversations 以无参形式调用
-    expect(adapter.listConversations).toHaveBeenCalledWith();
+    expect(adapter.listConversations).toHaveBeenCalledWith(undefined);
 
     const dir = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('gitlab.com/team/beta'), 'tester');
     expect(fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl'))).toHaveLength(8);
@@ -476,6 +564,43 @@ describe('session push --all', () => {
     expect(text).not.toContain('✓ Pushed');
     expect(process.exitCode).toBe(1);
   });
+
+  // An older TeamAI reused source ids, so one Claude Code id can live in two workspaces.
+  it('archives each listed session when one id lives in two workspaces', async () => {
+    const SID = '0190a0b0-c0d0-7e0f-8a0b-0c0d0e0f1a2b';
+    for (const [cwd, encoded, text] of [
+      ['/proj/alpha', '-proj-alpha', 'work in alpha'],
+      ['/proj/beta', '-proj-beta', 'work in beta'],
+    ]) {
+      const projDir = path.join(mocks.home, '.claude', 'projects', encoded);
+      fs.mkdirSync(projDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(projDir, `${SID}.jsonl`),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text }] },
+          cwd,
+          timestamp: '2026-01-02T00:00:00.000Z',
+          uuid: 'u1',
+          parentUuid: null,
+          isSidechain: false,
+        }) + '\n',
+      );
+    }
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    mocks.remotes['/proj/alpha'] = 'https://github.com/org/alpha.git';
+    mocks.remotes['/proj/beta'] = 'https://gitlab.com/team/beta.git';
+
+    await runSession('push', '--source', 'claude-code', '--all', '-y', '--repo-root', repoRoot, '--cwd', '/run/dir');
+
+    const archived = (identity: string): string => {
+      const dir = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity(identity), 'tester');
+      const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')) : [];
+      return files.map((f) => fs.readFileSync(path.join(dir, f), 'utf-8')).join('');
+    };
+    expect(archived('github.com/org/alpha')).toContain('work in alpha');
+    expect(archived('gitlab.com/team/beta')).toContain('work in beta');
+  });
 });
 
 describe('session push archive key (native cwd, not the run directory)', () => {
@@ -561,11 +686,13 @@ describe('session migrate interactive picker', () => {
       messageCount: 1,
       fidelity: { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] },
     };
-    mocks.migrateResult = {
-      success: true,
-      targetSessionId: 'tgt-1',
-      targetFilePath: '/tmp/tgt.jsonl',
-      preview: { fidelity: { score: 1 } },
+    mocks.copyResult = {
+      status: 'done',
+      sessionId: 'tgt-1',
+      cwd: '/run/dir',
+      reused: false,
+      filePath: '/tmp/tgt.jsonl',
+      fidelity: { score: 1 },
     };
     const { MigrationEngine } = await import('../session-flow/migrate.js');
     const previewSpy = vi.spyOn(MigrationEngine.prototype, 'preview');
@@ -576,7 +703,7 @@ describe('session migrate interactive picker', () => {
     // The picker is on page 2 by the time the number is entered, and the
     // selected id is the 11th newest -- unreachable before paging existed.
     expect(out.join('\n')).toContain('page 2/2');
-    expect(previewSpy).toHaveBeenCalledWith(expected, '/run/dir');
+    expect(previewSpy).toHaveBeenCalledWith(sessions[1]);
   });
 
   it('cancels on an empty answer instead of paging forever', async () => {
@@ -607,11 +734,13 @@ describe('session migrate --push archive key', () => {
       messageCount: 2,
       fidelity: { score: 1, mode: 1, preservedBlocks: 2, totalBlocks: 2, degradedBlocks: 0, degradations: [], warnings: [] },
     };
-    mocks.migrateResult = {
-      success: true,
-      targetSessionId: 'tgt-1',
-      targetFilePath: '/tmp/tgt.jsonl',
-      preview: { fidelity: { score: 0.9 } },
+    mocks.copyResult = {
+      status: 'done',
+      sessionId: 'tgt-1',
+      cwd: '/run/dir',
+      reused: false,
+      filePath: '/tmp/tgt.jsonl',
+      fidelity: { score: 0.9 },
     };
 
     fakeAdapter([mkSession({ sessionId: 'src-1', title: 'migrate me', cwd: '/run/dir' })], 'fakeplat');
@@ -654,11 +783,7 @@ describe('session migrate --push archive key', () => {
       messageCount: 1,
       fidelity: { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] },
     };
-    mocks.migrateResult = {
-      success: true,
-      targetSessionId: 'tgt-1',
-      preview: { fidelity: { score: 1 } },
-    };
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity: { score: 1 } };
     fakeAdapter([mkSession({ sessionId: 'src-1', cwd: '/run/dir' })], 'fakeplat');
     const targetSession = mkSession({
       sessionId: 'tgt-1',
@@ -701,11 +826,7 @@ describe('session migrate --push archive key', () => {
       messageCount: 2,
       fidelity: { score: 1, mode: 1, preservedBlocks: 2, totalBlocks: 2, degradedBlocks: 0, degradations: [], warnings: [] },
     };
-    mocks.migrateResult = {
-      success: true,
-      targetSessionId: 'tgt-1',
-      preview: { fidelity: { score: 1 } },
-    };
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity: { score: 1 } };
     fakeAdapter([mkSession({ sessionId: 'src-1' })], 'fakeplat');
     mocks.adaptersByPlatform['fakeplat2'] = {
       platform: 'fakeplat2',
@@ -734,11 +855,13 @@ describe('session migrate --push archive key', () => {
       messageCount: 1,
       fidelity: { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] },
     };
-    mocks.migrateResult = {
-      success: true,
-      targetSessionId: 'tgt-1',
-      registrationNotice: 'Cursor session list registration failed (transcript written, session may be invisible in Cursor): state db not found',
-      preview: { fidelity: { score: 1 } },
+    mocks.copyResult = {
+      status: 'done',
+      sessionId: 'tgt-1',
+      cwd: '/run/dir',
+      reused: false,
+      notice: 'Cursor session list registration failed (transcript written, session may be invisible in Cursor): state db not found',
+      fidelity: { score: 1 },
     };
     fakeAdapter([mkSession()], 'fakeplat');
     mocks.adaptersByPlatform['tgtplat'] = {
@@ -753,6 +876,563 @@ describe('session migrate --push archive key', () => {
     expect(text).toContain('Migration successful');
     expect(text).toContain('transcript written, session may be invisible');
     expect(process.exitCode).not.toBe(1);
+  });
+});
+
+describe('session migrate of a session already migrated', () => {
+  const preview = {
+    sourcePlatform: 'fakeplat',
+    targetPlatform: 'tgtplat',
+    sessionTitle: 'task',
+    sessionId: 's-1',
+    cwd: '/run/dir',
+    messageCount: 1,
+    fidelity: { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] },
+  };
+
+  // The copy itself is mocked; the target only has to be a platform the CLI knows.
+  beforeEach(() => {
+    mocks.adaptersByPlatform['tgtplat'] = { platform: 'tgtplat' };
+  });
+
+  it('reports the existing copy, how to refresh it, and succeeds', async () => {
+    mocks.previewResult = preview;
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: true, fidelity: { score: 1 } };
+    fakeAdapter([mkSession()], 'fakeplat');
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir');
+
+    const text = out.join('\n');
+    expect(text).toContain('already migrated as tgt-1, nothing written');
+    expect(text).toContain('teamai session rollback tgt-1 --platform tgtplat --cwd "/run/dir"');
+    expect(text).toContain('0 session(s) migrated, 1 already migrated.');
+    expect(text).not.toContain('Migration successful');
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('prints the failure and exits 1 when the copy fails', async () => {
+    mocks.previewResult = preview;
+    mocks.copyResult = {
+      status: 'failed',
+      failure: { code: 'invalid_workspace', cwd: 'rel/ws', message: 'Target workspace "rel/ws" is not an absolute path' },
+    };
+    fakeAdapter([mkSession()], 'fakeplat');
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--target-cwd', 'rel/ws');
+
+    expect(errored.join('\n')).toContain('Migration failed: Target workspace "rel/ws" is not an absolute path');
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe('a batch over sessions when one session cannot be read', () => {
+  // Three sessions, the middle one unreadable: every batch names it, finishes the other two, and exits 1.
+  const ids = ['ok-1', 'bad-2', 'ok-3'];
+  const fidelity = { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] };
+  let copied: string[] = [];
+
+  /** An adapter listing every session in `sessionIds` whose `readSession` throws on `unreadable`. */
+  function adapterWith(platform: string, sessionIds: string[], unreadable: string) {
+    const adapter = fakeAdapter(
+      sessionIds.map((sessionId, i) =>
+        mkSession({ sessionId, platform, title: `task ${sessionId}`, updatedAt: `2026-01-0${9 - i}T00:00:00.000Z` }),
+      ),
+      platform,
+    );
+    const read = adapter.readSession.getMockImplementation()!;
+    adapter.readSession.mockImplementation(async (ref: SessionReadRef) => {
+      if (ref.sessionId === unreadable) throw new Error('Unexpected end of JSON input');
+      return read(ref);
+    });
+    // A read by id alone asks whether the session exists, to tell unreadable from missing.
+    Object.assign(adapter, { existingSessionId: async (id: string) => (sessionIds.includes(id) ? id : undefined) });
+  }
+
+  /** The source session ids archived in the team repo. */
+  function archivedIds(): string[] {
+    const sessionsDir = path.join(repoRoot, 'sessions');
+    if (!fs.existsSync(sessionsDir)) return [];
+    return (fs.readdirSync(sessionsDir, { recursive: true }) as string[])
+      .filter((f) => f.endsWith('.meta.json'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf-8')).origin.sessionId as string)
+      .sort();
+  }
+
+  beforeEach(() => {
+    copied = [];
+    mocks.remotes['/proj/beta'] = 'https://gitlab.com/team/beta.git';
+    mocks.previewResult = {
+      sourcePlatform: 'fakeplat',
+      targetPlatform: 'tgtplat',
+      sessionTitle: 'task',
+      sessionId: 'x',
+      cwd: '/proj/beta',
+      messageCount: 2,
+      fidelity,
+    };
+    mocks.copyResult = (request: { from: { sessionId: string } }) => {
+      copied.push(request.from.sessionId);
+      return { status: 'done', sessionId: `tgt-${request.from.sessionId}`, cwd: '/proj/beta', reused: false, fidelity };
+    };
+  });
+
+  const cases: Array<{
+    name: string;
+    setup: () => void;
+    argv: string[];
+    /** What the run did to the healthy sessions. */
+    done: () => string[];
+    expected: string[];
+    summary: string;
+  }> = [
+    {
+      name: 'migrate --all copies the others',
+      setup: () => {
+        adapterWith('fakeplat', ids, 'bad-2');
+        mocks.adaptersByPlatform['tgtplat'] = { platform: 'tgtplat' };
+      },
+      argv: ['migrate', '-s', 'fakeplat', '-t', 'tgtplat', '--all', '-y', '--cwd', '/proj/beta'],
+      done: () => copied.sort(),
+      expected: ['ok-1', 'ok-3'],
+      summary: '2 session(s) migrated, 1 failed.',
+    },
+    {
+      name: 'migrate --all --dry-run previews the others',
+      setup: () => {
+        adapterWith('fakeplat', ids, 'bad-2');
+        mocks.adaptersByPlatform['tgtplat'] = { platform: 'tgtplat' };
+      },
+      argv: ['migrate', '-s', 'fakeplat', '-t', 'tgtplat', '--all', '-y', '--cwd', '/proj/beta', '--dry-run'],
+      done: () => out.flatMap((line) => line.match(/not migrated: (\S+?)\.\.\./)?.slice(1) ?? []).sort(),
+      expected: ['ok-1', 'ok-3'],
+      summary: '2 session(s) would be migrated, 1 failed (--dry-run, no changes made).',
+    },
+    {
+      name: 'migrate --all --push archives the copies it can read back',
+      setup: () => {
+        adapterWith('fakeplat', ids, '');
+        adapterWith('tgtplat', ids.map((id) => `tgt-${id}`), 'tgt-bad-2');
+      },
+      argv: ['migrate', '-s', 'fakeplat', '-t', 'tgtplat', '--all', '--push', '-y', '--repo-root', '<repo>', '--cwd', '/proj/beta'],
+      done: archivedIds,
+      expected: ['tgt-ok-1', 'tgt-ok-3'],
+      summary: 'Pushed 2 session(s) to team repo',
+    },
+    {
+      name: 'push --all archives the others',
+      setup: () => adapterWith('fakeplat', ids, 'bad-2'),
+      argv: ['push', '--source', 'fakeplat', '--all', '-y', '--repo-root', '<repo>', '--cwd', '/run/dir'],
+      done: archivedIds,
+      expected: ['ok-1', 'ok-3'],
+      summary: 'Pushed 2 session(s) from fakeplat',
+    },
+  ];
+
+  it.each(cases)('$name, names the failed one, and exits 1', async ({ setup, argv, done, expected, summary }) => {
+    setup();
+    // repoRoot is created per test, after the table is built.
+    await runSession(...argv.map((a) => (a === '<repo>' ? repoRoot : a)));
+
+    expect(done()).toEqual(expected);
+    expect(errored.join('\n')).toMatch(/bad-2/);
+    expect(out.join('\n')).toContain(summary);
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe('session migrate --json', () => {
+  const fidelity = { score: 1, mode: 1, preservedBlocks: 1, totalBlocks: 1, degradedBlocks: 0, degradations: [], warnings: [] };
+  const preview = {
+    sourcePlatform: 'fakeplat',
+    targetPlatform: 'tgtplat',
+    sessionTitle: 'task',
+    sessionId: 's-1',
+    cwd: '/run/dir',
+    messageCount: 1,
+    fidelity,
+  };
+
+  /** stdout must hold exactly one JSON line: the envelope. */
+  function envelope(): { data?: Record<string, unknown>; error?: { code: string; message: string } } {
+    const lines = out.join('').split('\n').filter((l) => l.trim() !== '');
+    expect(lines).toHaveLength(1);
+    return JSON.parse(lines[0]);
+  }
+
+  beforeEach(() => {
+    mocks.previewResult = preview;
+    fakeAdapter([mkSession()], 'fakeplat');
+    mocks.adaptersByPlatform['tgtplat'] = {
+      platform: 'tgtplat',
+      listConversations: vi.fn(async () => []),
+      readSession: vi.fn(async () => mkSession({ sessionId: 'tgt-1' })),
+    };
+  });
+
+  it('prints the copy as one data envelope and nothing else on stdout', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({ data: { sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity } });
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('reports an existing copy as reused', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: true, fidelity };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({ data: { sessionId: 'tgt-1', cwd: '/run/dir', reused: true, fidelity } });
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('prints a failed copy as an error envelope with its code and exits 1', async () => {
+    const message = 'Target platform "tgtplat" is not installed or its storage directory was not found.';
+    mocks.copyResult = { status: 'failed', failure: { code: 'tool_unavailable', platform: 'tgtplat', message } };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({ error: { code: 'tool_unavailable', message } });
+    expect(process.exitCode).toBe(1);
+  });
+
+  // OpenCode lists its sessions through its CLI, so a missing CLI fails the listing itself.
+  it('names a source whose CLI cannot run tool_unavailable', async () => {
+    const message = 'The opencode CLI was not found on PATH. Install OpenCode 2 or later.';
+    mocks.adaptersByPlatform['fakeplat'] = {
+      platform: 'fakeplat',
+      isReady: () => true,
+      listConversations: vi.fn(async () => {
+        throw new ToolUnavailableError(message);
+      }),
+    };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({ error: { code: 'tool_unavailable', message } });
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('names a source that could not be listed list_failed', async () => {
+    mocks.adaptersByPlatform['fakeplat'] = {
+      platform: 'fakeplat',
+      isReady: () => true,
+      listConversations: vi.fn(async () => {
+        throw new Error('EACCES: permission denied');
+      }),
+    };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({
+      error: { code: 'list_failed', message: 'Listing fakeplat sessions failed: EACCES: permission denied' },
+    });
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('names an unknown source platform no_adapter', async () => {
+    await runSession('migrate', 's-1', '-s', 'nope', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('no_adapter');
+    expect(error?.message).toContain('Unknown platform "nope"');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('names a session missing from the workspace not_found, with the id and the workspace searched', async () => {
+    await runSession('migrate', 'gone-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    expect(envelope()).toEqual({ error: { code: 'not_found', message: 'No fakeplat session gone-1 in /run/dir.' } });
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each([
+    ['the target platform', ['s-1', '-s', 'fakeplat'], '-t'],
+    ['the session', ['-s', 'fakeplat', '-t', 'tgtplat'], 'session id'],
+    ['consent to archive unredacted', ['s-1', '-s', 'fakeplat', '-t', 'tgtplat', '--push', '--repo-root', '/nowhere'], '-y'],
+  ])('refuses to prompt for %s and says which flag answers it', async (_what, args, flag) => {
+    // An interactive terminal: without --json each of these would ask.
+    const wasTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    vi.stubEnv('CI', '');
+    vi.stubEnv('TEAMAI_NONINTERACTIVE', '');
+    try {
+      await runSession('migrate', ...args, '--cwd', '/run/dir', '--json');
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: wasTTY, configurable: true });
+      vi.unstubAllEnvs();
+    }
+
+    const { error } = envelope();
+    expect(error?.code).toBe('prompt_refused');
+    expect(error?.message).toContain(flag);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('archives with --push -y and still prints only the envelope', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity };
+
+    await runSession(
+      'migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--push', '-y', '--repo-root', repoRoot, '--json',
+    );
+
+    expect(envelope()).toEqual({ data: { sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity } });
+    expect(fs.existsSync(path.join(repoRoot, 'sessions'))).toBe(true);
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('prints a held archive lock as a busy error that names the local copy', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity };
+    mocks.heldArchiveLock = '/home/.teamai/locks/sessions-x.lock';
+
+    await runSession(
+      'migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--push', '-y', '--repo-root', repoRoot, '--json',
+    );
+
+    const { error } = envelope();
+    expect(error?.code).toBe('busy');
+    expect(error?.message).toContain('/home/.teamai/locks/sessions-x.lock');
+    expect(error?.message).toContain('tgt-1');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('prints a failed remote push as archive_failed that names the local copy and commit', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity };
+    mocks.pushError = 'Command failed: git push origin\nfatal: no upstream';
+
+    await runSession(
+      'migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--push', '-y', '--repo-root', repoRoot, '--json',
+    );
+
+    const { error } = envelope();
+    expect(error?.code).toBe('archive_failed');
+    expect(error?.message).toContain('Copied as tgt-1 in /run/dir');
+    expect(error?.message).toContain('abc123de');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('prints a --dry-run preview as data and writes nothing', async () => {
+    mocks.copyResult = { status: 'failed', failure: { code: 'write_failed', platform: 'tgtplat', message: 'must not copy' } };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json', '--dry-run');
+
+    expect(envelope()).toEqual({ data: { dryRun: true, fidelity } });
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('names a source that exists but cannot be parsed unreadable', async () => {
+    const listed = path.join(mocks.home, 's-1.jsonl');
+    fs.writeFileSync(listed, '{"truncated');
+    const adapter = fakeAdapter([mkSession()], 'fakeplat');
+    adapter.listConversations.mockImplementation(async () => [
+      { sessionId: 's-1', title: 'task', cwd: '/run/dir', platform: 'fakeplat', createdAt: '', updatedAt: '', messageCount: 1, filePath: listed, sizeBytes: 11 },
+    ]);
+    adapter.readSession.mockRejectedValue(new Error('bad record on line 3'));
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('unreadable');
+    expect(error?.message).toContain('bad record on line 3');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('names a Claude Code session whose first lines do not parse unreadable, not not_found', async () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const projDir = path.join(mocks.home, '.claude', 'projects', '-run-dir');
+    fs.mkdirSync(projDir, { recursive: true });
+    fs.writeFileSync(path.join(projDir, `${sid}.jsonl`), '{"truncated\nnot json either\n');
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+
+    await runSession('migrate', sid, '-s', 'claude-code', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('unreadable');
+    expect(error?.message).toContain(sid);
+    expect(process.exitCode).toBe(1);
+  });
+
+  // Cursor and WorkBuddy list a copy only once the sqlite3 CLI registers it, and Windows ships none.
+  it.each(['cursor', 'workbuddy'])('refuses %s as a target on Windows once, before listing anything', async (platform) => {
+    mocks.adaptersByPlatform[platform] = { platform };
+    mocks.os = 'win32';
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', platform, '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('no_adapter');
+    expect(error?.message).toContain(`Writing ${platform} sessions is not supported on Windows`);
+    expect((mocks.adaptersByPlatform['fakeplat'] as ReturnType<typeof fakeAdapter>).listConversations).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('names an id prefix that matches several sessions ambiguous_id', async () => {
+    fakeAdapter([mkSession({ sessionId: 's-1a' }), mkSession({ sessionId: 's-1b' })], 'fakeplat');
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('ambiguous_id');
+    expect(error?.message).toContain('matches 2 sessions');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('refuses --all, which would migrate more than the one session an envelope reports', async () => {
+    mocks.copyResult = { status: 'done', sessionId: 'tgt-1', cwd: '/run/dir', reused: false, fidelity };
+
+    await runSession('migrate', 's-1', '-s', 'fakeplat', '-t', 'tgtplat', '--all', '-y', '--cwd', '/run/dir', '--json');
+
+    const { error } = envelope();
+    expect(error?.code).toBe('unsupported_option');
+    expect(error?.message).toContain('--all');
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe('session migrate on Windows', () => {
+  it.each(['cursor', 'workbuddy'])('refuses %s as a target once, before any preview', async (platform) => {
+    const source = fakeAdapter([mkSession(), mkSession({ sessionId: 's-2' })], 'fakeplat');
+    mocks.adaptersByPlatform[platform] = { platform };
+    mocks.os = 'win32';
+
+    await runSession('migrate', '-s', 'fakeplat', '-t', platform, '--all', '-y', '--cwd', '/run/dir');
+
+    const refusals = errored.filter((line) => line.includes(`Writing ${platform} sessions is not supported on Windows`));
+    expect(refusals).toHaveLength(1);
+    expect(out.join('\n')).not.toContain('Migration Preview');
+    expect(source.listConversations).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe('session resume of a session already restored', () => {
+  it('writes nothing the second time and keeps a turn added to the restored copy', async () => {
+    const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(mocks.home, 'ws-')));
+    mocks.remotes[ws] = 'https://github.com/org/alpha.git';
+    const session = mkSession({ sessionId: '0b6f3c1e-5a2d-4c8e-9f10-7a1b2c3d4e5f', cwd: ws, platform: 'codex' });
+    new SyncManager(repoRoot).saveSession(
+      session,
+      defaultSyncMeta(
+        {
+          platform: 'codex',
+          author: 'tester',
+          cwd: ws,
+          sessionId: session.sessionId,
+          repoIdentity: 'github.com/org/alpha',
+          title: session.title,
+        },
+        session.createdAt,
+      ),
+    );
+    const indexPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
+    const name = (JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { sessions: Array<{ sessionName: string }> })
+      .sessions[0].sessionName;
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    const resume = () => runSession('resume', name, '--platform', 'claude-code', '--repo-root', repoRoot, '--cwd', ws);
+
+    await resume();
+    const projects = path.join(mocks.home, '.claude', 'projects');
+    const [transcript] = (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl'));
+    const restoredId = path.basename(transcript, '.jsonl');
+    fs.appendFileSync(path.join(projects, transcript), JSON.stringify({ type: 'user', message: { content: 'later turn' } }) + '\n');
+    const before = fs.readFileSync(path.join(projects, transcript), 'utf-8');
+    out = [];
+
+    await resume();
+
+    expect(out.join('\n')).toContain(`Session already restored as ${restoredId}, nothing written.`);
+    expect(fs.readFileSync(path.join(projects, transcript), 'utf-8')).toBe(before);
+    expect(process.exitCode).not.toBe(1);
+  });
+});
+
+describe('session resume of a restore whose write failed', () => {
+  it('leaves nothing behind, and a retry restores the session', async () => {
+    const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(mocks.home, 'ws-')));
+    mocks.remotes[ws] = 'https://github.com/org/alpha.git';
+    const session = mkSession({ sessionId: '0b6f3c1e-5a2d-4c8e-9f10-7a1b2c3d4e5f', cwd: ws, platform: 'codex' });
+    new SyncManager(repoRoot).saveSession(
+      session,
+      defaultSyncMeta(
+        {
+          platform: 'codex',
+          author: 'tester',
+          cwd: ws,
+          sessionId: session.sessionId,
+          repoIdentity: 'github.com/org/alpha',
+          title: session.title,
+        },
+        session.createdAt,
+      ),
+    );
+    const indexPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
+    const name = (JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { sessions: Array<{ sessionName: string }> })
+      .sessions[0].sessionName;
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    const projects = path.join(mocks.home, '.claude', 'projects');
+    const transcripts = () =>
+      fs.existsSync(projects) ? (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl')) : [];
+    const resume = () => runSession('resume', name, '--platform', 'claude-code', '--repo-root', repoRoot, '--cwd', ws);
+    // The transcript lands, then the write fails, the way a crash after a partial write looks.
+    const write = ClaudeCodeAdapter.prototype.writeSession;
+    const spy = vi.spyOn(ClaudeCodeAdapter.prototype, 'writeSession').mockImplementation(async function (
+      this: ClaudeCodeAdapter,
+      ...args
+    ) {
+      await write.apply(this, args);
+      throw new Error('disk full');
+    });
+
+    await resume();
+    spy.mockRestore();
+
+    expect(errored.join('\n')).toContain('disk full');
+    expect(process.exitCode).toBe(1);
+    expect(transcripts()).toEqual([]);
+
+    process.exitCode = 0;
+    await resume();
+
+    expect(out.join('\n')).toContain('Session restored to claude-code');
+    expect(transcripts()).toHaveLength(1);
+    expect(process.exitCode).not.toBe(1);
+  });
+});
+
+describe('session resume on Windows', () => {
+  it.each(['cursor', 'workbuddy'])('refuses to restore into %s, which would never show the copy', async (platform) => {
+    mocks.remotes['/run/dir'] = 'https://github.com/org/alpha.git';
+    const session = mkSession({ cwd: '/run/dir', platform: 'claude-code' });
+    new SyncManager(repoRoot).saveSession(
+      session,
+      defaultSyncMeta(
+        {
+          platform: 'claude-code',
+          author: 'tester',
+          cwd: '/run/dir',
+          sessionId: session.sessionId,
+          repoIdentity: 'github.com/org/alpha',
+          title: session.title,
+        },
+        session.createdAt,
+      ),
+    );
+    const indexPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
+    const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { sessions: Array<{ sessionName: string }> };
+    const writeSession = vi.fn(async () => 'should-not-write');
+    const existingSessionId = vi.fn(async () => undefined);
+    mocks.adaptersByPlatform[platform] = { platform, writeSession, existingSessionId, consumeWriteNotice: () => undefined };
+    mocks.os = 'win32';
+
+    await runSession(
+      'resume', index.sessions[0].sessionName,
+      '--platform', platform, '--repo-root', repoRoot, '--cwd', '/run/dir',
+    );
+
+    expect(errored.join('\n')).toContain(`Writing ${platform} sessions is not supported on Windows`);
+    expect(writeSession).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
   });
 });
 
@@ -834,7 +1514,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new ClaudeCodeAdapter().readSession(SID);
+    const session = await new ClaudeCodeAdapter().readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 
@@ -855,7 +1535,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new CodeBuddyAdapter().readSession(SID);
+    const session = await new CodeBuddyAdapter().readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 
@@ -873,7 +1553,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new CursorAdapter().readSession(SID);
+    const session = await new CursorAdapter().readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 });

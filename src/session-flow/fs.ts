@@ -6,16 +6,33 @@
  * writes JSONL as a stream.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { homedir } from 'node:os';
+import {
+  CLAUDE_TOOL_ID,
+  CODEX_TOOL_ID,
+  DEFAULT_CLAUDE_ROOT,
+  DEFAULT_CODEX_ROOT,
+  resolveToolRootDir,
+  type LocalConfig,
+} from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Default per-platform storage paths
 // ---------------------------------------------------------------------------
 
-export function getClaudeCodeProjectsDir(): string {
-  return path.join(homedir(), '.claude', 'projects');
+/**
+ * The root of a relocatable tool: the one the member recorded (`toolRoots`, written by `teamai
+ * init` from CLAUDE_CONFIG_DIR or CODEX_HOME), else the default one in the home directory.
+ */
+function toolRootDir(tool: string, defaultRoot: string, toolRoots: LocalConfig['toolRoots']): string {
+  return toolRoots?.[tool] ? resolveToolRootDir(tool, defaultRoot, toolRoots) : path.join(homedir(), defaultRoot);
+}
+
+export function getClaudeCodeProjectsDir(toolRoots?: LocalConfig['toolRoots']): string {
+  return path.join(toolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, toolRoots), 'projects');
 }
 
 /** TeamAI variant: claude-internal */
@@ -28,8 +45,8 @@ export function getTClaudeProjectsDir(): string {
   return path.join(homedir(), '.tclaude', 'projects');
 }
 
-export function getCodexSessionsDir(): string {
-  return path.join(homedir(), '.codex', 'sessions');
+export function getCodexSessionsDir(toolRoots?: LocalConfig['toolRoots']): string {
+  return path.join(toolRootDir(CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, toolRoots), 'sessions');
 }
 
 /** TeamAI variant: codex-internal */
@@ -186,8 +203,10 @@ export function* readJsonlHead(filePath: string, maxLines: number): Generator<Re
 }
 
 /**
- * Stream-write a JSONL file, one object per line.
- * Parent directories are created automatically.
+ * Write a JSONL file, one object per line. Parent directories are created automatically.
+ *
+ * The lines go to a temp file beside the target, renamed into place, so a crash or a full disk
+ * never leaves a truncated transcript a tool would read as the session.
  */
 export function writeJsonl(filePath: string, records: Iterable<Record<string, unknown>>): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -195,12 +214,28 @@ export function writeJsonl(filePath: string, records: Iterable<Record<string, un
   for (const record of records) {
     lines.push(JSON.stringify(record));
   }
-  fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf-8');
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, lines.join('\n') + '\n', { encoding: 'utf-8', flag: 'wx' });
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    fs.rmSync(tmpPath, { force: true });
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
+
+/** When the file was last modified (ISO 8601), or now when it cannot be read. */
+export function fileModifiedAt(p: string): string {
+  try {
+    return fs.statSync(p).mtime.toISOString();
+  } catch {
+    return new Date().toISOString();
+  }
+}
 
 export function fileExists(p: string): boolean {
   try {

@@ -37,16 +37,17 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFile, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
+import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
-import { AgentAdapter, type SessionMeta } from './base.js';
+import crossSpawn from 'cross-spawn';
+import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
 import { titleFromUserText, visibleUserText } from '../title.js';
-import { assertSafeSessionFileId, resolveWriteSessionId } from '../ids.js';
+import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { findSqlite3 } from '../sqlite.js';
 import { log } from '../../utils/logger.js';
+import { execCommand, probeBinary } from '../../utils/exec.js';
 import { isOnPath } from '../../utils/lookpath.js';
 import {
   getCodexSessionsDir,
@@ -217,8 +218,6 @@ function pushItemCompleted(records: Record<string, unknown>[], args: ItemComplet
   records.push(buildItemCompletedRecord(args));
 }
 
-const execFileAsync = promisify(execFile);
-
 /** Location of the codex CLI bundled with Codex Desktop (ChatGPT.app) on macOS. */
 const DESKTOP_CODEX_CANDIDATES = [
   '/Applications/ChatGPT.app/Contents/Resources/codex',
@@ -226,27 +225,14 @@ const DESKTOP_CODEX_CANDIDATES = [
   '/Applications/Codex.app/Contents/Resources/codex',
 ];
 
-function findCodexCli(): string | null {
-  // 1) codex on PATH (npm / brew install)
-  const pathEnv = process.env.PATH ?? '';
-  for (const dir of pathEnv.split(path.delimiter)) {
-    if (!dir) continue;
-    const p = path.join(dir, 'codex');
-    try {
-      fs.accessSync(p, fs.constants.X_OK);
-      return p;
-    } catch {
-      // continue
-    }
-  }
-  // 2) CLI bundled with Codex Desktop
-  for (const p of DESKTOP_CODEX_CANDIDATES) {
-    try {
-      fs.accessSync(p, fs.constants.X_OK);
-      return p;
-    } catch {
-      // continue
-    }
+/**
+ * The codex CLI that runs: `codex` on PATH (npm / brew install), else the one bundled with
+ * Codex Desktop. Probed and later started through cross-spawn, which resolves the npm
+ * `codex.cmd` shim on Windows that a plain PATH join and `spawn` miss.
+ */
+async function findCodexCli(): Promise<string | null> {
+  for (const candidate of ['codex', ...DESKTOP_CODEX_CANDIDATES]) {
+    if (await probeBinary(candidate)) return candidate;
   }
   return null;
 }
@@ -290,8 +276,14 @@ export class CodexAdapter extends AgentAdapter {
     return scanFiles(this.storageRoot, /\.jsonl$/);
   }
 
+  /** Every rollout, active then archived: Codex moves an archived thread's rollout to `archived_sessions/`. */
+  private scanAllRollouts(): string[] {
+    return [...this.scanJsonlFiles(), ...scanFiles(path.join(path.dirname(this.storageRoot), 'archived_sessions'), /\.jsonl$/)];
+  }
+
+  /** The rollout to read or delete, archived ones included, so it agrees with `existingSessionId`. */
   private findSessionFile(sessionId: string, projectPath?: string): string | null {
-    for (const f of this.scanJsonlFiles()) {
+    for (const f of this.scanAllRollouts()) {
       // The filename is rollout-<timestamp>-<sessionId>, matched as an infix; but the prefix is only accepted at 8+ characters,
       // otherwise a 4-character prefix substring would read someone else's session
       const base = path.basename(f, '.jsonl');
@@ -427,12 +419,17 @@ export class CodexAdapter extends AgentAdapter {
     return metas;
   }
 
-  async readSession(sessionId: string, _projectPath?: string): Promise<Session> {
-    const f = this.findSessionFile(sessionId);
-    if (!f) throw new Error(`Codex session not found: ${sessionId}`);
+  async readSession(ref: SessionReadRef): Promise<Session> {
+    const f = ref.filePath ?? this.findSessionFile(ref.sessionId, ref.projectPath);
+    if (!f) {
+      const where = ref.projectPath ? ` in ${ref.projectPath}` : '';
+      throw new Error(`Codex session not found: ${ref.sessionId}${where}`);
+    }
 
     const records = [...readJsonl(f)];
 
+    // A suffix of the id finds the session, so the id comes from the rollout opened.
+    let sessionId = path.basename(f, '.jsonl');
     let cwd = '';
     let createdAt = new Date().toISOString();
     const sessionMetadata: Record<string, unknown> = {};
@@ -440,6 +437,7 @@ export class CodexAdapter extends AgentAdapter {
     for (const rec of records) {
       if (rec.type === 'session_meta') {
         const payload = (rec.payload as Record<string, unknown>) ?? {};
+        if (typeof payload.id === 'string' && payload.id) sessionId = payload.id;
         cwd = String(payload.cwd ?? '');
         createdAt = parseCodexTimestamp(payload.timestamp);
         for (const key of ['originator', 'cli_version', 'source', 'model_provider'] as const) {
@@ -608,15 +606,28 @@ export class CodexAdapter extends AgentAdapter {
     return blocks;
   }
 
+  /**
+   * Every rollout counts, archived ones included: the file path comes from the session's
+   * creation time and the local timezone, so one id can sit in a file other than the one a
+   * write would compute. Matches the whole id, never a suffix.
+   */
+  async existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined> {
+    for (const f of this.scanAllRollouts()) {
+      const base = path.basename(f, '.jsonl');
+      if (base !== sessionId && !base.endsWith(`-${sessionId}`)) continue;
+      if (projectPath && !this.rolloutMatchesCwd(f, projectPath)) continue;
+      return sessionId;
+    }
+    return undefined;
+  }
+
   async writeSession(session: Session, projectPath?: string): Promise<string> {
-    // session_id: reuse if already UUIDv7; otherwise derive deterministically.
-    // Random ids would give every re-migration a fresh target id -- a fully
-    // duplicated second thread in Codex (threads doubled). Derived ids make a
-    // re-migration an overwrite: idempotent by construction.
-    // cwd participates in the derivation: a Codex rollout sessionId is a global key. If the same source session
-    // is migrated into two workspaces under one id, the second copy overwrites the first.
     const cwd = projectPath ?? session.cwd;
-    const sessionId = resolveWriteSessionId(this.platform, session, cwd);
+    const sessionId = deriveTargetSessionId({
+      targetPlatform: this.platform,
+      targetCwd: cwd,
+      sourceSessionId: session.sessionId,
+    });
 
     // Guard against corrupt input: an invalid session.createdAt makes new Date(...) an Invalid Date,
     // and calling toISOString() directly throws RangeError and crashes the whole write.
@@ -841,30 +852,24 @@ export class CodexAdapter extends AgentAdapter {
    * then retry. Everything is best-effort: keep the legacy rollout as-is when the CLI
    */
   private async paginateRollout(sessionId: string, codexHome: string): Promise<void> {
-    const bin = findCodexCli();
+    const bin = await findCodexCli();
     if (!bin) {
       this.noteWrite(
         'Codex CLI was not found. The rollout was written, but Codex will not list it until the CLI indexes it.',
       );
       return;
     }
-    const env = { ...process.env, CODEX_HOME: codexHome };
-    const opts = { env, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 };
+    const opts = { env: { ...process.env, CODEX_HOME: codexHome }, timeoutMs: 120_000 };
 
     const runApply = async (): Promise<string | undefined> => {
       let stdout = '';
       try {
-        const r = await execFileAsync(
-          bin,
-          ['migrate-rollouts', '--apply', '--thread', sessionId, '--json'],
-          opts,
-        );
-        stdout = r.stdout ?? '';
-      } catch (e) {
-        // Non-zero exit (e.g. a corrupted rollout causing "one or more rollout
+        // A non-zero exit (e.g. a corrupted rollout causing "one or more rollout
         // migrations failed") still carries the full JSON report; parse it to
         // judge this thread's outcome.
-        stdout = (e as { stdout?: string }).stdout ?? '';
+        ({ stdout } = await execCommand(bin, ['migrate-rollouts', '--apply', '--thread', sessionId, '--json'], opts));
+      } catch {
+        // Timed out or could not start: no report.
       }
       try {
         const report = JSON.parse(stdout) as {
@@ -903,11 +908,12 @@ export class CodexAdapter extends AgentAdapter {
    */
   private indexThreadViaAppServer(bin: string, codexHome: string): Promise<void> {
     return new Promise((resolve) => {
-      let child: ReturnType<typeof spawn>;
+      let child: ChildProcess;
       try {
-        child = spawn(bin, ['app-server'], {
+        child = crossSpawn(bin, ['app-server'], {
           env: { ...process.env, CODEX_HOME: codexHome, RUST_LOG: 'error' },
           stdio: ['pipe', 'pipe', 'ignore'],
+          windowsHide: true,
         });
       } catch {
         resolve();
@@ -1066,7 +1072,9 @@ export class CodexAdapter extends AgentAdapter {
 
   /**
    * Remove the session's traces from both Codex stores: state_5.threads (list rows) and
-   * items/turns/projection watermark. Best-effort: a missing CLI or lock contention never blocks the rollout delete.
+   * items/turns/projection watermark. Lock contention or a missing table never blocks the
+   * rollout delete. A missing sqlite3 CLI does: the rows would stay listed, so this throws
+   * before the rollout is deleted, and a rollback run again once sqlite3 is installed finds it.
    */
   private async unregisterThread(sessionId: string): Promise<void> {
     // Defense in depth against SQL injection: the id comes straight from the CLI
@@ -1077,8 +1085,6 @@ export class CodexAdapter extends AgentAdapter {
       return;
     }
     const safeId = sessionId.replace(/'/g, "''");
-    const bin = findSqlite3();
-    if (!bin) return;
     const home = path.dirname(this.storageRoot); // ~/.codex
     const stmts: Array<[string, string[]]> = [
       [
@@ -1096,16 +1102,21 @@ export class CodexAdapter extends AgentAdapter {
         ],
       ],
     ];
+    const present = stmts.filter(([db]) => fileExists(db));
+    if (present.length === 0) return;
+    const bin = findSqlite3();
+    if (!bin) {
+      throw new Error(
+        `The sqlite3 CLI was not found, so TeamAI could not unregister Codex thread ${sessionId} ` +
+          'and Codex would keep listing it. Nothing was deleted: install sqlite3 and run the rollback again.',
+      );
+    }
     // Run statement by statement, no transaction: table shapes differ across Codex
     // versions (e.g. no projection_state table) and one error in a transaction
-    for (const [db, sqls] of stmts) {
-      if (!fileExists(db)) continue;
+    for (const [db, sqls] of present) {
       for (const sql of sqls) {
         try {
-          await execFileAsync(bin, [db, `PRAGMA busy_timeout=5000; ${sql}`], {
-            timeout: 30_000,
-            maxBuffer: 16 * 1024 * 1024,
-          });
+          await execCommand(bin, [db, `PRAGMA busy_timeout=5000; ${sql}`], { timeoutMs: 30_000 });
         } catch {
           // Missing table / lock contention: skip, other cleanup continues
         }

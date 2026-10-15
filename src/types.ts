@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { getUserHome, expandHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 import type { WorkspaceChildren } from './workspace-children.js';
+import type { HeadState } from './utils/git.js';
 
 const DEFAULT_COPILOT_HOME = '.copilot';
 const COPILOT_USER_MCP_CONFIG = 'mcp-config.json';
@@ -1749,6 +1750,15 @@ export interface DashboardEvent {
   transcriptPath?: string;
   /** Resolved PID of the AI tool main process (for liveness monitoring) */
   monitorPid?: number;
+  /**
+   * On `session_start` only: the commit checked out at `cwd` when the session
+   * (or its resume or compaction) started, and whether tracked files were
+   * modified or staged then (untracked files are not counted). Absent outside
+   * git, in a repo with no commits, on events that record no `cwd` (Copilot),
+   * when git failed or timed out, and on events written before this field
+   * existed.
+   */
+  gitAtStart?: HeadState;
   /** Last event timestamp the PID monitor observed, so a delayed exit targets that run. */
   processExitAfter?: string;
   /** Byte boundary captured at Copilot SessionStart; private log path is never stored. */

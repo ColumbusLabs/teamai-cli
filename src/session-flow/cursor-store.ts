@@ -20,6 +20,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { findSqlite3 } from './sqlite.js';
 
 // ---------------------------------------------------------------------------
 // Paths and helpers
@@ -41,25 +42,6 @@ export function getCursorStateRoot(): string | null {
 export function getCursorStateDbPath(): string | null {
   const root = getCursorStateRoot();
   return root ? path.join(root, 'User', 'globalStorage', 'state.vscdb') : null;
-}
-
- /** Locate the sqlite3 CLI: PATH first, then well-known install locations. */
-function findSqlite3(): string | null {
-  const candidates = [
-    ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((d) => path.join(d, 'sqlite3')),
-    '/usr/bin/sqlite3',
-    '/opt/homebrew/bin/sqlite3',
-    '/usr/local/bin/sqlite3',
-  ];
-  for (const p of candidates) {
-    try {
-      fs.accessSync(p, fs.constants.X_OK);
-      return p;
-    } catch {
-      // continue
-    }
-  }
-  return null;
 }
 
  /** cwd -> Cursor workspaceId (resolved from workspaceStorage/<hash>/workspace.json's folder). */
@@ -635,6 +617,43 @@ export function registerCursorComposer(args: RegisterCursorComposerArgs): Regist
   }
 
   return { ok: true, bubbleCount: records.length };
+}
+
+/**
+ * Whether Cursor's store holds composer `composerId`: its header, its data, or any of its
+ * bubbles. With `cwd`, only a header in that workspace counts. Where `registerCursorComposer`
+ * could not write either (no store, no sqlite3 CLI, an id that is not a UUID, a workspace Cursor
+ * does not know), the answer is no, since a write leaves the store alone there.
+ */
+export function cursorComposerExists(composerId: string, cwd?: string): { ok: true; exists: boolean } | { ok: false; reason: string } {
+  if (assertCursorSessionId(composerId)) return { ok: true, exists: false };
+  const dbPath = getCursorStateDbPath();
+  if (!dbPath || !fs.existsSync(dbPath)) return { ok: true, exists: false };
+  const sqlite3 = findSqlite3();
+  if (!sqlite3) return { ok: true, exists: false };
+
+  const id = esc(composerId);
+  let sql: string;
+  if (cwd) {
+    const ws = resolveCursorWorkspaceId(cwd);
+    if (!ws) return { ok: true, exists: false };
+    sql = `SELECT EXISTS(SELECT 1 FROM composerHeaders WHERE composerId='${id}' AND workspaceId='${esc(ws.id)}');`;
+  } else {
+    sql =
+      `SELECT EXISTS(SELECT 1 FROM composerHeaders WHERE composerId='${id}') ` +
+      `OR EXISTS(SELECT 1 FROM cursorDiskKV WHERE key='composerData:${id}' OR (${cursorBubbleCleanupWhere(composerId)}));`;
+  }
+
+  try {
+    const r = spawnSync(sqlite3, [dbPath], { input: `PRAGMA busy_timeout=5000;\n${sql}`, timeout: 30_000 });
+    if (r.status !== 0) {
+      const stderr = (r.stderr?.toString() ?? '').trim();
+      return { ok: false, reason: (stderr || `sqlite3 exit ${r.status}${r.signal ? ` signal ${r.signal}` : ''}`).slice(0, 300) };
+    }
+    return { ok: true, exists: (r.stdout?.toString() ?? '').trim().endsWith('1') };
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
 }
 
 /**

@@ -23,7 +23,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AgentAdapter, type SessionMeta } from './base.js';
+import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
 import {
@@ -38,7 +38,7 @@ import {
   removeDirRecursive,
 } from '../fs.js';
 import { cleanTitleText, fallbackTitle, isInjectedText, titleFromCandidates, titleFromUserText } from '../title.js';
-import { assertSafeSessionFileId, resolveWriteSessionId } from '../ids.js';
+import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { registerWorkBuddySession, unregisterWorkBuddySession } from '../workbuddy-store.js';
 import { log } from '../../utils/logger.js';
 
@@ -290,7 +290,7 @@ export class WorkBuddyAdapter extends AgentAdapter {
         }
       }
     } catch {
-      return null;
+      // Still listed with what was read, so a lookup reports the session unreadable, not missing.
     }
 
     if (!createdAt) createdAt = new Date().toISOString();
@@ -322,11 +322,17 @@ export class WorkBuddyAdapter extends AgentAdapter {
     };
   }
 
-  async readSession(sessionId: string, projectPath?: string): Promise<Session> {
-    const jsonlPath = this.findSessionFile(sessionId, projectPath);
+  async readSession(ref: SessionReadRef): Promise<Session> {
+    // The listed file, else the id in the workspace, else the id anywhere.
+    const jsonlPath =
+      ref.filePath ??
+      this.findSessionFile(ref.sessionId, ref.projectPath) ??
+      (ref.projectPath ? this.findSessionFile(ref.sessionId) : null);
     if (!jsonlPath) {
-      throw new Error(`WorkBuddy session file not found: session_id=${sessionId}`);
+      throw new Error(`WorkBuddy session file not found: session_id=${ref.sessionId}`);
     }
+    // The file name is the id: a listed file decides it, not the request.
+    const sessionId = path.basename(jsonlPath, '.jsonl');
 
     const metaInfo = readMeta(jsonlPath);
     const cwd = metaInfo.cwd ?? decodeCwdGeneric(path.basename(path.dirname(jsonlPath)));
@@ -500,11 +506,17 @@ export class WorkBuddyAdapter extends AgentAdapter {
     return blocks;
   }
 
+  async existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined> {
+    return this.findSessionFile(sessionId, projectPath) ? sessionId : undefined;
+  }
+
   async writeSession(session: Session, projectPath?: string): Promise<string> {
     const cwd = projectPath ?? session.cwd;
-    // Non-UUID source ids use a deterministic derivation (repeated migrations of the same source session hit the same id → no duplicate sessions)
-    // cwd participates in the derivation: a WorkBuddy session record is a global key, so the same id migrated into two workspaces would overwrite each other.
-    const sessionId = resolveWriteSessionId(this.platform, session, cwd);
+    const sessionId = deriveTargetSessionId({
+      targetPlatform: this.platform,
+      targetCwd: cwd,
+      sourceSessionId: session.sessionId,
+    });
     // WorkBuddy is isomorphic with CodeBuddy: project directory names keep spaces (observed CodeBuddy on disk as
     // `Users-caiwenzhe-Desktop-Code-teamai cli`). encodeCwdGeneric would also turn spaces into
     // `-`, so the directory name would not match what the client computes from the current cwd → the session would not appear in that project's list.

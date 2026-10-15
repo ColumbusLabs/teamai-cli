@@ -18,7 +18,7 @@ vi.mock('node:os', async (importOriginal) => {
 });
 
 import { getAdapter, listInstalledPlatforms } from '../session-flow/adapters/index.js';
-import { MigrationEngine } from '../session-flow/migrate.js';
+import { AgentSession } from '../session-flow/agent-session.js';
 import type { Session } from '../session-flow/ir.js';
 
 const SESSION_ID = '11111111-2222-4333-8444-555555555555';
@@ -68,14 +68,16 @@ describe('Codex installed without a sessions directory', () => {
     const sourceId = await plantClaudeSession(cwd);
     fs.mkdirSync(path.join(mocks.home, '.codex'));
 
-    const result = await new MigrationEngine('claude-code', 'codex').migrate(sourceId, cwd);
+    const result = await AgentSession.copy({
+      from: { platform: 'claude-code', sessionId: sourceId, cwd },
+      to: { platform: 'codex', cwd },
+    });
 
-    expect(result.error).toBeUndefined();
-    expect(result.success).toBe(true);
+    expect(result).toMatchObject({ status: 'done', reused: false });
     const dayDir = path.join(mocks.home, '.codex', 'sessions', '2026', '09', '20');
     const rollouts = fs.readdirSync(dayDir).filter((f) => f.endsWith('.jsonl'));
     expect(rollouts).toHaveLength(1);
-    expect(rollouts[0]).toContain(result.targetSessionId);
+    expect(rollouts[0]).toContain(result.status === 'done' ? result.sessionId : 'not copied');
   });
 
   it('lists Codex as installed when the codex CLI is on PATH and ~/.codex does not exist yet', () => {

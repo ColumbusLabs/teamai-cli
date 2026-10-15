@@ -48,7 +48,7 @@ The local copy goes to `~/.teamai/session-logs/<year-month>.md`. `--push` sends 
 
 `teamai session` moves a full transcript between tools, or archives it in the team repo. `session save` remains the scrubbed summary.
 
-Platforms: `claude-code`, `codex`, `codebuddy`, `codebuddy-ide`, `cursor`, `workbuddy`. `teamai session platforms` lists what is installed here.
+Platforms: `claude-code`, `codex`, `codebuddy`, `codebuddy-ide`, `cursor`, `workbuddy`, and `opencode` (through the `opencode` CLI, version 2 or later; an OpenCode target workspace must exist). `teamai session platforms` lists what is installed here. On Windows, `cursor` and `workbuddy` cannot be a migrate or resume target: they list a session only once the `sqlite3` CLI registers it, so TeamAI refuses instead of writing a copy they never show.
 
 ```bash
 teamai session migrate <sessionId> -s codebuddy-ide -t claude-code
@@ -60,5 +60,9 @@ teamai session list                                        # --all: every projec
 teamai session search <query>
 teamai session resume <name> --platform claude-code
 ```
+
+A migration never overwrites. If the target workspace already has a copy of the session, from this TeamAI or an older one, `migrate` prints `already migrated as <id>` and writes nothing, so turns you added to the copy stay. To refresh a copy, delete it with `session rollback <id> --platform <tool> --cwd <workspace>` and migrate again. `session resume` follows the same rule: a session already restored into that workspace prints `already restored as <id>` and is left as it is.
+
+For a script, `migrate <sessionId> -s <tool> -t <tool> --json` prints one line on stdout, the same `{ "data": ... }` or `{ "error": { "code", "message" } }` shape as `teamai workflow`; progress goes to stderr. `data` has the target `sessionId`, `cwd`, `reused`, and the `fidelity` report. `error.code` names the failure, such as `no_adapter` (unknown tool), `tool_unavailable` (the source or target tool is not installed, or its CLI cannot run), `not_found`, or `unreadable`, and the exit code is 1. `--json` never prompts: a missing id, `-s`, or `-t` fails with `prompt_refused`, and `--push` needs `-y` or `--scrub`.
 
 `--dry-run` previews. `--scrub` redacts before an archive; without it, an interactive run asks and a script needs `-y`. `--all` confirms above 10 sessions (push: 5). Archives go to `sessions/repos/<repo>/<author>/` under the session's own git remote, or `_unattributed`.

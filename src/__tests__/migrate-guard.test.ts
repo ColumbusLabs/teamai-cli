@@ -8,9 +8,11 @@
  */
 
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import os from 'node:os';
 import type { AgentAdapter, SessionMeta } from '../session-flow/adapters/base.js';
 import { ADAPTER_REGISTRY, type AdapterFactory } from '../session-flow/adapters/index.js';
-import { MigrationEngine, fidelityFromSession } from '../session-flow/migrate.js';
+import { fidelityFromSession } from '../session-flow/migrate.js';
+import { AgentSession } from '../session-flow/agent-session.js';
 import type { Session } from '../session-flow/ir.js';
 
 function makeSession(overrides: Partial<Session> = {}): Session {
@@ -40,6 +42,7 @@ function notReadyAdapter(): AgentAdapter {
     isReady: () => false,
     listConversations: async (): Promise<SessionMeta[]> => [],
     readSession: async () => makeSession(),
+    existingSessionId: async () => undefined,
     writeSession: async () => 'mock-id',
     deleteSession: async () => {},
   } as unknown as AgentAdapter;
@@ -52,15 +55,17 @@ function readyAdapter(written: Session[]) {
     isReady: () => true,
     listConversations: async (): Promise<SessionMeta[]> => [],
     readSession: async () => makeSession(),
+    existingSessionId: async () => undefined,
     writeSession: async (s: Session) => {
       written.push(s);
       return 'mock-target-id';
     },
+    consumeWriteNotice: () => undefined,
     deleteSession: async () => {},
   } as unknown as AgentAdapter;
 }
 
-describe('MigrationEngine — 目标端安装检查', () => {
+describe('AgentSession.copy — 目标端安装检查', () => {
   const KEY = '__test_uninstalled__';
   let original: AdapterFactory | undefined;
 
@@ -73,16 +78,19 @@ describe('MigrationEngine — 目标端安装检查', () => {
     else delete ADAPTER_REGISTRY[KEY];
   });
 
-  it('目标端未安装 → success=false 且错误信息可读', async () => {
-    const engine = new MigrationEngine('claude-code', KEY);
-    const result = await engine.migrate('11111111-2222-4333-8444-555555555555', '/tmp');
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('not installed');
-    expect(result.error).toContain(KEY);
+  it('目标端未安装 → tool_unavailable 且错误信息可读', async () => {
+    const result = await AgentSession.copy({
+      from: { platform: 'claude-code', sessionId: '11111111-2222-4333-8444-555555555555', cwd: '/tmp' },
+      to: { platform: KEY, cwd: '/tmp' },
+    });
+    expect(result).toMatchObject({ status: 'failed', failure: { code: 'tool_unavailable', platform: KEY } });
+    const message = result.status === 'failed' ? result.failure.message : '';
+    expect(message).toContain('not installed');
+    expect(message).toContain(KEY);
   });
 });
 
-describe('MigrationEngine — 写入路径', () => {
+describe('AgentSession.copy — 写入路径', () => {
   const SRC = '__test_src__';
   const KEY = '__test_ready__';
   const originals: Record<string, AdapterFactory | undefined> = {};
@@ -103,10 +111,11 @@ describe('MigrationEngine — 写入路径', () => {
 
   it('目标端就绪 → 写入成功且 IR 传给 writeSession', async () => {
     written.length = 0;
-    const engine = new MigrationEngine(SRC, KEY);
-    const result = await engine.migrate('11111111-2222-4333-8444-555555555555', '/tmp');
-    expect(result.success).toBe(true);
-    expect(result.targetSessionId).toBe('mock-target-id');
+    const result = await AgentSession.copy({
+      from: { platform: SRC, sessionId: '11111111-2222-4333-8444-555555555555', cwd: '/tmp' },
+      to: { platform: KEY, cwd: os.tmpdir() },
+    });
+    expect(result).toMatchObject({ status: 'done', reused: false, sessionId: 'mock-target-id' });
     expect(written).toHaveLength(1);
     expect(written[0].messages[0].content[0]).toMatchObject({ type: 'text', text: 'hello' });
   });
@@ -175,5 +184,36 @@ describe('fidelityFromSession — 真实统计', () => {
       true,
     );
     expect(toCodex.score).toBeLessThan(1);
+  });
+
+  // OpenCode keeps reasoning parts and inline image files (what `opencode session export` carries).
+  it('OpenCode keeps thinking, images and its own tools, and warns about a tool it does not have', () => {
+    const session = makeSession({
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=', label: 'shot.png' }],
+          timestamp: '2026-09-20T00:00:10.000Z',
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', text: 'plan' },
+            { type: 'tool_call', toolName: 'read_file', callId: 'c1', arguments: {} },
+            { type: 'tool_call', toolName: 'notebook_edit', callId: 'c2', arguments: {} },
+          ],
+          timestamp: '2026-09-20T00:00:30.000Z',
+        },
+      ],
+    });
+
+    const report = fidelityFromSession(session, 'opencode');
+
+    expect(report).toMatchObject({
+      preservedBlocks: 3,
+      degradedBlocks: 1,
+      degradations: [],
+      warnings: ['tool_not_in_target: notebook_edit'],
+    });
   });
 });

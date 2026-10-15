@@ -67,6 +67,28 @@ describe('collectSession', () => {
     expect(s.firstPrompt).toContain('<REDACTED:gh_tok>');
     expect(s.firstPrompt).not.toContain('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
   });
+
+  it('reports the git state of the earliest start that recorded one, whatever the event order', () => {
+    const events = [
+      ...sampleEvents(),
+      ev({ type: 'session_start', timestamp: '2026-03-10T10:00:00.000Z', sessionId: SID, gitAtStart: { head: 'b'.repeat(40), dirty: true } }),
+      ev({ type: 'session_start', timestamp: '2026-03-10T09:30:00.000Z', sessionId: SID, gitAtStart: { head: 'a'.repeat(40), dirty: false } }),
+    ];
+    expect(collectSession(SID, events)!.gitAtStart).toEqual({ head: 'a'.repeat(40), dirty: false });
+  });
+
+  it('reports no git state when no start recorded one', () => {
+    expect(collectSession(SID, sampleEvents())).not.toHaveProperty('gitAtStart');
+  });
+
+  it('keeps the git state out of the monthly log', () => {
+    const plain = collectSession(SID, sampleEvents())!;
+    const withGit = collectSession(SID, [
+      ...sampleEvents(),
+      ev({ type: 'session_start', timestamp: '2026-03-10T09:00:01.000Z', sessionId: SID, gitAtStart: { head: 'a'.repeat(40), dirty: true } }),
+    ])!;
+    expect(renderSessionMarkdown(withGit, { includePrompt: true })).toBe(renderSessionMarkdown(plain, { includePrompt: true }));
+  });
 });
 
 describe('isValuable', () => {

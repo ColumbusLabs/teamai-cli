@@ -21,9 +21,9 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AgentAdapter, type SessionMeta } from './base.js';
+import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock } from '../ir.js';
-import { assertSafeSessionFileId, resolveWriteSessionId } from '../ids.js';
+import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { imagePlaceholderText } from '../ir.js';
 import {
   getClaudeCodeProjectsDir,
@@ -32,6 +32,7 @@ import {
   decodeCwdClaude,
   readJsonl,
   readJsonlHead,
+  fileModifiedAt,
   writeJsonl,
   fileExists,
   dirExists,
@@ -358,6 +359,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     let createdAt: string | undefined;
     let updatedAt: string | undefined;
     let messageCount = 0;
+    let recordedCwd: string | undefined;
     const userTextCandidates: string[] = [];
     let summaryTitle = '';
 
@@ -379,6 +381,10 @@ export class ClaudeCodeAdapter extends AgentAdapter {
 
         if (rtype === 'user' || rtype === 'assistant') {
           messageCount++;
+          // The directory name decodes only when the path has no '-', '_', '.' or space; the record has the real one.
+          if (recordedCwd === undefined && typeof record.cwd === 'string' && path.isAbsolute(record.cwd)) {
+            recordedCwd = record.cwd;
+          }
           if (rtype === 'user' && userTextCandidates.length < 5) {
             const msg = record.message as Record<string, unknown> | undefined;
             const content = msg?.content;
@@ -397,10 +403,11 @@ export class ClaudeCodeAdapter extends AgentAdapter {
         }
       }
     } catch {
-      return null;
+      // Still listed with what was read, so a lookup reports the session unreadable, not missing.
     }
 
-    if (!createdAt) createdAt = new Date().toISOString();
+    // No record says when: date it by the file, so a damaged session does not sort as the newest.
+    if (!createdAt) createdAt = fileModifiedAt(jsonlPath);
     if (!updatedAt) updatedAt = createdAt;
 
     // Title: summary line (that is what CC /resume uses) > unwrapped user text > id fallback.
@@ -420,7 +427,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     return {
       sessionId,
       title,
-      cwd,
+      cwd: recordedCwd ?? cwd,
       platform: this.platform,
       createdAt,
       updatedAt,
@@ -430,11 +437,15 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     };
   }
 
-  async readSession(sessionId: string, projectPath?: string): Promise<Session> {
-    const jsonlPath = this.findSessionFile(sessionId, projectPath);
+  async readSession(ref: SessionReadRef): Promise<Session> {
+    const jsonlPath = ref.filePath ?? this.findSessionFile(ref.sessionId, ref.projectPath);
     if (!jsonlPath) {
-      throw new Error(`Claude Code session file not found: session_id=${sessionId}, project_path=${projectPath ?? 'undefined'}`);
+      throw new Error(
+        `Claude Code session file not found: session_id=${ref.sessionId}, project_path=${ref.projectPath ?? 'undefined'}`,
+      );
     }
+    // The file name is the id: a listed file decides it, not the request.
+    const sessionId = path.basename(jsonlPath, '.jsonl');
 
     const cwd =
       bestEffortDecodeCwdClaude(path.basename(path.dirname(jsonlPath))) ??
@@ -615,14 +626,17 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     };
   }
 
-  async writeSession(session: Session, projectPath?: string): Promise<string> {
-    // Same-platform archives derive a new id so the original jsonl is not overwritten.
-    // cwd is intentionally omitted: this store is per project directory, so one
-    // id in two directories is already two files.
-    const sessionId = resolveWriteSessionId(this.platform, session);
+  async existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined> {
+    return this.findSessionFile(sessionId, projectPath) ? sessionId : undefined;
+  }
 
-    // Resolve the target directory
+  async writeSession(session: Session, projectPath?: string): Promise<string> {
     const cwd = projectPath ?? session.cwd;
+    const sessionId = deriveTargetSessionId({
+      targetPlatform: this.platform,
+      targetCwd: cwd,
+      sourceSessionId: session.sessionId,
+    });
     const projDir = path.join(this.storageRoot, encodeCwdClaude(cwd));
     const jsonlPath = path.join(projDir, `${sessionId}.jsonl`);
 

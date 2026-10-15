@@ -22,12 +22,22 @@ import type { Command } from 'commander';
 import readline from 'node:readline';
 import * as path from 'node:path';
 import { getAdapter, listAvailablePlatforms, listInstalledPlatforms } from './adapters/index.js';
-import { scrubSession } from './scrub.js';
-import { MigrationEngine } from './migrate.js';
-import { SyncManager, getRepoIdentity, getGitAuthor, defaultSyncMeta } from './sync.js';
+import { MigrationEngine, resolveTargetCwd } from './migrate.js';
+import {
+  AgentSession,
+  noAdapter,
+  recordedToolRoots,
+  toolRootsLookup,
+  writeCopyOnce,
+  type AgentSessionCopy,
+  type AgentSessionListed,
+} from './agent-session.js';
+import { SyncManager, getRepoIdentity, getGitAuthor, defaultSyncMeta, withSessionIndexLock } from './sync.js';
 import { SessionSearchEngine, type LoadedSession } from './search.js';
 import { isSafeSessionFileId } from './ids.js';
 import { isInteractive } from '../utils/prompt.js';
+import { setStderrOnly } from '../utils/logger.js';
+import type { WorkflowEnvelope } from '../workflow/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,6 +47,13 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+/** `  (12 msgs)` or `  (12 msgs, 4.0KB)`; nothing when the tool's listing does not count (OpenCode). */
+function listedCounts(m: AgentSessionListed, { includeSize = false } = {}): string {
+  if (m.messageCount === undefined) return '';
+  if (!includeSize || m.sizeBytes === undefined) return `  (${m.messageCount} msgs)`;
+  return `  (${m.messageCount} msgs, ${formatBytes(m.sizeBytes)})`;
 }
 
 /**
@@ -183,17 +200,15 @@ async function promptSelect(question: string, options: string[]): Promise<string
 
 /**
  * Look up an adapter safely; an invalid platform gets a friendly message
- * instead of a stack trace.
+ * instead of a stack trace. Its store follows the tool roots recorded for `cwd`.
  */
-function safeGetAdapter(platform: string) {
-  try {
-    return getAdapter(platform);
-  } catch {
-    const available = listAvailablePlatforms().join(', ');
-    console.error(`Error: Unknown platform "${platform}".`);
-    console.error(`Available platforms: ${available}`);
+async function safeGetAdapter(platform: string, cwd: string | undefined) {
+  const unknown = noAdapter(platform, 'read');
+  if (unknown) {
+    console.error(`Error: ${unknown.message}`);
     process.exit(1);
   }
+  return getAdapter(platform, await recordedToolRoots(cwd));
 }
 
 /**
@@ -319,6 +334,68 @@ function runGitStep<T>(step: () => T, repoRoot: string, what: string): T {
   }
 }
 
+function archiveBusyMessage(repoRoot: string, lockPath: string): string {
+  return `another teamai command is writing the session archive in ${repoRoot} (lock: ${lockPath}).`;
+}
+
+/** Another command held the session archive lock for the whole wait: this write did not happen, so fail the run. */
+function reportArchiveBusy(repoRoot: string, lockPath: string): void {
+  console.error(`Error: ${archiveBusyMessage(repoRoot, lockPath)}`);
+  console.error('Run this command again once it has finished.');
+  process.exitCode = 1;
+}
+
+/** What `session migrate --json` reports for one copy: the copy result without its status. */
+type MigrateJsonData = Omit<Extract<AgentSessionCopy, { status: 'done' }>, 'status'>;
+
+/** `session migrate --json` prints the same `{ data } | { error }` envelope as the workflow commands. */
+function printEnvelope(envelope: WorkflowEnvelope): void {
+  process.stdout.write(`${JSON.stringify(envelope)}\n`);
+  if ('error' in envelope) process.exitCode = 1;
+}
+
+/**
+ * The sessions of `platform` in `cwd`, or in every workspace without it. When the platform could
+ * not be listed, its failure is printed (as the envelope under --json), the run fails, and the
+ * result is undefined.
+ */
+async function listSource({
+  platform,
+  cwd,
+  asEnvelope = false,
+}: {
+  platform: string;
+  cwd?: string;
+  asEnvelope?: boolean;
+}): Promise<AgentSessionListed[] | undefined> {
+  const {
+    sessions,
+    failures: [failure],
+  } = await AgentSession.list({ platforms: [platform], cwd });
+  if (!failure) return sessions;
+  if (asEnvelope) {
+    printEnvelope({ error: { code: failure.code, message: failure.message } });
+  } else {
+    console.error(`Error: ${failure.message}`);
+    process.exitCode = 1;
+  }
+  return undefined;
+}
+
+/**
+ * Under --json, stdout carries only the envelope: every progress line, from this command or a
+ * logger it reaches, goes to stderr until the returned restore runs.
+ */
+function reserveStdoutForEnvelope(): () => void {
+  const log = console.log;
+  console.log = console.error;
+  const wasStderrOnly = setStderrOnly(true);
+  return () => {
+    console.log = log;
+    setStderrOnly(wasStderrOnly);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Command registration
 // ---------------------------------------------------------------------------
@@ -349,7 +426,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     .description('List supported and installed AI agent platforms')
     .action(async () => {
       const available = listAvailablePlatforms();
-      const installed = listInstalledPlatforms();
+      const installed = listInstalledPlatforms(await recordedToolRoots(undefined));
       console.log('Available platforms:');
       for (const p of available) {
         const status = installed.includes(p) ? '✓ installed' : '✗ not installed';
@@ -372,8 +449,25 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     .option('--all', 'Migrate every session from source (not just the 5 most recent)')
     .option('--limit <n>', 'Max sessions to migrate (only caps --all; ignored otherwise)')
     .option('-y, --yes', 'Skip confirmation prompts, including archiving unredacted transcripts')
+    .option('--json', 'Print one {data}|{error} JSON envelope on stdout; never prompts (needs a session id, -s and -t)')
     .action(async (sessionId, opts) => {
+      const json = Boolean(opts.json);
+      const restoreStdout = json ? reserveStdoutForEnvelope() : undefined;
       try {
+      // A driver never answers a prompt: refuse up front, before anything is copied.
+      if (json) {
+        const refuse = (message: string) => printEnvelope({ error: { code: 'prompt_refused', message } });
+        if (opts.all) {
+          return printEnvelope({
+            error: { code: 'unsupported_option', message: '--json migrates one session: pass its id instead of --all.' },
+          });
+        }
+        if (!opts.source || !opts.target) return refuse('--json never prompts: pass -s <platform> and -t <platform>.');
+        if (!sessionId) return refuse('--json never prompts: pass the session id to migrate.');
+        if (opts.push && !opts.scrub && !opts.yes) {
+          return refuse('--json never prompts: pass -y to archive the transcript as-is, or --scrub to redact it first.');
+        }
+      }
       let source = opts.source;
       let target = opts.target;
 
@@ -386,15 +480,25 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         target = await promptSelect('Select target platform:', others);
       }
 
+      // A target no copy can be written to fails once here, not once per session after its preview.
+      const refusedTarget = noAdapter(target, 'write');
+      if (refusedTarget) {
+        if (json) return printEnvelope({ error: { code: refusedTarget.code, message: refusedTarget.message } });
+        console.error(`Error: ${refusedTarget.message}`);
+        process.exitCode = 1;
+        return;
+      }
+
       let workCwd = opts.cwd ?? process.cwd();
-      const sourceAdapter = safeGetAdapter(source);
-      let metas = await sourceAdapter.listConversations(workCwd);
+      let metas = await listSource({ platform: source, cwd: workCwd, asEnvelope: json });
+      if (!metas) return;
       let crossDirExpanded = false;
       // --all means "every session from this source": with no --cwd, enumerate
       // across all workspaces, rather than only the current directory (that
       // would silently turn --all into "everything in the current directory").
       if (opts.all && !opts.cwd && !sessionId) {
-        const allMetas = await sourceAdapter.listConversations();
+        const allMetas = await listSource({ platform: source });
+        if (!allMetas) return;
         if (allMetas.length > 0) {
           metas = allMetas;
           crossDirExpanded = true;
@@ -408,7 +512,8 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       // Previously workCwd was still passed to the source adapter, and claude-code
       // only looked in the single encodeCwdClaude(workCwd) directory, so this path failed 100% of the time.
       if (metas.length === 0 && !opts.cwd && !sessionId) {
-        const allMetas = await sourceAdapter.listConversations();
+        const allMetas = await listSource({ platform: source });
+        if (!allMetas) return;
         if (allMetas.length > 0) {
           console.log(`\nNo sessions found in current directory: ${workCwd}`);
           console.log(`But ${allMetas.length} session(s) found across all directories on ${source}.`);
@@ -422,8 +527,11 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       }
       /** Workspace used for source lookup: when expanded across directories, sessions do not belong to workCwd, so the adapter searches globally. */
       const sourceProjectPath = crossDirExpanded ? undefined : workCwd;
+      const printNotFound = () =>
+        printEnvelope({ error: { code: 'not_found', message: `No ${source} session ${sessionId} in ${workCwd}.` } });
 
       if (metas.length === 0) {
+        if (json) return printNotFound();
         console.log('No sessions found on source platform.');
         return;
       }
@@ -446,7 +554,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           console.log(`\nAbout to migrate ${targets.length} session(s) from ${source}:`);
           for (const m of targets) {
             const title = safeText(m.title);
-            console.log(`  ${m.sessionId.slice(0, 8)}  ${title.length > 50 ? title.slice(0, 50) + '...' : title}  (${m.messageCount} msgs)`);
+            console.log(`  ${m.sessionId.slice(0, 8)}  ${title.length > 50 ? title.slice(0, 50) + '...' : title}${listedCounts(m)}`);
           }
           // Nobody can answer in a non-interactive run. Cancelling with exit 0
           // there would tell a script that every session was migrated; refuse
@@ -467,12 +575,22 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           (m) => m.sessionId === sessionId || m.sessionId.startsWith(sessionId),
         );
         if (matches.length === 0) {
+          if (json) return printNotFound();
           console.error(`Session not found: ${sessionId}`);
           process.exit(1);
         }
         // Ambiguous prefix: taking every match silently migrates sessions the
         // user never named (and rollback then has to undo all of them).
         if (matches.length > 1) {
+          if (json) {
+            const ids = matches.slice(0, 10).map((m) => m.sessionId).join(', ');
+            return printEnvelope({
+              error: {
+                code: 'ambiguous_id',
+                message: `Session id "${sessionId}" matches ${matches.length} sessions (${ids}). Pass the full id.`,
+              },
+            });
+          }
           console.error(`Ambiguous session id "${sessionId}": matches ${matches.length} sessions.`);
           for (const m of matches.slice(0, 10)) {
             console.error(`  ${m.sessionId}  ${safeText(m.title).slice(0, 60)}`);
@@ -500,7 +618,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
             const title = safeText(m.title);
             const titleShown = title.length > 50 ? title.slice(0, 50) + '...' : title;
             console.log(
-              `  [${start + i + 1}] ${m.sessionId.slice(0, 8)}  ${titleShown}  (${m.messageCount} msgs, ${formatBytes(m.sizeBytes)})`,
+              `  [${start + i + 1}] ${m.sessionId.slice(0, 8)}  ${titleShown}${listedCounts(m, { includeSize: true })}`,
             );
           }
 
@@ -539,15 +657,31 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       }
 
       const engine = new MigrationEngine(source, target);
+      const toolRootsFor = toolRootsLookup();
       let migrated = 0;
+      let reused = 0;
       let failed = 0;
-      // Record the target session ID and real fidelity of each successful migration.
+      // Record the target session ID and real fidelity of each successful migration, and of each
+      // copy that already existed (a retried --push archives it).
       // --push then reads those IDs back exactly (not "the N most recent on the target platform",
       // which would push the wrong sessions; see P4/P7).
       const migratedTargets: { sessionId: string; fidelityScore: number; cwd?: string }[] = [];
+      /** --json: the one copy this run made or found. */
+      let copied: MigrateJsonData | undefined;
 
       for (const m of targets) {
-        const preview = await engine.preview(m.sessionId, sourceProjectPath);
+        // The preview shows what is stored; a --scrub run redacts in the copy itself.
+        const found = await AgentSession.find(
+          { platform: source, sessionId: m.sessionId, cwd: sourceProjectPath, filePath: m.filePath },
+          { scrub: false, toolRootsFor },
+        );
+        if (found.status === 'failed') {
+          if (json) return printEnvelope({ error: { code: found.failure.code, message: found.failure.message } });
+          console.error(`\n  ✗ Migration failed: ${found.failure.message}`);
+          failed++;
+          continue;
+        }
+        const preview = engine.preview(found.session);
 
         console.log(`\n  Migration Preview`);
         console.log(`  ─────────────────────────────────`);
@@ -576,59 +710,74 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         // Without honoring the global --dry-run, the only way to see fidelity and warnings
         // is to migrate for real and roll back if unhappy.
         if (isDryRun()) {
+          if (json) return printEnvelope({ data: { dryRun: true, fidelity: preview.fidelity } });
           console.log(`\n  · --dry-run: preview only, not migrated: ${m.sessionId.slice(0, 8)}...\n`);
           continue;
         }
 
-        // Target cwd defaults to the current working directory (a real absolute path).
-        // If omitted, writeSession falls back to session.cwd, which may be the encoded
-        // form stored by the source platform (e.g. `-Users-foo-project`) and cannot be restored to a real path.
         // Target workspace default = source session workspace (keep the directory the same);
-        // only an explicit --target-cwd moves the session to another workspace.
-        const result = await engine.migrate(m.sessionId, sourceProjectPath, opts.targetCwd, Boolean(opts.scrub));
-        if (result.success) {
+        // only an explicit --target-cwd moves the session to another workspace. An encoded or
+        // placeholder source cwd (e.g. `-Users-foo-project`) falls back to --cwd, and copy
+        // refuses anything that is still not an existing absolute directory.
+        const targetCwd = resolveTargetCwd(opts.targetCwd, preview.cwd, sourceProjectPath) ?? preview.cwd;
+        const result = await AgentSession.copy({
+          from: { platform: source, sessionId: m.sessionId, cwd: sourceProjectPath, filePath: m.filePath },
+          to: { platform: target, cwd: targetCwd },
+          scrub: Boolean(opts.scrub),
+          toolRootsFor,
+        });
+        if (result.status === 'failed') {
+          if (json) {
+            printEnvelope({ error: { code: result.failure.code, message: result.failure.message } });
+            return;
+          }
+          console.error(`\n  ✗ Migration failed: ${result.failure.message}`);
+          failed++;
+          continue;
+        }
+        if (result.reused) {
+          // Never overwritten: the member may have kept talking in the copy.
+          console.log(`\n  ✓ Session already migrated as ${result.sessionId}, nothing written.`);
+          console.log(`  Target CWD: ${result.cwd}`);
+          console.log(
+            `  To refresh it, delete that copy and migrate again: teamai session rollback ${result.sessionId} --platform ${target} --cwd "${result.cwd}"`,
+          );
+          reused++;
+        } else {
           console.log(`\n  ✓ Migration successful`);
-          console.log(`  Target session ID: ${result.targetSessionId}`);
-          if (result.targetCwd) console.log(`  Target CWD: ${result.targetCwd}`);
+          console.log(`  Target session ID: ${result.sessionId}`);
+          console.log(`  Target CWD: ${result.cwd}`);
           if (opts.scrub) {
             console.log(
               `  Redacted: ${result.redactedCount ?? 0} secret-looking value(s) (best-effort; review before archiving)`,
             );
           }
-          if (result.targetFilePath) {
-            console.log(`  Target file: ${result.targetFilePath}`);
+          if (result.filePath) {
+            console.log(`  Target file: ${result.filePath}`);
           }
-          if (result.registrationNotice) {
-            console.error(`  ⚠ ${result.registrationNotice}`);
+          if (result.notice) {
+            console.error(`  ⚠ ${result.notice}`);
           }
-          console.log(`  Fidelity: ${(result.preview.fidelity.score * 100).toFixed(1)}%`);
+          console.log(`  Fidelity: ${(result.fidelity.score * 100).toFixed(1)}%`);
           migrated++;
-          if (result.targetSessionId) {
-            migratedTargets.push({
-              sessionId: result.targetSessionId,
-              fidelityScore: result.preview.fidelity.score,
-              cwd: result.targetCwd,
-            });
-          }
-        } else {
-          console.error(`\n  ✗ Migration failed: ${result.error}`);
-          failed++;
         }
+        migratedTargets.push({ sessionId: result.sessionId, fidelityScore: result.fidelity.score, cwd: result.cwd });
+        const { status: _status, ...copy } = result;
+        copied = copy;
       }
-
       // Scripted semantics: any single failure exits non-zero (--all batch does not stop the remaining sessions).
-      if (failed > 0 && !isDryRun()) {
+      if (failed > 0) {
         process.exitCode = 1;
       }
 
       // --push: push to the team repo
-      if (opts.push && migrated > 0) {
-        const consent = await confirmUnredactedArchive(migrated, `${source} → ${target}`, {
+      if (opts.push && migratedTargets.length > 0) {
+        const consent = await confirmUnredactedArchive(migratedTargets.length, `${source} → ${target}`, {
           scrub: Boolean(opts.scrub),
           yes: Boolean(opts.yes),
         });
         if (consent !== 'ok') {
-          console.error(`\n  ${migrated} session(s) migrated locally, not archived.`);
+          console.error(`\n  ${migratedTargets.length} session(s) migrated locally, not archived.`);
           if (consent === 'refused') {
             console.error('Pass --scrub to redact the archive, or -y to archive as-is.');
             process.exitCode = 1;
@@ -641,16 +790,28 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         // When expanded across directories, sessions do not belong to workCwd; author should come from the repo the session actually lives in
         const authorCwd = migratedTargets.find((t) => t.cwd)?.cwd ?? workCwd;
         const author = getGitAuthor(authorCwd);
-        const targetAdapter = safeGetAdapter(target);
 
         const syncMgr = new SyncManager(repoRoot);
+        /** --json: the copy stays on this machine whatever happens to its archive, so say where it is. */
+        const archiveFailed = (code: string, reason: string) =>
+          printEnvelope({ error: { code, message: `Copied as ${copied?.sessionId} in ${copied?.cwd}, but not archived: ${reason}` } });
         let saved = 0;
+        let unarchived = 0;
         for (const t of migratedTargets) {
           // Migration keeps image paths so the target can still open the file.
           // The copy that lands in the team repo must not: re-read the target
           // and scrub again with the archive default, which drops filePath.
-          const readBack = await targetAdapter.readSession(t.sessionId, t.cwd ?? opts.targetCwd ?? workCwd);
-          const session = opts.scrub ? scrubSession(readBack).session : readBack;
+          const readBack = await AgentSession.find(
+            { platform: target, sessionId: t.sessionId, cwd: t.cwd ?? opts.targetCwd ?? workCwd },
+            { scrub: Boolean(opts.scrub), toolRootsFor },
+          );
+          if (readBack.status === 'failed') {
+            if (json) return archiveFailed(readBack.failure.code, readBack.failure.message);
+            console.error(`\n  ✗ Not archived: ${readBack.failure.message}`);
+            unarchived++;
+            continue;
+          }
+          const session = readBack.session;
           // P3: the archive key is derived from the session's native cwd, not the directory migrate is running in (see deriveArchiveIdentity)
           const meta = defaultSyncMeta(
             {
@@ -668,20 +829,29 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           meta.migration.targetPlatform = target;
           meta.migration.fidelityScore = t.fidelityScore;
           try {
-            syncMgr.saveSession(session, meta);
+            const write = await withSessionIndexLock(repoRoot, async () => syncMgr.saveSession(session, meta));
+            if (write.status === 'busy') {
+              if (json) return archiveFailed('busy', `${archiveBusyMessage(repoRoot, write.lockPath)} Run it again once that has finished.`);
+              reportArchiveBusy(repoRoot, write.lockPath);
+              return;
+            }
           } catch (err) {
-            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            const reason = err instanceof Error ? err.message : String(err);
+            if (json) return archiveFailed('archive_failed', reason);
+            console.error(`Error: ${reason}`);
             process.exitCode = 1;
             return;
           }
           saved++;
         }
+        if (unarchived > 0) {
+          console.error(`\n  ✗ ${unarchived} migrated session(s) could not be read back and were not archived.`);
+          process.exitCode = 1;
+        }
         // [fixed] a gitCommit failure (not a git directory / index.lock race) used to crash with a raw stack trace
-        const commit = runGitStep(
-          () => syncMgr.gitCommit(`sync: migrate ${saved} session(s) ${source}→${target}`),
-          repoRoot,
-          'git commit',
-        );
+        // Under --json a throw reaches the action's catch, which prints the envelope; runGitStep would exit without one.
+        const commitArchive = () => syncMgr.gitCommit(`sync: migrate ${saved} session(s) ${source}→${target}`);
+        const commit = json ? commitArchive() : runGitStep(commitArchive, repoRoot, 'git commit');
         if (commit.status === 'committed') {
           const pushed = pushToRemote(syncMgr);
           if (pushed) {
@@ -689,6 +859,12 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           } else {
             console.log(`\n  · ${saved} session(s) committed locally but not pushed`);
             process.exitCode = 1;
+            if (json) {
+              return archiveFailed(
+                'archive_failed',
+                `committed in ${repoRoot} as ${commit.commit.slice(0, 8)}, but the push to the remote failed (reason on stderr).`,
+              );
+            }
           }
           console.log(`  commit: ${commit.commit.slice(0, 8)}`);
         } else if (commit.status === 'failed') {
@@ -697,20 +873,29 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           // a broken archive.
           console.error(`\n  ✗ Commit failed, ${saved} session(s) left staged in ${repoRoot}: ${safeText(commit.reason)}`);
           process.exitCode = 1;
+          if (json) return archiveFailed('archive_failed', `the commit failed, files left staged in ${repoRoot}: ${safeText(commit.reason)}`);
         } else {
           console.log(`\n  · No changes to push\n`);
         }
       }
 
+      if (json && copied) {
+        printEnvelope({ data: copied });
+        return;
+      }
+      const failedNote = failed > 0 ? `, ${failed} failed` : '';
       console.log(
         isDryRun()
-          ? `\n  ${targets.length} session(s) would be migrated (--dry-run, no changes made).\n`
-          : `\n  ${migrated} session(s) migrated.\n`,
+          ? `\n  ${targets.length - failed} session(s) would be migrated${failedNote} (--dry-run, no changes made).\n`
+          : `\n  ${migrated} session(s) migrated${reused > 0 ? `, ${reused} already migrated` : ''}${failedNote}.\n`,
       );
       } catch (err) {
         // Interactive cancel (promptSelect throws 'Selection cancelled'; on EOF, ask returns an empty string
         // and hits that path) is not a failure. Exit quietly, and do not turn it into an unhandled-rejection stack.
         const msg = err instanceof Error ? err.message : String(err);
+        // --json never prompts, so nothing here is a cancel. Listing, reading and copying report their
+        // failures as values, so a throw that reaches here has no known cause.
+        if (json) return printEnvelope({ error: { code: 'unexpected_error', message: msg } });
         if (/cancel/i.test(msg)) {
           console.log('Cancelled.');
           return;
@@ -718,6 +903,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         console.error(`Error: ${msg}`);
         process.exit(1);
       } finally {
+        restoreStdout?.();
         closeStdin();
       }
     });
@@ -744,12 +930,10 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       const workCwd = opts.cwd ?? process.cwd();
       const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
       const author = getGitAuthor(workCwd);
-      const adapter = safeGetAdapter(source);
-      // --all: listConversations() with no argument enumerates every workspace directory of that platform (P5).
+      // --all: no workspace lists every workspace directory of that platform (P5).
       // The blast radius stays on a single platform (same as status --all); single-cwd mode keeps the old behavior.
-      const metas = opts.all
-        ? await adapter.listConversations()
-        : await adapter.listConversations(workCwd);
+      const metas = await listSource({ platform: source, cwd: opts.all ? undefined : workCwd });
+      if (!metas) return;
       const limitRaw = parseInt(opts.limit, 10);
       // Non-numeric / 0 / negative all fall back to the default. slice(0, -1)'s negative semantics would quietly drop one result
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 5;
@@ -765,7 +949,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       if (isDryRun()) {
         console.log(`\nDry-run: would archive ${selected.length} session(s) from ${source}:`);
         for (const m of selected) {
-          console.log(`  ${m.sessionId.slice(0, 8)}  ${safeText(m.title).slice(0, 50)}  (${m.messageCount} msgs)`);
+          console.log(`  ${m.sessionId.slice(0, 8)}  ${safeText(m.title).slice(0, 50)}${listedCounts(m)}`);
         }
         console.log(`  Repo root: ${repoRoot}`);
         return;
@@ -782,7 +966,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         console.log(`\nAbout to push ${selected.length} session(s) from ${source}:`);
         for (const m of selected) {
           const title = safeText(m.title);
-          console.log(`  ${m.sessionId.slice(0, 8)}  ${title.length > 50 ? title.slice(0, 50) + '...' : title}  (${m.messageCount} msgs)`);
+          console.log(`  ${m.sessionId.slice(0, 8)}  ${title.length > 50 ? title.slice(0, 50) + '...' : title}${listedCounts(m)}`);
         }
         const ans = await ask('\nPush all of the above? (y/N): ');
         if (ans.toLowerCase() !== 'y' && ans.toLowerCase() !== 'yes') {
@@ -807,17 +991,25 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       }
 
       const syncMgr = new SyncManager(repoRoot);
+      const toolRootsFor = toolRootsLookup();
       let saved = 0;
+      let unreadable = 0;
       let redactedTotal = 0;
       for (const m of selected) {
-        // With --all, sessions may come from any workspace. A scoped lookup (by the cwd-encoded directory)
-        // can miss because directory-name decoding is lossy, so leave it to a global adapter lookup.
-        // Single-cwd mode still passes workCwd.
-        const readSession = await adapter.readSession(m.sessionId, opts.all ? undefined : workCwd);
+        // Read the file that was listed: with --all, one id can live in several workspaces.
         // What gets archived is the full original text, and the team can read it: redact first when --scrub is set; when not redacted, say so once explicitly.
-        const scrubbed = opts.scrub ? scrubSession(readSession) : null;
-        const session = scrubbed ? scrubbed.session : readSession;
-        if (scrubbed) redactedTotal += scrubbed.redactedCount;
+        const found = await AgentSession.find(
+          { platform: source, sessionId: m.sessionId, cwd: opts.all ? undefined : workCwd, filePath: m.filePath },
+          { scrub: Boolean(opts.scrub), toolRootsFor },
+        );
+        if (found.status === 'failed') {
+          // This session alone is skipped; the rest of the batch is still archived.
+          console.error(`  ✗ Not archived: ${found.failure.message}`);
+          unreadable++;
+          continue;
+        }
+        const session = found.session;
+        redactedTotal += found.redactedCount ?? 0;
         if (opts.all) {
           console.log(`  Source: ${safeText(session.cwd || 'unknown directory')}`);
         }
@@ -838,13 +1030,21 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         // mid-batch must not fall through to a commit that publishes a
         // half-archive.
         try {
-          syncMgr.saveSession(session, meta);
+          const write = await withSessionIndexLock(repoRoot, async () => syncMgr.saveSession(session, meta));
+          if (write.status === 'busy') {
+            reportArchiveBusy(repoRoot, write.lockPath);
+            return;
+          }
         } catch (err) {
           console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
           process.exitCode = 1;
           return;
         }
         saved++;
+      }
+      if (unreadable > 0) {
+        console.error(`  ✗ ${unreadable} session(s) could not be read and were not archived.`);
+        process.exitCode = 1;
       }
       if (opts.scrub) {
         console.log(`  Redacted: ${redactedTotal} secret-looking value(s) (best-effort; review before sharing)`);
@@ -905,12 +1105,15 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       if (opts.all) {
         // P2: rebuild by directory (including repos whose index is missing or corrupt — those are exactly the ones that most need repair),
         // rather than only rebuilding the ones whose identity can be recovered from _index.json.
-        const { repos, sessions } = syncMgr.rebuildAllIndexes();
+        const rebuilt = await withSessionIndexLock(repoRoot, async () => syncMgr.rebuildAllIndexes());
+        if (rebuilt.status === 'busy') return reportArchiveBusy(repoRoot, rebuilt.lockPath);
+        const { repos, sessions } = rebuilt.value;
         console.log(`\n  ✓ Pulled and indexed ${sessions} session(s) across ${repos} repo(s)\n`);
       } else {
         const repoIdentity = resolveRepoIdentity(workCwd);
-        const count = syncMgr.rebuildIndex(repoIdentity);
-        console.log(`\n  ✓ Pulled and indexed ${count} session(s)\n`);
+        const rebuilt = await withSessionIndexLock(repoRoot, async () => syncMgr.rebuildIndex(repoIdentity));
+        if (rebuilt.status === 'busy') return reportArchiveBusy(repoRoot, rebuilt.lockPath);
+        console.log(`\n  ✓ Pulled and indexed ${rebuilt.value} session(s)\n`);
       }
     });
 
@@ -982,6 +1185,12 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     .option('--cwd <path>', 'Working directory for the restored session (defaults to current directory)')
     .option('--author <name>', 'Author of the session (if ambiguous)')
     .action(async (sessionName, opts) => {
+      const refused = noAdapter(opts.platform, 'write');
+      if (refused) {
+        console.error(`Error: ${refused.message}`);
+        process.exitCode = 1;
+        return;
+      }
       const workCwd = opts.cwd ?? process.cwd();
       const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
       const repoIdentity = resolveRepoIdentity(workCwd);
@@ -1001,8 +1210,8 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         process.exit(1);
       }
 
-      const resumeAdapter = safeGetAdapter(opts.platform);
       const resumeCwd = opts.cwd ?? process.cwd();
+      const resumeAdapter = await safeGetAdapter(opts.platform, resumeCwd);
       session.cwd = resumeCwd;
 
       if (isDryRun()) {
@@ -1012,7 +1221,21 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         return;
       }
 
-      const newSessionId = await resumeAdapter.writeSession(session, resumeCwd);
+      // Never overwrite: a member may have kept talking in an earlier restore of this session.
+      const write = await writeCopyOnce(resumeAdapter, { session, sourcePlatform: session.platform, cwd: resumeCwd });
+      if (write.status === 'failed') {
+        console.error(`Error: ${write.failure.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (write.reused) {
+        console.log(`\n  ✓ Session already restored as ${write.sessionId}, nothing written.`);
+        console.log(`  CWD: ${resumeCwd}`);
+        console.log(`\n  To continue: ${opts.platform} --resume ${write.sessionId}\n`);
+        return;
+      }
+
+      const newSessionId = write.sessionId;
       const registrationNotice = resumeAdapter.consumeWriteNotice?.();
 
       console.log(`\n  ✓ Session restored to ${opts.platform}`);
@@ -1075,7 +1298,8 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         const snippet = safeText(hit.snippet);
         const snippetShown = snippet.length > 150 ? snippet.slice(0, 150) + '...' : snippet;
         console.log(`  [${i + 1}] ${safeText(hit.sessionName)} (${safeText(hit.author)}, ${date})`);
-        console.log(`      Score: ${hit.score.toFixed(1)}`);
+        // Two significant digits: a match only in tool output scores well under 0.1, and one decimal printed 0.0.
+        console.log(`      Score: ${Number(hit.score.toPrecision(2))}`);
         console.log(`      ${snippetShown}`);
         console.log('');
       }
@@ -1104,7 +1328,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         return;
       }
 
-      const adapter = safeGetAdapter(opts.platform);
+      const adapter = await safeGetAdapter(opts.platform, opts.cwd);
       let deleted: boolean;
       try {
         deleted = await adapter.deleteSession(sessionId, opts.cwd);

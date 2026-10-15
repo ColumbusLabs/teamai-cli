@@ -21,7 +21,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AgentAdapter, type SessionMeta } from './base.js';
+import { AgentAdapter, ToolUnavailableError, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
 import {
@@ -36,8 +36,8 @@ import {
   removeDirRecursive,
 } from '../fs.js';
 import { cleanTitleText, fallbackTitle, titleFromCandidates, titleFromUserText, isRenderableText, visibleUserText } from '../title.js';
-import { registerCursorComposer, unregisterCursorComposer, type CursorComposerMessage, type CursorComposerTool } from '../cursor-store.js';
-import { assertSafeSessionFileId, resolveWriteSessionId } from '../ids.js';
+import { cursorComposerExists, registerCursorComposer, unregisterCursorComposer, type CursorComposerMessage, type CursorComposerTool } from '../cursor-store.js';
+import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { log } from '../../utils/logger.js';
 
 // ---------------------------------------------------------------------------
@@ -229,7 +229,7 @@ export class CursorAdapter extends AgentAdapter {
         }
       }
     } catch {
-      return null;
+      // Still listed with what was read, so a lookup reports the session unreadable, not missing.
     }
 
     title = titleFromCandidates(userTextCandidates) || fallbackTitle(sessionId);
@@ -254,11 +254,17 @@ export class CursorAdapter extends AgentAdapter {
     };
   }
 
-  async readSession(sessionId: string, projectPath?: string): Promise<Session> {
-    const jsonlPath = this.findSessionFile(sessionId, projectPath);
+  async readSession(ref: SessionReadRef): Promise<Session> {
+    // The listed file, else the id in the workspace, else the id anywhere.
+    const jsonlPath =
+      ref.filePath ??
+      this.findSessionFile(ref.sessionId, ref.projectPath) ??
+      (ref.projectPath ? this.findSessionFile(ref.sessionId) : null);
     if (!jsonlPath) {
-      throw new Error(`Cursor session file not found: session_id=${sessionId}`);
+      throw new Error(`Cursor session file not found: session_id=${ref.sessionId}`);
     }
+    // The file name is the id: a listed file decides it, not the request.
+    const sessionId = path.basename(jsonlPath, '.jsonl');
 
     // The directory layout is <encoded-cwd>/agent-transcripts/<uuid>/<uuid>.jsonl.
     // Go up 3 levels to reach the project directory; 2 levels lands on the intermediate agent-transcripts layer,
@@ -403,10 +409,25 @@ export class CursorAdapter extends AgentAdapter {
     return withResults;
   }
 
+  async existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined> {
+    if (this.findSessionFile(sessionId, projectPath)) return sessionId;
+    // Cursor shows the conversation from its store, which a write would replace, transcript or not.
+    const inStore = cursorComposerExists(sessionId, projectPath);
+    if (!inStore.ok) {
+      throw new ToolUnavailableError(
+        `Cursor's session store could not be read, so whether session ${sessionId} exists is unknown: ${inStore.reason}`,
+      );
+    }
+    return inStore.exists ? sessionId : undefined;
+  }
+
   async writeSession(session: Session, projectPath?: string): Promise<string> {
     const cwd = projectPath ?? session.cwd;
-    // Deterministic id: re-migrations of the same source session hit the same composerId (no more per-run copies)
-    const sessionId = resolveWriteSessionId(this.platform, session, cwd);
+    const sessionId = deriveTargetSessionId({
+      targetPlatform: this.platform,
+      targetCwd: cwd,
+      sourceSessionId: session.sessionId,
+    });
     const projDir = path.join(getCursorProjectsDir(), encodeCwdGeneric(cwd));
     const transcriptDir = path.join(projDir, 'agent-transcripts', sessionId);
     const jsonlPath = path.join(transcriptDir, `${sessionId}.jsonl`);
@@ -440,6 +461,9 @@ export class CursorAdapter extends AgentAdapter {
             cursorContent.push({ type: 'text', text: block.text });
           } else if (block.type === 'thinking') {
             cursorContent.push({ type: 'text', text: `<thinking>\n${block.text}\n</thinking>` });
+          } else if (block.type === 'image') {
+            // Cursor storage has no images: degrade to a placeholder (counted degraded)
+            cursorContent.push({ type: 'text', text: imagePlaceholderText(block) });
           }
         }
         if (toolResults.length > 0 && lastAssistantRecord) {
@@ -587,15 +611,16 @@ export class CursorAdapter extends AgentAdapter {
       const tools: CursorComposerTool[] = [];
       for (const block of msg.content) {
         if (block.type === 'text') {
-          // MigrationEngine degrades Cursor-unsupported ThinkingBlocks into `<thinking>...</thinking>`,
-          // wrapped text blocks (migrate.ts degradeThinkingBlocks). Left in the body they make Cursor
-          // rendered as an HTML block (markdown broken, newlines swallowed) -- strip before the DB bubble; the original stays in the
-          // transcript.
+          // AgentSession.copy hands thinking over as `<thinking>...</thinking>` text; writeSession degrades a
+          // raw ThinkingBlock to that text in the transcript itself. In a bubble body Cursor renders it as an
+          // HTML block (markdown broken, newlines swallowed), so strip it; the transcript keeps it.
           const stripped = block.text.replace(THINKING_WRAP_RE, '').trim();
           // user bubbles show the real question only: injected blocks (<user_info>/<rules>/<additional_data>/...) and attachment
           // paths are noise (Cursor renders them as chips natively; we cannot).
           const visible = msg.role === 'user' ? visibleUserText(stripped) : stripped;
           if (visible && isRenderableText(visible)) textParts.push(visible);
+        } else if (block.type === 'image') {
+          textParts.push(imagePlaceholderText(block));
         } else if (block.type === 'tool_call') {
           const res = toolResults.get(block.callId);
           tools.push({
@@ -628,7 +653,15 @@ export class CursorAdapter extends AgentAdapter {
     // unregistering first would drop another workspace's copy of the same
     // session id when `rollback --cwd` matched nothing here.
     const jsonlPath = this.findSessionFile(sessionId, projectPath);
-    if (!jsonlPath) return false;
+    if (!jsonlPath) {
+      // No transcript, but the composer can still be in the store; with `projectPath`, only one in that workspace.
+      const inStore = cursorComposerExists(sessionId, projectPath);
+      if (!inStore.ok) throw new Error(`Cursor's session store could not be read: ${inStore.reason}`);
+      if (!inStore.exists) return false;
+      const removed = unregisterCursorComposer(sessionId);
+      if (!removed.ok) throw new Error(`Removing session ${sessionId} from Cursor's store failed: ${removed.reason}`);
+      return true;
+    }
 
     // Unregister (otherwise deleting the transcript leaves an unopenable entry in the Agents list)
     try {

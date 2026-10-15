@@ -14,9 +14,39 @@ export interface SessionMeta {
   platform: string;
   createdAt: string; // ISO8601
   updatedAt: string; // ISO8601
-  messageCount: number;
+  /** Absent when the tool's listing does not count messages (OpenCode). */
+  messageCount?: number;
+  /**
+   * Where the session lives: its transcript file, or on CodeBuddy IDE its conversation directory.
+   * Pass it back as `SessionReadRef.filePath` to read exactly this session.
+   */
   filePath?: string;
-  sizeBytes: number;
+  /** Absent when the tool's listing does not measure it (OpenCode). */
+  sizeBytes?: number;
+}
+
+/** Which session `readSession` opens. */
+export interface SessionReadRef {
+  /** The id the session is listed under. Codex also accepts a suffix of 8+ characters. */
+  sessionId: string;
+  /** The workspace to look in. */
+  projectPath?: string;
+  /**
+   * The `SessionMeta.filePath` the adapter listed: a transcript file on every platform except
+   * CodeBuddy IDE, where it is the conversation directory, and OpenCode, which lists none (its
+   * sessions live behind its CLI, where one id names one session). When set, exactly that is
+   * read, so a caller that enumerated sessions never opens another copy with the same id.
+   */
+  filePath?: string;
+}
+
+/**
+ * Thrown by an adapter whose tool CLI cannot run on this machine (absent, or too old), or whose
+ * store cannot be read.
+ * `AgentSession` reports it as `tool_unavailable`, never as a missing session.
+ */
+export class ToolUnavailableError extends Error {
+  override name = 'ToolUnavailableError';
 }
 
 export abstract class AgentAdapter {
@@ -44,8 +74,22 @@ export abstract class AgentAdapter {
   /** List every session under the given project (working directory) on this platform. When projectPath is undefined, list all. */
   abstract listConversations(projectPath?: string): Promise<SessionMeta[]>;
 
-  /** Read one session and return a normalized IR Session. */
-  abstract readSession(sessionId: string, projectPath?: string): Promise<Session>;
+  /**
+   * Read one session and return a normalized IR Session. Lookup order: `filePath`, then the id in
+   * `projectPath`, then (Cursor, WorkBuddy, CodeBuddy IDE and OpenCode, or when no `projectPath`
+   * is given) the id across the platform. The returned `sessionId` is the id of the session opened, never
+   * the one requested.
+   */
+  abstract readSession(ref: SessionReadRef): Promise<Session>;
+
+  /**
+   * The id this platform stores `sessionId` under, when anything with that id exists, or undefined.
+   *
+   * A lookup by id across all of the platform's storage, not a computed path, and without parsing:
+   * a copy the client is writing at that moment, or one that no longer parses, still exists.
+   * With `projectPath`, only that workspace counts, the same scope `deleteSession` uses.
+   */
+  abstract existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined>;
 
   /** Write a normalized IR Session to the target platform and return the written session ID. */
   abstract writeSession(session: Session, projectPath?: string): Promise<string>;

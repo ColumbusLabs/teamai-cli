@@ -24,16 +24,17 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AgentAdapter, type SessionMeta } from './base.js';
+import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
-import { assertSafeSessionFileId, resolveWriteSessionId } from '../ids.js';
+import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import {
   getCodeBuddyProjectsDir,
   encodeCwdCodeBuddy,
   decodeCwdGeneric,
   readJsonl,
   readJsonlHead,
+  fileModifiedAt,
   writeJsonl,
   fileExists,
   dirExists,
@@ -120,9 +121,6 @@ function argumentsDisplayText(name: string, args: Record<string, unknown> | unde
 // UUID / timestamp helpers
 // ---------------------------------------------------------------------------
 
-// Do not check the version nibble: a source sessionId may be UUID v7 (codex / codex-internal / tcodex).
-// Accepting only v4 would mint a new v4 ID on every migration — not idempotent (repeated migrations pile up copies)
-// and the source sessionId could no longer be used to track or roll back. Any well-formed UUID shape is enough to reuse the source ID.
 function uuidV4(): string {
   return crypto.randomUUID();
 }
@@ -263,10 +261,11 @@ export class CodeBuddyAdapter extends AgentAdapter {
         }
       }
     } catch {
-      return null;
+      // Still listed with what was read, so a lookup reports the session unreadable, not missing.
     }
 
-    if (!createdAt) createdAt = new Date().toISOString();
+    // No record says when: date it by the file, so a damaged session does not sort as the newest.
+    if (!createdAt) createdAt = fileModifiedAt(jsonlPath);
     if (!updatedAt) updatedAt = createdAt;
 
     // ai-title is the title CodeBuddy itself chose, so it is the most reliable; otherwise fall back to the first user text.
@@ -298,11 +297,13 @@ export class CodeBuddyAdapter extends AgentAdapter {
     };
   }
 
-  async readSession(sessionId: string, projectPath?: string): Promise<Session> {
-    const jsonlPath = this.findSessionFile(sessionId, projectPath);
+  async readSession(ref: SessionReadRef): Promise<Session> {
+    const jsonlPath = ref.filePath ?? this.findSessionFile(ref.sessionId, ref.projectPath);
     if (!jsonlPath) {
-      throw new Error(`CodeBuddy session file not found: session_id=${sessionId}`);
+      throw new Error(`CodeBuddy session file not found: session_id=${ref.sessionId}`);
     }
+    // The file name is the id: a listed file decides it, not the request.
+    const sessionId = path.basename(jsonlPath, '.jsonl');
 
     const cwd = decodeCwdGeneric(path.basename(path.dirname(jsonlPath)));
     const records = [...readJsonl(jsonlPath)];
@@ -479,12 +480,17 @@ export class CodeBuddyAdapter extends AgentAdapter {
     return blocks;
   }
 
-  async writeSession(session: Session, projectPath?: string): Promise<string> {
-    // Same-platform archives derive a new id. cwd stays out of the hash:
-    // sessions live under the project directory, so one id in two dirs is two files.
-    const sessionId = resolveWriteSessionId(this.platform, session);
+  async existingSessionId(sessionId: string, projectPath?: string): Promise<string | undefined> {
+    return this.findSessionFile(sessionId, projectPath) ? sessionId : undefined;
+  }
 
+  async writeSession(session: Session, projectPath?: string): Promise<string> {
     const cwd = projectPath ?? session.cwd;
+    const sessionId = deriveTargetSessionId({
+      targetPlatform: this.platform,
+      targetCwd: cwd,
+      sourceSessionId: session.sessionId,
+    });
     const projDir = path.join(getCodeBuddyProjectsDir(), encodeCwdCodeBuddy(cwd));
     const jsonlPath = path.join(projDir, `${sessionId}.jsonl`);
 

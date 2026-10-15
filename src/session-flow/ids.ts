@@ -1,53 +1,140 @@
 /**
- * ids.ts -- deterministic derivation of target-platform session ids.
+ * ids.ts -- the id a session gets when TeamAI writes it into a tool.
  *
- * Source session ids are often not UUIDs (e.g. CodeBuddy IDE's 32-hex
- * `60062279ff104372bc110594720a8016`). If a target adapter falls back to
- * `randomUUID()` in that case, every re-migration of the same session mints a
- * fresh duplicate in the target client.
+ * Every target id is derived: sha256 over the target platform, the canonical
+ * target workspace and the source session id, shaped as a UUIDv7, or on
+ * OpenCode as an OpenCode id. No source id is ever reused, for any platform:
  *
- * Deriving from sha256(platform + sourceId) yields a stable UUIDv7-shaped id:
- * the same (platform, source session) always maps to the same target id, so a
- * re-migration is an overwrite -- idempotent by construction.
+ * - Reusing a source UUID wrote the copy over whatever already had that id in
+ *   the target, and a same-platform CodeBuddy IDE copy replaced the live
+ *   conversation.
+ * - The workspace is part of the key for every platform. Claude Code resumes by
+ *   id across all project directories, and a rollback without a workspace
+ *   deletes the id everywhere, so one id in two workspaces is not two sessions.
+ *
+ * The same request (platform, workspace, source) always names the same target.
+ * Copies written by an older TeamAI kept the source UUID, or (Claude Code and
+ * CodeBuddy) left the workspace out of the hash, so they carry other ids;
+ * `legacyTargetSessionIds` names them so a re-copy finds them.
  */
 
 import * as crypto from 'node:crypto';
-import { resolveRealCwd } from './fs.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 /**
- * Derive a deterministic target session id (UUIDv7 shape) from a source id.
+ * Derive the id to write a session under in `targetPlatform` at `targetCwd`.
  *
- * `targetCwd` participates when known: Cursor/WorkBuddy/Codex key their
- * records globally (one sqlite / threads table for every workspace), so
- * migrating one source session into two workspaces with the same derived id
- * makes the second copy replace the first.
+ * Throws before anything is written when `targetCwd` is not absolute: a
+ * relative path or a placeholder such as `md5:<hash>` would resolve against
+ * the directory the command runs in, so both the id and the file would move
+ * with it.
  *
- * Only claude-code and codebuddy omit it: they store each session under
- * `<storageRoot>/<encoded cwd>/<id>.jsonl`, so one id in two workspaces is
- * already two files and nothing is overwritten. Adding cwd there would only
- * move already-migrated sessions to a new id. Note the consequence: a session
- * migrated into a global-key platform before this change gets a different id
- * when re-migrated (the old copy stays, orphaned).
+ * `platform` names the OS whose path rules apply; only a test passes another one, since no
+ * Windows CI runs.
  */
 export function deriveTargetSessionId(
-  targetPlatform: string,
-  sourceId: string,
-  targetCwd?: string,
+  target: {
+    targetPlatform: string;
+    targetCwd: string;
+    sourceSessionId: string;
+    /** The source session's creation time (ISO 8601). Only an OpenCode id carries it. */
+    sourceCreatedAt?: string;
+  },
+  platform: NodeJS.Platform = process.platform,
 ): string {
-  // Resolve before hashing: `/tmp/x` and `/private/tmp/x` are one workspace on
-  // macOS, and two spellings would derive two ids for the same migration --
-  // a re-migration would then add a second copy instead of overwriting.
-  const scope = targetCwd ? `:${resolveRealCwd(targetCwd)}` : '';
-  const hex = crypto
-    .createHash('sha256')
-    .update(`teamai:${targetPlatform}${scope}:${sourceId}`)
-    .digest('hex');
+  const { targetPlatform, targetCwd, sourceSessionId } = target;
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  if (!paths.isAbsolute(targetCwd)) {
+    throw new Error(
+      `Target workspace "${targetCwd}" is not an absolute path, so the session was not written. ` +
+        'Pass an absolute directory (--target-cwd for `session migrate`, --cwd for `session resume`).',
+    );
+  }
+  const key = `teamai:${targetPlatform}:${canonicalWorkspace(targetCwd, paths)}:${sourceSessionId}`;
+  if (targetPlatform === 'opencode') {
+    const time =
+      OPENCODE_SESSION_TIME.exec(sourceSessionId)?.[1] ?? opencodeTime(opencodeClock(createdMs(target.sourceCreatedAt)), 'descending');
+    return `ses_${time}${base62Suffix(key)}`;
+  }
+  return uuidV7Shaped(key);
+}
+
+/**
+ * The ids of the messages TeamAI writes into the OpenCode session `sessionId`, one per creation
+ * time (epoch ms), in order. A copy needs its own message ids: OpenCode refuses a message id it
+ * already has, so two copies of one source cannot share them. Each id sorts after the one before,
+ * as OpenCode's own do, even when two messages share a time.
+ */
+export function deriveOpencodeMessageIds(sessionId: string, createdTimes: number[]): string[] {
+  let previous = -1n;
+  return createdTimes.map((ms, index) => {
+    const clock = opencodeClock(ms);
+    previous = clock > previous ? clock : previous + 1n;
+    return `msg_${opencodeTime(previous, 'ascending')}${base62Suffix(`${sessionId}:${index}`)}`;
+  });
+}
+
+/**
+ * OpenCode ids: a prefix, 12 hex of time, 14 base62 characters. OpenCode encodes the creation
+ * time so that session ids sort newest first and message ids oldest first, and a copy keeps that:
+ * the time part of an OpenCode source, or the time encoded the way OpenCode 2 encodes it, followed
+ * by a suffix derived like every other target id. OpenCode only checks the prefix.
+ */
+const OPENCODE_SESSION_TIME = /^ses_([0-9a-f]{12})/;
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+/** OpenCode 2 counts ids within one millisecond: `ms * 4096 + counter`, the first counter being 1. */
+const opencodeClock = (ms: number): bigint => BigInt(ms) * 4096n + 1n;
+
+/** OpenCode 2's time part: the low 48 bits of the clock, inverted for descending ids. */
+function opencodeTime(clock: bigint, order: 'ascending' | 'descending'): string {
+  const bits = (order === 'descending' ? ~clock : clock) & 0xffff_ffff_ffffn;
+  return bits.toString(16).padStart(12, '0');
+}
+
+/** A time OpenCode can encode; a missing or unparseable one sorts first. */
+function createdMs(iso: string | undefined): number {
+  const ms = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+function base62Suffix(key: string): string {
+  const bytes = crypto.createHash('sha256').update(key).digest();
+  return Array.from(bytes.subarray(0, 14), (byte) => BASE62[byte % 62]).join('');
+}
+
+/** Platforms whose copies an older TeamAI derived without the workspace: per-project stores. */
+const DERIVED_WITHOUT_WORKSPACE = new Set(['claude-code', 'claude-internal', 'tclaude', 'codebuddy']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Ids an older TeamAI wrote a copy of this source under, in the target workspace:
+ *
+ * - the source id itself, when it is a UUID and the target is another platform;
+ * - for Claude Code and CodeBuddy, the id derived without the workspace.
+ *
+ * Workspace-keyed stores (Codex, Cursor, WorkBuddy, CodeBuddy IDE) already
+ * hashed the workspace the way `deriveTargetSessionId` does for a correctly
+ * spelled path, so their derived id is the same.
+ */
+export function legacyTargetSessionIds(target: {
+  sourcePlatform: string;
+  targetPlatform: string;
+  sourceSessionId: string;
+}): string[] {
+  const { sourcePlatform, targetPlatform, sourceSessionId } = target;
+  const ids: string[] = [];
+  if (sourcePlatform !== targetPlatform && UUID_RE.test(sourceSessionId)) ids.push(sourceSessionId);
+  if (DERIVED_WITHOUT_WORKSPACE.has(targetPlatform)) ids.push(uuidV7Shaped(`teamai:${targetPlatform}:${sourceSessionId}`));
+  return ids;
+}
+
+function uuidV7Shaped(key: string): string {
+  const hex = crypto.createHash('sha256').update(key).digest('hex');
   const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
-  // version nibble is **7**: targets (e.g. Codex's isUuidV7) treat the id as
-  // "already a native id" and reuse it. With 8, migrating an already-migrated
-  // session (codex->X->codex) would derive a *new* id and break idempotency
-  // across chains. The time bits are hash, not a real timestamp -- sorting
-  // fields (recency/updated_at) come from session timestamps, not the id.
+  // Version nibble 7 keeps the UUIDv7 shape Codex expects of a thread id. The
+  // time bits are hash, not a timestamp: sorting comes from session timestamps.
   return [
     hex.slice(0, 8),
     hex.slice(8, 12),
@@ -57,26 +144,28 @@ export function deriveTargetSessionId(
   ].join('-');
 }
 
-const UUID_ANY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SAFE_SESSION_FILE_ID_RE = /^[A-Za-z0-9_-]+$/;
-
 /**
- * Id to write under `targetPlatform`.
- * Same-platform archives always derive, so the original file is not overwritten.
- * A dashed UUID from another platform is reused. `targetCwd` is hashed for
- * stores that key sessions globally (Cursor, WorkBuddy, Codex).
+ * One spelling per workspace: the native real path. It resolves symlinks
+ * (`/tmp/x` and `/private/tmp/x` on macOS) and, on case-insensitive file
+ * systems, letter case (`/Users/me/Repo` and `/users/me/repo`), so a retry
+ * from another spelling names the same target. A path that does not exist yet
+ * is only resolved, so its id can change once the directory is created through
+ * another spelling. On Windows, resolving also turns `/` into `\` and drops a
+ * trailing separator, and the drive letter is upper-cased: `c:\` (what VS Code
+ * terminals type) and `C:\` are one drive, even for a folder not created yet.
  */
-export function resolveWriteSessionId(
-  targetPlatform: string,
-  session: { sessionId: string; platform: string },
-  targetCwd?: string,
-): string {
-  if (session.platform === targetPlatform) {
-    return deriveTargetSessionId(targetPlatform, session.sessionId, targetCwd);
+function canonicalWorkspace(cwd: string, paths: path.PlatformPath): string {
+  const resolved = paths.resolve(cwd);
+  let real: string;
+  try {
+    real = fs.realpathSync.native(resolved);
+  } catch {
+    real = resolved;
   }
-  if (UUID_ANY_RE.test(session.sessionId)) return session.sessionId;
-  return deriveTargetSessionId(targetPlatform, session.sessionId, targetCwd);
+  return paths === path.win32 ? real.replace(/^[a-z]:/, (drive) => drive.toUpperCase()) : real;
 }
+
+const SAFE_SESSION_FILE_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 export function isSafeSessionFileId(sessionId: string): boolean {
   return SAFE_SESSION_FILE_ID_RE.test(sessionId);
