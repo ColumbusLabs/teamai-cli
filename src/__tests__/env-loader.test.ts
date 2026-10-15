@@ -1972,6 +1972,29 @@ describe('team env by directory (#1018)', () => {
       expect(run.stdout).toContain('hooks:__teamai_env_apply member_prompt');
     });
 
+    // RHEL-family /etc/bashrc sets an entry like `printf "\033]0;%s\007" ...`.
+    it.skipIf(!hasBashAtLeast(5, 1))('keeps an array prompt hook whole when it holds a `;`', async () => {
+      const a = await project('prompt-array-semicolon');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      const loader = path.join(homeDir, '.teamai', 'env-loader.sh');
+      await fse.writeFile(path.join(homeDir, '.bashrc'), [
+        `PROMPT_COMMAND=('printf "title;%s\\n" "$MARKER"')`,
+        `. '${loader}'`,
+        '',
+      ].join('\n'));
+      const run = spawnSync('bash', ['-i'], {
+        cwd: a.projectRoot,
+        env: { HOME: homeDir, PATH: process.env.PATH, SHELL: '/bin/bash' },
+        input: `:\n. '${loader}'\nprintf 'hooks:%s\\n' "\${PROMPT_COMMAND[*]}"\nexit\n`,
+        encoding: 'utf-8',
+      });
+
+      expect(run.status, run.stderr).toBe(0);
+      expect(run.stderr).not.toContain('bash: PROMPT_COMMAND');
+      expect(run.stdout).toContain('title;from-a');
+      expect(run.stdout).toContain('hooks:__teamai_env_apply printf "title;%s\\n" "$MARKER"');
+    });
+
     const promptBashes = [...new Set(['/bin/bash', 'bash'])].filter((bash) => hasBashAtLeast(0, 0, bash));
     const promptEdits = promptBashes.flatMap((bash) => [
       { bash, separator: ';', edit: 'PROMPT_COMMAND="$PROMPT_COMMAND; member_extra"' },
