@@ -123,3 +123,15 @@ teamai workflow report <run> --json '{"attempt":"<attempt>","revision":1,"outcom
 `outcome` is `success`, `failed`, or `released`. `released` puts the step back to pending. It does not use up a retry. A report for an attempt that was already settled returns `repeated_report`, even when the revision is old. The run keeps recent settled attempts for that check. An older attempt uses the other checks: an old revision returns `stale_revision`, and a current revision that is not the leased attempt returns `wrong_attempt`. Another driver returns `wrong_driver`.
 
 The run is stored in this scope's TeamAI data directory. The command exits when it finishes. A local run that ends `failed` exits with status 1. No workflow process keeps running.
+
+## Run records
+
+Every run publishes a privacy-preserving record to the team's `teamai-reports` branch: once when it starts and once when it ends. Records live in `workflows/runs/<run id>.json`, keyed by run id, so a retried publication updates the same record instead of adding a copy.
+
+A record carries only: the run id, workflow name, phase (`start` or `end`), driver kind, status, the end the run reached (when it reached one), start and end times, duration, per-step entries (step path such as `check.classify`, agent, tool, model, outcome, tokens — a mixed-agent run records each step's own fields), summary step counts (succeeded, failed, skipped), the cumulative settled-attempt count, and the publishing username. Steps of a sub-workflow that never started are not counted. Prompts, command text, input values, `env` values, outputs, diffs, secret values, local workspace paths, session ids, and hostnames have no field to land in — the record is built from an allowlist, not filtered from the run state.
+
+The end record is published by the `next` that settles the run. A publication that fails — no remote, a busy reports lock, a rejected push — is queued in this scope's data directory and retried on the next `teamai pull`. The `start` and `next` envelopes then carry `record: pending` instead of `record: published`. The run itself is unaffected: a machine that dies after starting a run leaves it visible as started but not ended.
+
+Run ids are `r` plus 16 hex digits. Runs created before this scheme used 8 hex digits and still resolve.
+
+Workflow totals (runs, succeeded, failed, cumulative duration) are folded into `stats/<username>.yaml` on the reports branch at publication time and shown by `teamai digest`.
