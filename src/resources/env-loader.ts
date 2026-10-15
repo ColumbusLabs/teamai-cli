@@ -764,9 +764,10 @@ __teamai_env_unhook() {
   if [ -n "\${BASH_VERSION-}" ]; then
     if __teamai_env_prompt_array; then
       __teamai_prompts=()
-      for __teamai_prompt in "\${PROMPT_COMMAND[@]}"; do
-        __teamai_env_prompt_strip "$__teamai_prompt"
-        if [ -z "$__teamai_prompt_found" ]; then __teamai_prompts+=("$__teamai_prompt")
+      # Not __teamai_prompt: the strip overwrites that with each command it splits off.
+      for __teamai_prompt_entry in "\${PROMPT_COMMAND[@]}"; do
+        __teamai_env_prompt_strip "$__teamai_prompt_entry"
+        if [ -z "$__teamai_prompt_found" ]; then __teamai_prompts+=("$__teamai_prompt_entry")
         elif [ -n "$__teamai_prompt_clean" ]; then __teamai_prompts+=("$__teamai_prompt_clean"); fi
       done
       PROMPT_COMMAND=("\${__teamai_prompts[@]}")
