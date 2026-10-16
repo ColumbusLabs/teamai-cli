@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { readUsageEvents, truncateUsageAfterReport } from './usage-tracker.js';
 import { aggregateUsage } from './stats.js';
+import { collectTeamRepoSkills } from './agent-skills.js';
+import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { readEvents, aggregateSessionMetrics, dataHomeKey } from './dashboard-collector.js';
 import {
   createGit,
@@ -132,6 +134,41 @@ export function mergeStats(
     ...(existing?.tokens !== undefined ? { tokens: existing.tokens } : {}),
     ...(existing?.daily !== undefined ? { daily: existing.daily } : {}),
   };
+}
+
+/**
+ * The set of skill names that may be published in stats: the team repo's
+ * shared catalog plus the CLI's built-in skills (deployed by the CLI itself
+ * and served via `teamai skill get`, never present in `skills/` — without
+ * them, adoption of the built-in `teamai` skill would silently disappear
+ * from the digest, #1056 review). The catalog is enumerated from the team
+ * repo's default-branch checkout. The reports branch is an orphan branch and
+ * never carries `skills/`, so the catalog must always be enumerated from the
+ * main repo path, not from the worktree stats are written into (#1055).
+ */
+export async function teamSharedSkillNames(repoRoot: string): Promise<Set<string>> {
+  const names = new Set((await collectTeamRepoSkills(repoRoot)).keys());
+  for (const name of BUILTIN_SKILL_NAMES) names.add(name);
+  return names;
+}
+
+/**
+ * Merge usage stats into the published file, filtering new usage to skill
+ * names the team actually shares (#1055). `stats/<user>.yaml` is visible to
+ * everyone who pulls, so a member's local-only skills, slash-command names and
+ * stray SKILL.md reads must not be published; the local `usage.jsonl` keeps
+ * full fidelity. Names published before this filter existed are kept as-is:
+ * they remain in the git history either way, and rewriting that history is
+ * costly (maintainer call on #1056). An empty catalog (a team that shares no
+ * skills) therefore only blocks new additions.
+ */
+export function mergeStatsWithinTeamSkills(
+  existing: UserStats | null,
+  username: string,
+  newEvents: { name: string; count: number; lastUsed: Date }[],
+  teamSkills: ReadonlySet<string>,
+): UserStats {
+  return mergeStats(existing, username, newEvents.filter((s) => teamSkills.has(s.name)));
 }
 
 // ─── Human Intervention reporting (Issue #34) ──────────
@@ -974,6 +1011,10 @@ export async function reportUsageToTeam(
       writeRoot: string,
       votesStaged?: { syncedDeltas?: UserVotesV2['deltas'] },
     ): Promise<void> => {
+      // The team's shared-skill catalog for the #1055 privacy filter. Always
+      // enumerated from repoPath (the default-branch checkout): writeRoot may
+      // be the orphan reports-branch worktree, which never carries skills/.
+      const teamSkillNames = await teamSharedSkillNames(repoPath);
       // Process usage and/or intervention/prompt/token stats if anything is new to report.
       if (hasStats) {
         const statsDir = path.join(writeRoot, 'stats');
@@ -991,7 +1032,12 @@ export async function reportUsageToTeam(
           restoreStats = () => writeFile(statsPath, previousContent ?? '');
         }
         const newStats = hasUsage ? aggregateUsage(events) : [];
-        const merged = mergeStats(existing, username, newStats);
+        // #1055: new usage is filtered to names the team actually shares (plus
+        // CLI built-ins); names published before this filter existed are kept
+        // as-is (maintainer call on #1056). The catalog comes from the
+        // default-branch repo path, never from writeRoot (the reports branch
+        // is an orphan without skills/).
+        const merged = mergeStatsWithinTeamSkills(existing, username, newStats, teamSkillNames);
         if (hasInterventions) {
           merged.interventions = mergeInterventionStats(existing?.interventions, interventionDelta);
         }
