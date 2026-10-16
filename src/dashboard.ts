@@ -15,6 +15,7 @@ import { getDashboardHtml } from './dashboard-html.js';
 import { getUserHome } from './utils/home.js';
 import type { VizSummary } from './viz.js';
 import { aggregateDailySessions, computeDailyStatsDelta, summarizeTrendWindow, summarizeSessionCosts } from './session-trends.js';
+import { HttpError, isLocalWrite, readJsonBody } from './dashboard/http.js';
 
 // ─── Dashboard server architecture ──────────────────────
 //
@@ -164,11 +165,77 @@ export async function startDashboard(port?: number): Promise<void> {
   };
   const pidCheckInterval = setInterval(() => void checkPids(), DASHBOARD_PID_CHECK_INTERVAL_MS);
 
+  // Distribution (#1124): read, preview, and save a workspace's roles and
+  // projects. The workspace's config is read fresh, not from the TTL cache.
+  // Saves run one at a time, each reading the config, checking its revision,
+  // and writing it in turn, so two saves cannot both pass the check against
+  // one old config and the second overwrite the first.
+  let distributionWrites: Promise<unknown> = Promise.resolve();
+  const freshConfig = async (scopeId: string | null) => {
+    workspacesCache = null;
+    return (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId)?.config ?? null;
+  };
+  const handleDistribution = async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string, scopeId: string | null) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    const route = pathname.slice('/api/distribution'.length);
+    const writeRoutes = ['/preview', '/roles', '/projects'];
+    if (route === '' ? req.method !== 'GET' : !writeRoutes.includes(route) || req.method !== 'POST') {
+      json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
+      return;
+    }
+    const distribution = await import('./dashboard/distribution.js');
+    try {
+      if (route === '') {
+        const config = await freshConfig(scopeId);
+        json(200, config ? await distribution.readDistribution(config) : { configured: false });
+        return;
+      }
+      const body = await readJsonBody(req);
+      if (route === '/preview') {
+        const config = await freshConfig(scopeId);
+        if (!config) throw new HttpError(400, 'Select a workspace with a teamai config.');
+        json(200, await distribution.previewDistribution(config, body));
+        return;
+      }
+      const save = async () => {
+        const config = await freshConfig(scopeId);
+        if (!config) throw new HttpError(400, 'Select a workspace with a teamai config.');
+        if (route === '/roles') await distribution.saveRoles(config, body);
+        else await distribution.saveProjects(config, body);
+        const saved = await freshConfig(scopeId);
+        return saved ? distribution.readDistribution(saved) : { configured: false };
+      };
+      const result = distributionWrites.then(save, save);
+      distributionWrites = result.catch(() => undefined);
+      json(200, await result);
+    } catch (e) {
+      if (e instanceof HttpError) {
+        json(e.status, { error: e.message });
+        return;
+      }
+      log.debug(`dashboard: ${pathname} failed: ${(e as Error).message}`);
+      json(500, { error: 'Failed to update distribution.' });
+    }
+  };
+
   const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://localhost:${serverPort}`);
 
     // CORS headers for local development
     res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Any origin may read (CORS *), so every other method is a write and must
+    // come from this dashboard's own page, whichever route it is for (#1124).
+    // A browser's preflight (OPTIONS) is refused here too, so a cross-site
+    // write is never sent.
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !isLocalWrite(req, serverPort)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Write requests must come from the local dashboard.' }));
+      return;
+    }
 
     if (url.pathname === '/' || url.pathname === '/index.html') {
       // Serve dashboard HTML
@@ -253,6 +320,11 @@ export async function startDashboard(port?: number): Promise<void> {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Failed to load rules.' }));
       }
+      return;
+    }
+
+    if (url.pathname === '/api/distribution' || url.pathname.startsWith('/api/distribution/')) {
+      await handleDistribution(req, res, url.pathname, scopeId);
       return;
     }
 
