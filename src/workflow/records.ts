@@ -14,8 +14,9 @@
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { loadTeamConfig } from '../config.js';
 import type { LocalConfig } from '../types.js';
-import { getDataHome } from '../types.js';
+import { getDataHome, isUsageReportEnabled } from '../types.js';
 import { locateStep } from './engine.js';
 import type { DriverIdentity, RunState, RunStatus, StepOutcome, TokenUsage } from './types.js';
 
@@ -157,30 +158,46 @@ export function mergeRecord(origin: WorkflowRunRecord | null, next: WorkflowRunR
   return { ...origin, ...next, startedAt: origin.startedAt };
 }
 
+/** Whether a run record was delivered or still waits in the local queue. */
+type RecordState = 'published' | 'pending';
+
+/** The opt-out `pull` applies to stat commits covers run records too: the member's `usageReportEnabled`, else teamai.yaml `usageReport`. */
+async function isRecordingEnabled(config: LocalConfig): Promise<boolean> {
+  return isUsageReportEnabled(config, (await loadTeamConfig(config.repo.localPath)) ?? {});
+}
+
 /**
  * Build, queue, and try to publish a run's phase record (#1083).
  *
  * The enqueue happens before the publish attempt, so a crash mid-publish
  * leaves the record queued for the next pull. Publication failures — no
  * remote, a busy reports lock, a rejected push — surface as `'pending'` and
- * never fail the run operation that produced the record.
+ * never fail the run operation that produced the record. With usage reporting
+ * off nothing is queued and there is no state to report.
  */
 export async function noteRunRecord(
   config: LocalConfig,
   run: RunState,
   driver: DriverIdentity | undefined,
   phase: 'start' | 'end',
-): Promise<'published' | 'pending'> {
+): Promise<RecordState | undefined> {
   try {
+    if (!await isRecordingEnabled(config)) return undefined;
     const username = config.username ?? 'unknown';
     const record = phase === 'start'
       ? buildStartRecord(run, driver, username)
       : buildEndRecord(run, driver, username);
     await enqueueRecord(config, record);
-    return await publishPendingRecords(config, username);
+    return await publishPendingRecords(config);
   } catch {
     return 'pending';
   }
+}
+
+/** The record state of a run that settled earlier: pending while any of its records waits in the queue. */
+export async function runRecordState(config: LocalConfig, runId: string): Promise<RecordState | undefined> {
+  if (!await isRecordingEnabled(config)) return undefined;
+  return (await pendingRecords(config)).some((record) => record.run === runId) ? 'pending' : 'published';
 }
 
 // ─── Local pending queue ────────────────────────────────
@@ -235,16 +252,13 @@ async function dequeue(config: LocalConfig, record: WorkflowRunRecord): Promise<
 
 /**
  * Publish every queued record through the reports branch, then fold their
- * totals into the user's stats file in the same update.
+ * totals into each record's own member stats file in the same update.
  *
  * Returns `'published'` when the queue drained (or was empty) and `'pending'`
  * when anything remains queued — the value the engine surfaces as
  * `record: pending` (#1083).
  */
-export async function publishPendingRecords(
-  config: LocalConfig,
-  username: string,
-): Promise<'published' | 'pending'> {
+export async function publishPendingRecords(config: LocalConfig): Promise<RecordState> {
   const queued = await pendingRecords(config);
   if (queued.length === 0) return 'published';
   const { updateReports, readReportsOriginFile } = await import('../utils/reports-branch.js');
@@ -283,25 +297,31 @@ export async function publishPendingRecords(
       delivered.push(...records);
     }
     // Workflow totals ride the same update: one lock, one push, and the stats
-    // merge counts only what this update delivered.
-    const statsRel = `stats/${username}.yaml`;
+    // merge counts only what this update delivered. Each total lands in the
+    // stats file of the member who ran it, not of whoever drains the queue.
     const { default: YAML } = await import('yaml');
-    const existingStatsRaw = await readReportsOriginFile(worktree, statsRel);
-    let existingStats: Record<string, unknown> = {};
-    if (existingStatsRaw !== null && existingStatsRaw.trim() !== '') {
-      try {
-        existingStats = YAML.parse(existingStatsRaw) as Record<string, unknown>;
-      } catch {
-        existingStats = {};
-      }
+    const deltaByUser = new Map<string, WorkflowRunRecord[]>();
+    for (const record of statsDeltaRecords(originByRun, delivered)) {
+      const list = deltaByUser.get(record.username) ?? [];
+      list.push(record);
+      deltaByUser.set(record.username, list);
     }
-    const mergedStats = mergeWorkflowStats(
-      ensureStatsShape(existingStats, username),
-      statsDeltaRecords(originByRun, delivered),
-    );
-    await fs.mkdir(path.join(worktree, 'stats'), { recursive: true });
-    await fs.writeFile(path.join(worktree, statsRel), YAML.stringify(mergedStats), 'utf-8');
-    files.push(statsRel);
+    for (const [username, delta] of deltaByUser) {
+      const statsRel = `stats/${username}.yaml`;
+      const existingStatsRaw = await readReportsOriginFile(worktree, statsRel);
+      let existingStats: Record<string, unknown> = {};
+      if (existingStatsRaw !== null && existingStatsRaw.trim() !== '') {
+        try {
+          existingStats = YAML.parse(existingStatsRaw) as Record<string, unknown>;
+        } catch {
+          existingStats = {};
+        }
+      }
+      const mergedStats = mergeWorkflowStats(ensureStatsShape(existingStats, username), delta);
+      await fs.mkdir(path.join(worktree, 'stats'), { recursive: true });
+      await fs.writeFile(path.join(worktree, statsRel), YAML.stringify(mergedStats), 'utf-8');
+      files.push(statsRel);
+    }
     return {
       files: [...new Set(files)],
       message: `[teamai] Publish ${byRun.size} workflow run record${byRun.size === 1 ? '' : 's'}`,
