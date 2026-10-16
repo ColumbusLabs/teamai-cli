@@ -4,8 +4,8 @@ import path from 'node:path';
 import { readWorkspaceChildren } from './workspace-children.js';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward } from './utils/git.js';
-import { pushRepoDirectly } from './utils/git.js';
+import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, pushRepoDirectly, autoPushViaMR, initPushBlockTimeoutMs } from './utils/git.js';
+import { withTimeout } from './utils/async.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
 import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
 import { probeSelfHostedGitLab } from './providers/gitlab/probe.js';
@@ -1439,26 +1439,30 @@ export async function initSelfRepo(options: GlobalOptions & {
       const { isPublished } = await import('./utils/branch-worktree.js');
       let isNewSelfMember = false;
       let selfMemberChanged = false;
-      const pushed = isPublished(await updateReports(localConfig, async (wt) => {
-        const memberDir = path.join(wt, 'members');
-        await ensureDir(memberDir);
-        const memberPath = path.join(memberDir, `${username}.yaml`);
-        isNewSelfMember = !await pathExists(memberPath);
-        const existingSelfMember = await readMemberConfig(memberReadRoots(wt, localConfig), username);
-        const merged = mergeMemberConfig(existingSelfMember, {
-          username,
-          projects: localConfig.projects,
-        });
-        selfMemberChanged = merged.changed;
-        if (!merged.changed) return null;
-        await writeFile(memberPath, YAML.stringify(merged.config));
-        return {
-          files: ['members/'],
-          message: isNewSelfMember
-            ? `[teamai] Register member: ${username}`
-            : `[teamai] Update member roster: ${username}`,
-        };
-      }));
+      const pushed = isPublished(await withTimeout(
+        updateReports(localConfig, async (wt) => {
+          const memberDir = path.join(wt, 'members');
+          await ensureDir(memberDir);
+          const memberPath = path.join(memberDir, `${username}.yaml`);
+          isNewSelfMember = !await pathExists(memberPath);
+          const existingSelfMember = await readMemberConfig(memberReadRoots(wt, localConfig), username);
+          const merged = mergeMemberConfig(existingSelfMember, {
+            username,
+            projects: localConfig.projects,
+          });
+          selfMemberChanged = merged.changed;
+          if (!merged.changed) return null;
+          await writeFile(memberPath, YAML.stringify(merged.config));
+          return {
+            files: ['members/'],
+            message: isNewSelfMember
+              ? `[teamai] Register member: ${username}`
+              : `[teamai] Update member roster: ${username}`,
+          };
+        }, { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Member registration push',
+      ));
       if (selfMemberChanged) {
         if (pushed) {
           log.success(isNewSelfMember
@@ -1965,14 +1969,18 @@ export async function init(options: GlobalOptions & {
   // after that go to teamai-reports.
   if (createdSkeleton && !options.dryRun) {
     try {
-      await pushRepoDirectly(localPath, '[teamai] Initialize team repo skeleton', [
-        'teamai.yaml',
-        'skills/.gitkeep',
-        'rules/.gitkeep',
-        'docs/.gitkeep',
-        'env/.gitkeep',
-        'members/.gitkeep',
-      ]);
+      await withTimeout(
+        pushRepoDirectly(localPath, '[teamai] Initialize team repo skeleton', [
+          'teamai.yaml',
+          'skills/.gitkeep',
+          'rules/.gitkeep',
+          'docs/.gitkeep',
+          'env/.gitkeep',
+          'members/.gitkeep',
+        ], { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Skeleton push',
+      );
     } catch (e) {
       log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
     }
@@ -1988,27 +1996,31 @@ export async function init(options: GlobalOptions & {
       const { isPublished } = await import('./utils/branch-worktree.js');
       let memberChanged = false;
       let memberProjects: string[] | undefined;
-      const pushed = isPublished(await updateReports(reportsConfig, async (wt) => {
-        const memberDir = path.join(wt, 'members');
-        await ensureDir(memberDir);
-        const memberPath = path.join(memberDir, `${username}.yaml`);
-        isNewMember = !await pathExists(memberPath);
-        const existingMember = await readMemberConfig(memberReadRoots(wt, reportsConfig), username);
-        const merged = mergeMemberConfig(existingMember, {
-          username,
-          projects: resolvedProjects,
-        });
-        memberChanged = merged.changed;
-        memberProjects = merged.config.projects;
-        if (!merged.changed) return null;
-        await writeFile(memberPath, YAML.stringify(merged.config));
-        return {
-          files: ['members/'],
-          message: isNewMember
-            ? `[teamai] Register member: ${username}`
-            : `[teamai] Update member roster: ${username}`,
-        };
-      }));
+      const pushed = isPublished(await withTimeout(
+        updateReports(reportsConfig, async (wt) => {
+          const memberDir = path.join(wt, 'members');
+          await ensureDir(memberDir);
+          const memberPath = path.join(memberDir, `${username}.yaml`);
+          isNewMember = !await pathExists(memberPath);
+          const existingMember = await readMemberConfig(memberReadRoots(wt, reportsConfig), username);
+          const merged = mergeMemberConfig(existingMember, {
+            username,
+            projects: resolvedProjects,
+          });
+          memberChanged = merged.changed;
+          memberProjects = merged.config.projects;
+          if (!merged.changed) return null;
+          await writeFile(memberPath, YAML.stringify(merged.config));
+          return {
+            files: ['members/'],
+            message: isNewMember
+              ? `[teamai] Register member: ${username}`
+              : `[teamai] Update member roster: ${username}`,
+          };
+        }, { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Member registration push',
+      ));
       if (memberChanged) {
         log.success(isNewMember
           ? `Registered as team member: ${username}`
@@ -2056,10 +2068,37 @@ export async function init(options: GlobalOptions & {
 
           if (!options.dryRun) {
             try {
-              await pushRepoDirectly(localPath, `[teamai] Configure reviewers: ${reviewers.join(', ')}`, [
-                'teamai.yaml',
-              ]);
-              log.success('Reviewer config pushed to team repo');
+              // Reviewer config goes via MR: a protected default branch rejects
+              // a direct push (the original bug), and an MR lands it on a
+              // feature branch for a maintainer to merge. The push itself uses
+              // createGitForInitPush (spawn-level timeout); the provider's
+              // pr-create spawnSync also carries the init-push timeout so a
+              // stalled gh/gf process cannot block the event loop past it.
+              const mrTeamConfig = await loadTeamConfig(localPath);
+              const mrLocalConfig = {
+                repo: { remote: repoInfo.httpsUrl, localPath },
+                username,
+                ...(forcedProvider ? { provider: forcedProvider } : {}),
+              };
+              if (mrTeamConfig) {
+                const prUrl = await withTimeout(
+                  autoPushViaMR(
+                    localPath,
+                    `[teamai] Configure reviewers: ${reviewers.join(', ')}`,
+                    ['teamai.yaml'],
+                    mrTeamConfig,
+                    mrLocalConfig,
+                    { initPush: true },
+                  ),
+                  initPushBlockTimeoutMs(),
+                  'Reviewer config push',
+                );
+                if (prUrl) {
+                  log.success(`Reviewer config pushed via MR: ${prUrl}`);
+                } else {
+                  log.warn('Reviewer config MR could not be created (you can push manually later)');
+                }
+              }
             } catch (e) {
               log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
             }

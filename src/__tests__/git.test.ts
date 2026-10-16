@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 
 // Mock simple-git before importing
@@ -24,8 +24,14 @@ const mockGit = {
   outputHandler: vi.fn().mockReturnThis(),
 };
 
+// Capture the options every createGit() call passes to simple-git, so tests
+// can assert the hang guards (block timeout + GIT_TERMINAL_PROMPT) are present.
+const simpleGitCalls: unknown[][] = [];
 vi.mock('simple-git', () => ({
-  default: () => mockGit,
+  default: (...args: unknown[]) => {
+    simpleGitCalls.push(args);
+    return mockGit;
+  },
 }));
 
 vi.mock('fs-extra', () => ({
@@ -67,6 +73,79 @@ vi.mock('../utils/logger.js', () => ({
 
 import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin, gitCommonDir, unusedBranchName } from '../utils/git.js';
 import fse from 'fs-extra';
+import { createGit, createGitForInitPush, disableGitTerminalPrompt } from '../utils/git.js';
+
+describe('createGit', () => {
+  // The init-hang bug: a push with missing credentials opened an invisible
+  // prompt (no tty) and blocked forever. The credential-prompt guard is set
+  // process-wide by disableGitTerminalPrompt (tested separately), NOT per
+  // simple-git instance — simple-git's .env() replaces the whole child env,
+  // which would drop PATH/HOME and break git. The spawn-level block timeout
+  // is NOT global either — it lives in createGitForInitPush so it cannot kill
+  // slow clones/fetches elsewhere.
+  beforeEach(() => {
+    simpleGitCalls.length = 0;
+  });
+
+  it('does NOT add a global spawn timeout (would kill legitimate slow clones/fetches)', () => {
+    createGit('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { timeout?: unknown };
+    expect(options.timeout).toBeUndefined();
+  });
+
+  it('forwards basePath as baseDir', () => {
+    createGit('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { baseDir?: string };
+    expect(options.baseDir).toBe('/some/path');
+  });
+});
+
+describe('createGitForInitPush', () => {
+  beforeEach(() => {
+    simpleGitCalls.length = 0;
+  });
+
+  it('adds the spawn-level block timeout so a hung init push subprocess is killed', () => {
+    createGitForInitPush('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { timeout?: { block?: number } };
+    // simple-git's timeout.block actually kills the spawned process; a
+    // Promise.race-style timeout would leave it running.
+    expect(options.timeout?.block).toBe(30_000);
+  });
+
+  it('honors TEAMAI_INIT_PUSH_TIMEOUT_MS for slow links', () => {
+    const prev = process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS;
+    process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS = '120000';
+    try {
+      createGitForInitPush('/some/path');
+      const options = simpleGitCalls.at(-1)![0] as { timeout?: { block?: number } };
+      expect(options.timeout?.block).toBe(120_000);
+    } finally {
+      if (prev === undefined) delete process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS;
+      else process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS = prev;
+    }
+  });
+});
+
+describe('disableGitTerminalPrompt', () => {
+  // The credential-prompt guard must be process-wide so every git subprocess
+  // inherits it — but it must not clobber an explicit user override.
+  afterEach(() => {
+    delete process.env.GIT_TERMINAL_PROMPT;
+  });
+
+  it('sets GIT_TERMINAL_PROMPT=0 process-wide so git fails fast on missing credentials', () => {
+    delete process.env.GIT_TERMINAL_PROMPT;
+    disableGitTerminalPrompt();
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('is idempotent and preserves an explicit user override', () => {
+    process.env.GIT_TERMINAL_PROMPT = '1'; // user wants prompts
+    disableGitTerminalPrompt();
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe('1');
+  });
+});
 
 describe('gitCommonDir', () => {
   it('asks git each time when no repository on disk vouches for the answer', async () => {
