@@ -1,8 +1,8 @@
-import type { DriverIdentity, WorkflowEnvelope } from './types.js';
+import type { WorkflowEnvelope } from './types.js';
 
 export interface WorkflowClient {
   start(name: string): Promise<WorkflowEnvelope>;
-  next(runId: string, driver: DriverIdentity): Promise<WorkflowEnvelope>;
+  next(runId: string, body: unknown): Promise<WorkflowEnvelope>;
   report(runId: string, body: unknown): Promise<WorkflowEnvelope>;
 }
 
@@ -15,8 +15,9 @@ export interface ConformanceScenario {
   operations: ConformanceOperation[];
 }
 
+/** `running` and `cancelled` name leases that earlier operations saved; `cancelled` must match exactly. */
 export type ConformanceOperation =
-  | { kind: 'next'; saveAs: string; expect: Record<string, unknown> }
+  | { kind: 'next'; saveAs: string; running?: string[]; canTakeLease?: boolean; cancelled?: string[]; expect: Record<string, unknown> }
   | {
     kind: 'report';
     lease?: string;
@@ -118,6 +119,80 @@ steps:
     prompt: "Fix {{ with.task }}; keep \${{ inputs.version }}."
     with:
       task: "{{ steps.plan.outputs.task }}"
+`;
+
+const PARALLEL_ROOTS = `schemaVersion: v1alpha1
+name: build
+description: Two roots a driver runs in parallel, then a join.
+steps:
+  - id: a
+    command: echo a
+  - id: b
+    needs: []
+    command: echo b
+  - id: join
+    needs: [a, b]
+    command: echo join
+`;
+
+const END_WHILE_RUNNING = `schemaVersion: v1alpha1
+name: build
+description: A step reaches the end while another one runs.
+ends:
+  done: succeeded
+steps:
+  - id: slow
+    command: echo slow
+  - id: finish
+    needs: []
+    command: echo finish
+    end: done
+`;
+
+const STEP_LOOP = `schemaVersion: v1alpha1
+name: build
+description: A fix sends the work back to review.
+steps:
+  - id: review
+    command: echo review
+    output:
+      verdict: pass | fix
+  - id: fix
+    needs: [review]
+    if: steps.review.outputs.verdict == 'fix'
+    command: echo fix
+    loop: { back_to: review, max_iterations: 2 }
+`;
+
+const BREAK_LOOP = `schemaVersion: v1alpha1
+name: build
+description: Probe until ready while a slow check runs beside it.
+loop: { max_iterations: 3 }
+steps:
+  - id: slow
+    command: echo slow
+  - id: probe
+    needs: []
+    command: echo probe
+    output:
+      ready: boolean
+    break: steps.probe.outputs.ready
+`;
+
+const FAN_OUT = `schemaVersion: v1alpha1
+name: build
+description: Build each target the plan lists, two at a time.
+steps:
+  - id: plan
+    command: echo plan
+    output:
+      targets: [string]
+  - id: build
+    needs: [plan]
+    for_each: { items: steps.plan.outputs.targets, max_parallel: 2 }
+    command: echo build
+    env:
+      TARGET: "{{ item }}"
 `;
 
 export const workflowConformanceScenarios: ConformanceScenario[] = [
@@ -235,6 +310,104 @@ export const workflowConformanceScenarios: ConformanceScenario[] = [
       { kind: 'next', saveAs: 'plan', expect: { data: { lease: { step: 'plan' } } } },
       { kind: 'report', lease: 'plan', body: { outcome: 'success', outputs: { task: 'the crash' } }, expect: { data: { step: { status: 'succeeded' } } } },
       { kind: 'next', saveAs: 'fix', expect: { data: { lease: { step: 'fix', prompt: 'Fix the crash; keep ${{ inputs.version }}.' } } } },
+    ],
+  },
+  {
+    name: 'a driver that lists its running attempts gets parallel leases',
+    workflowName: 'build',
+    yaml: PARALLEL_ROOTS,
+    operations: [
+      { kind: 'next', saveAs: 'a', expect: { data: { lease: { step: 'a' }, cancelled: [] } } },
+      { kind: 'next', saveAs: 'b', running: ['a'], expect: { data: { lease: { step: 'b' }, cancelled: [] } } },
+      { kind: 'next', saveAs: 'wait', running: ['a', 'b'], expect: { data: { wait: { reason: 'a is leased' }, cancelled: [] } } },
+      { kind: 'next', saveAs: 'reconcile', running: ['a', 'b'], canTakeLease: false, expect: { data: { wait: { reason: 'a is leased' } } } },
+      { kind: 'next', saveAs: 'again', running: ['b'], expect: { data: { lease: { step: 'a' } } } },
+      { kind: 'report', lease: 'a', body: { outcome: 'success' }, expect: { data: { step: { id: 'a', status: 'succeeded' } } } },
+    ],
+  },
+  {
+    name: 'a report of a sibling does not make a parallel attempt stale',
+    workflowName: 'build',
+    yaml: PARALLEL_ROOTS,
+    operations: [
+      { kind: 'next', saveAs: 'a', expect: { data: { lease: { step: 'a', revision: 1 } } } },
+      { kind: 'next', saveAs: 'b', running: ['a'], expect: { data: { lease: { step: 'b', revision: 1 } } } },
+      { kind: 'report', lease: 'a', body: { outcome: 'success' }, expect: { data: { revision: 2, step: { id: 'a', status: 'succeeded' } } } },
+      { kind: 'report', lease: 'b', body: { outcome: 'success' }, expect: { data: { revision: 3, step: { id: 'b', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'join', expect: { data: { lease: { step: 'join', revision: 3 } } } },
+    ],
+  },
+  {
+    name: 'an end cancels a running lease, and its report is lease_cancelled',
+    workflowName: 'build',
+    yaml: END_WHILE_RUNNING,
+    operations: [
+      { kind: 'next', saveAs: 'slow', expect: { data: { lease: { step: 'slow' } } } },
+      { kind: 'next', saveAs: 'finish', running: ['slow'], expect: { data: { lease: { step: 'finish' } } } },
+      { kind: 'report', lease: 'finish', body: { outcome: 'success' }, expect: { data: { step: { id: 'finish', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'done', running: ['slow'], cancelled: ['slow'], expect: { data: { done: { outcome: 'succeeded', end: 'done' } } } },
+      { kind: 'next', saveAs: 'again', running: ['slow'], cancelled: ['slow'], expect: { data: { done: { outcome: 'succeeded', end: 'done' } } } },
+      { kind: 'report', lease: 'slow', body: { outcome: 'success' }, expect: { error: { code: 'lease_cancelled' } } },
+    ],
+  },
+  {
+    name: 'a report after an earlier end is lease_cancelled before next',
+    workflowName: 'build',
+    yaml: END_WHILE_RUNNING,
+    operations: [
+      { kind: 'next', saveAs: 'slow', expect: { data: { lease: { step: 'slow' } } } },
+      { kind: 'next', saveAs: 'finish', running: ['slow'], expect: { data: { lease: { step: 'finish' } } } },
+      { kind: 'report', lease: 'finish', body: { outcome: 'success' }, expect: { data: { accepted: true } } },
+      { kind: 'report', lease: 'slow', body: { outcome: 'success' }, expect: { error: { code: 'lease_cancelled' } } },
+      { kind: 'next', saveAs: 'done', expect: { data: { done: { outcome: 'succeeded', end: 'done' } } } },
+      { kind: 'report', lease: 'slow', body: { outcome: 'success' }, expect: { error: { code: 'lease_cancelled' } } },
+    ],
+  },
+  {
+    name: 'a step loop leases its range again, and each lease names its pass',
+    workflowName: 'build',
+    yaml: STEP_LOOP,
+    operations: [
+      { kind: 'next', saveAs: 'review1', cancelled: [], expect: { data: { lease: { step: 'review', pass: 1 } } } },
+      { kind: 'report', lease: 'review1', body: { outcome: 'success', outputs: { verdict: 'fix' } }, expect: { data: { step: { id: 'review', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'fix', cancelled: [], expect: { data: { lease: { step: 'fix', pass: 1 } } } },
+      { kind: 'report', lease: 'fix', body: { outcome: 'success' }, expect: { data: { step: { id: 'fix', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'review2', cancelled: [], expect: { data: { lease: { step: 'review', pass: 2 } } } },
+      { kind: 'report', lease: 'review2', body: { outcome: 'success', outputs: { verdict: 'pass' } }, expect: { data: { step: { id: 'review', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'done', cancelled: [], expect: { data: { done: { outcome: 'succeeded' } } } },
+    ],
+  },
+  {
+    name: 'a looping workflow runs every step again each round, and a break ends it and cancels what still runs',
+    workflowName: 'build',
+    yaml: BREAK_LOOP,
+    operations: [
+      { kind: 'next', saveAs: 'slow1', cancelled: [], expect: { data: { lease: { step: 'slow', pass: 1 } } } },
+      { kind: 'next', saveAs: 'probe1', running: ['slow1'], cancelled: [], expect: { data: { lease: { step: 'probe', pass: 1 } } } },
+      { kind: 'report', lease: 'probe1', body: { outcome: 'success', outputs: { ready: false } }, expect: { data: { step: { id: 'probe', status: 'succeeded' } } } },
+      { kind: 'report', lease: 'slow1', body: { outcome: 'success' }, expect: { data: { step: { id: 'slow', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'slow2', cancelled: [], expect: { data: { lease: { step: 'slow', pass: 2 } } } },
+      { kind: 'next', saveAs: 'probe2', running: ['slow2'], cancelled: [], expect: { data: { lease: { step: 'probe', pass: 2 } } } },
+      { kind: 'report', lease: 'probe2', body: { outcome: 'success', outputs: { ready: true } }, expect: { data: { step: { id: 'probe', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'done', running: ['slow2'], cancelled: ['slow2'], expect: { data: { done: { outcome: 'succeeded' } } } },
+      { kind: 'report', lease: 'slow2', body: { outcome: 'success' }, expect: { error: { code: 'lease_cancelled' } } },
+    ],
+  },
+  {
+    name: 'a for_each leases its items in parallel up to max_parallel, and a failed item cancels none of them',
+    workflowName: 'build',
+    yaml: FAN_OUT,
+    operations: [
+      { kind: 'next', saveAs: 'plan', expect: { data: { lease: { step: 'plan' } } } },
+      { kind: 'report', lease: 'plan', body: { outcome: 'success', outputs: { targets: ['a', 'b', 'c'] } }, expect: { data: { step: { id: 'plan', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'a', cancelled: [], expect: { data: { lease: { step: 'build[0]', env: { TARGET: 'a' } } } } },
+      { kind: 'next', saveAs: 'b', running: ['a'], cancelled: [], expect: { data: { lease: { step: 'build[1]', env: { TARGET: 'b' } } } } },
+      { kind: 'next', saveAs: 'full', running: ['a', 'b'], cancelled: [], expect: { data: { wait: { reason: 'build[0] is leased' } } } },
+      { kind: 'report', lease: 'a', body: { outcome: 'failed' }, expect: { data: { step: { id: 'build[0]', status: 'failed' } } } },
+      { kind: 'next', saveAs: 'c', running: ['b'], cancelled: [], expect: { data: { lease: { step: 'build[2]', env: { TARGET: 'c' } } } } },
+      { kind: 'report', lease: 'b', body: { outcome: 'success' }, expect: { data: { step: { id: 'build[1]', status: 'succeeded' } } } },
+      { kind: 'report', lease: 'c', body: { outcome: 'success' }, expect: { data: { step: { id: 'build[2]', status: 'succeeded' } } } },
+      { kind: 'next', saveAs: 'done', cancelled: [], expect: { data: { done: { outcome: 'failed' } } } },
     ],
   },
 ];

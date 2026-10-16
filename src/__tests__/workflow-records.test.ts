@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { simpleGit } from 'simple-git';
 import { afterEach, describe, expect, it } from 'vitest';
 import YAML from 'yaml';
@@ -15,7 +16,7 @@ import {
   recordPath,
 } from '../workflow/records.js';
 import { generateRunId, isRunId } from '../workflow/store.js';
-import type { DriverIdentity, RunState, WorkflowDefinition } from '../workflow/types.js';
+import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowDiagnostic } from '../workflow/types.js';
 
 const dirs: string[] = [];
 
@@ -66,14 +67,44 @@ function runState(overrides: Partial<RunState> = {}): RunState {
     sourceHash: 'abc',
     definition,
     steps: [
-      { id: 'one', status: 'succeeded', attempt: 'a1', outcome: 'success', exitCode: 0 },
-      { id: 'two', status: 'succeeded', attempt: 'a2', outcome: 'success', exitCode: 0 },
+      { id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success', exitCode: 0 },
+      { id: 'two', status: 'succeeded', attempt: 'a2', settledAt: 3, outcome: 'success', exitCode: 0 },
     ],
     settledAttempts: ['a1', 'a2', 'a1'],
     createdAt: '2026-10-14T10:00:00.000Z',
     updatedAt: '2026-10-14T10:02:30.000Z',
     ...overrides,
   };
+}
+
+/** A settled run of a for_each over `items` items, each of which runs an inline workflow with a reviewer prompt. */
+function settledFan(items: number): RunState {
+  const done = { status: 'succeeded', outcome: 'success', settledAt: 2 } as const;
+  return runState({
+    definition: {
+      ...definition,
+      steps: [
+        {
+          id: 'build',
+          forEach: { items: 'inputs.xs' },
+          workflow: { steps: [
+            { id: 'compile', command: 'node compile.js' },
+            { id: 'review', needs: ['compile'], prompt: 'Review it.', agent: 'reviewer' },
+          ] },
+        },
+        { id: 'after', needs: ['build'], command: 'node after.js' },
+      ],
+    },
+    steps: [
+      { id: 'build', ...done },
+      ...Array.from({ length: items }, (_, index) => [
+        { id: `build[${index}]`, item: index, ...done },
+        { id: `build[${index}].compile`, ...done },
+        { id: `build[${index}].review`, ...done },
+      ]).flat(),
+      { id: 'after', ...done },
+    ],
+  });
 }
 
 describe('#1083 workflow run records', () => {
@@ -102,6 +133,7 @@ describe('#1083 workflow run records', () => {
           id: 'one',
           status: 'failed',
           attempt: 'a1',
+          settledAt: 2,
           outcome: 'failed',
           exitCode: 1,
           // Step state may carry failure text quoting the command and paths.
@@ -119,18 +151,58 @@ describe('#1083 workflow run records', () => {
     }
   });
 
+  it('publishes the failure code of a run only when teamai sets it', () => {
+    const failed = (code: string): RunState => runState({ status: 'failed', failure: { code, message: `the ${code} message` } });
+
+    expect(buildEndRecord(failed('loop_exhausted'), driver, 'tester').failure).toEqual({ code: 'loop_exhausted' });
+    expect(JSON.stringify(buildEndRecord(failed('secret-x'), driver, 'tester'))).not.toContain('secret-x');
+  });
+
+  it('publishes the failure code of every step failure teamai writes, and only codes it can name', () => {
+    // Codes a `code: '…'` literal in src/workflow writes that never become a run's failure.
+    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop'] satisfies Array<WorkflowDiagnostic['code']>;
+    const answers = ['end_reached', 'repeated_report', 'wrong_attempt', 'lease_cancelled', 'interrupted', 'run_unreadable', 'driver_stuck', 'busy'];
+    const source = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'workflow');
+    const written = new Set(fs.readdirSync(source).filter((file) => file.endsWith('.ts'))
+      .flatMap((file) => [...fs.readFileSync(path.join(source, file), 'utf8').matchAll(/code: '([^']+)'/g)].map((match) => match[1]!)));
+    const failedWith = (code: string): RunState => runState({
+      status: 'failed',
+      steps: [{ id: 'one', status: 'failed', outcome: 'failed', attempt: 'a1', settledAt: 2, failure: { code, message: 'm' } }],
+    });
+
+    expect([...diagnostics, ...answers].filter((code) => !written.has(code))).toEqual([]);
+    expect([...written].filter((code) => ![...diagnostics, ...answers].includes(code) && buildEndRecord(failedWith(code), driver, 'tester').failure?.code !== code)).toEqual([]);
+  });
+
+  it('publishes the first failure teamai can name, under a top-level step whose own code it cannot', () => {
+    const run = runState({
+      status: 'failed',
+      definition: { ...definition, steps: [{ id: 'build', workflow: { steps: [{ id: 'compile', command: 'node compile.js' }] } }] },
+      steps: [
+        { id: 'build', status: 'failed', outcome: 'failed', settledAt: 3, failure: { code: 'my secret code', message: 'm' } },
+        { id: 'build.compile', status: 'failed', outcome: 'failed', attempt: 'a1', settledAt: 2, failure: { code: 'tool_failed', message: 'm' } },
+      ],
+    });
+
+    expect(buildEndRecord(run, driver, 'tester').failure).toEqual({ code: 'tool_failed' });
+  });
+
   it('builds an end record with outcome, duration, iterations, and step counts', () => {
     const record = buildEndRecord(runState(), driver, 'tester');
     expect(record.phase).toBe('end');
     expect(record.status).toBe('succeeded');
     expect(record.durationMs).toBe(150000);
     expect(record.iterations).toBe(3);
-    expect(record.stepCounts).toEqual({ total: 2, succeeded: 2, failed: 0, skipped: 0 });
+    expect(record.stepCounts).toEqual({ total: 2, succeeded: 2, failed: 0, skipped: 0, cancelled: 0 });
     expect(record.steps).toEqual([
-      { step: 'one', outcome: 'success' },
-      { step: 'two', outcome: 'success' },
+      { step: 'one', pass: 1, outcome: 'success' },
+      { step: 'two', pass: 1, outcome: 'success' },
     ]);
     expect(record.endedAt).toBe('2026-10-14T10:02:30.000Z');
+  });
+
+  it('gives the entry of a step that ran once pass 1, as its lease did', () => {
+    expect(buildEndRecord(runState(), driver, 'tester').steps?.map((entry) => entry.pass)).toEqual([1, 1]);
   });
 
   it('records per-step agent fields: a Codex implementer beside a Claude reviewer', () => {
@@ -144,15 +216,55 @@ describe('#1083 workflow run records', () => {
         ],
       },
       steps: [
-        { id: 'one', status: 'succeeded', attempt: 'a1', outcome: 'success', exitCode: 0, tool: 'codex', model: 'gpt-5.4-codex', tokens: { input: 100, output: 50 } },
-        { id: 'two', status: 'succeeded', attempt: 'a2', outcome: 'success', exitCode: 0, tool: 'claude', model: 'claude-sonnet-4.6' },
+        { id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success', exitCode: 0, tool: 'codex', model: 'gpt-5.4-codex', tokens: { input: 100, output: 50 } },
+        { id: 'two', status: 'succeeded', attempt: 'a2', settledAt: 3, outcome: 'success', exitCode: 0, tool: 'claude', model: 'claude-sonnet-4.6' },
       ],
     });
     const record = buildEndRecord(mixed, driver, 'tester');
     expect(record.steps).toEqual([
-      { step: 'one', agent: 'implementer', tool: 'codex', model: 'gpt-5.4-codex', outcome: 'success', tokens: { input: 100, output: 50 } },
-      { step: 'two', agent: 'reviewer', tool: 'claude', model: 'claude-sonnet-4.6', outcome: 'success' },
+      { step: 'one', pass: 1, agent: 'implementer', tool: 'codex', model: 'gpt-5.4-codex', outcome: 'success', tokens: { input: 100, output: 50 } },
+      { step: 'two', pass: 1, agent: 'reviewer', tool: 'claude', model: 'claude-sonnet-4.6', outcome: 'success' },
     ]);
+  });
+
+  it.each([
+    ['a local tool and a model name', 'claude-internal', 'anthropic/claude-sonnet-4.6@2026', { tool: 'claude-internal', model: 'anthropic/claude-sonnet-4.6@2026' }],
+    ['a secret as the tool', 'sk-ant-SECRET-token', 'gpt-5.4-codex', { model: 'gpt-5.4-codex' }],
+    ['an absolute path as the model', 'codex', '/Users/me/private/model', { tool: 'codex' }],
+    ['a relative path that climbs as the model', 'codex', 'models/../../home/me', { tool: 'codex' }],
+    ['a Windows absolute path as the model', 'codex', 'C:/Users/alice/private/model.gguf', { tool: 'codex' }],
+    ['a file URL as the model', 'codex', 'file:/Users/me/private/model', { tool: 'codex' }],
+    ['a tagged model name', 'codex', 'ollama:llama3.1:8b', { tool: 'codex', model: 'ollama:llama3.1:8b' }],
+    ['a model with a space', 'codex', 'my private model', { tool: 'codex' }],
+    ['a model longer than 80 characters', 'codex', `m${'x'.repeat(80)}`, { tool: 'codex' }],
+  ])('records the tool and model of a report with %s only when they are a local tool name and a model name', (_case, tool, model, fields) => {
+    const run = runState({
+      definition: { ...definition, steps: [{ id: 'one', command: 'node one.js' }] },
+      steps: [{ id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success', exitCode: 0, tool, model }],
+    });
+
+    expect(buildEndRecord(run, driver, 'tester').steps).toEqual([{ step: 'one', pass: 1, ...fields, outcome: 'success' }]);
+  });
+
+  it('builds the end record of a for_each with work linear in the item count', () => {
+    // Every lookup over the run's step instances reads each one's path, so the number of `id` reads counts how many it looks at.
+    const work = (items: number): number => {
+      let read = 0;
+      const run = settledFan(items);
+      run.steps = run.steps.map((state) => new Proxy(state, {
+        get: (target, key, receiver) => {
+          if (key === 'id') read += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      }));
+      expect(buildEndRecord(run, driver, 'tester').steps?.filter((entry) => entry.agent === 'reviewer')).toHaveLength(items);
+      return read;
+    };
+    const small = work(100);
+    const large = work(200);
+    expect(small).toBeGreaterThan(100);
+    // Linear work doubles with the items; a scan of every instance per entry grows about four times.
+    expect(large / small).toBeLessThan(3);
   });
 
   it('reports the cumulative iteration count, not the bounded history length', () => {

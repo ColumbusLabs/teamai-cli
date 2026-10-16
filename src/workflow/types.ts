@@ -1,5 +1,7 @@
 /** Workflow types for the v1alpha1 local-driver subset. */
 
+import type { ArchivedPass, StepState } from './step-state.js';
+
 export interface DriverIdentity {
   kind: string;
   machine: string;
@@ -38,6 +40,42 @@ export interface WorkflowStep {
   with?: Record<string, unknown>;
   /** Name in `ends` this step finishes the workflow with when it succeeds. A step with no action only ends the workflow and is never leased. */
   end?: string;
+  /** Runs the steps from `backTo` to this step again after this step succeeds. */
+  loop?: StepLoop;
+  /** Expression source, evaluated when this step succeeds; when true, its workflow, or that workflow's loop, ends as success. */
+  break?: string;
+  /** Runs the step's action once per item of a list, each as an instance such as `build[2]`. */
+  forEach?: ForEach;
+}
+
+/** A `for_each`: the list of items, and how many of them may run at once. */
+export interface ForEach {
+  /** Expression source that gives the list. */
+  items: string;
+  /** At most this many items are started and not yet settled. No limit when absent. */
+  maxParallel?: number;
+}
+
+/**
+ * A workflow loop. When a round reaches no end, every step of the workflow runs again, while `while` is true, or
+ * always when there is none. The workflow runs at most `maxIterations` rounds; one more fails it with `loop_exhausted`.
+ */
+export interface WorkflowLoop {
+  /** Expression source, evaluated when a round has nothing left to run. */
+  while?: string;
+  maxIterations: number;
+}
+
+/**
+ * A step loop. After its step succeeds, every step from `backTo` to it runs again, while `while` is true, or always
+ * when there is none. The step runs at most `maxIterations` times; a run past that fails it with `loop_exhausted`.
+ */
+export interface StepLoop {
+  /** The step itself, or a step it needs, directly or not. */
+  backTo: string;
+  /** Expression source, evaluated when the step succeeds. */
+  while?: string;
+  maxIterations: number;
 }
 
 /** The keys that give a step its action, as YAML writes them, each with the definition field it fills. */
@@ -57,6 +95,7 @@ export type EndOutcome = 'succeeded' | 'failed';
 export interface InlineWorkflow {
   ends?: Record<string, EndOutcome>;
   outputs?: Record<string, string>;
+  loop?: WorkflowLoop;
   steps: WorkflowStep[];
 }
 
@@ -70,6 +109,8 @@ export interface WorkflowDefinition {
   ends?: Record<string, EndOutcome>;
   /** Values this workflow returns to a step that runs it, each a path such as `steps.<id>.outputs.<field>`. */
   outputs?: Record<string, string>;
+  /** Runs the workflow's steps again, round after round. */
+  loop?: WorkflowLoop;
   steps: WorkflowStep[];
 }
 
@@ -88,16 +129,16 @@ export interface WorkflowDiagnostic {
    *   templates existed would now render it as empty text instead of the text it was written as.
    * `dotted_name`: a step id or an `inputs` or `output` field name contains "."; no path can read it, and a
    *   step id would clash with the dotted paths that address steps inside a sub-workflow.
-   * `undeclared_output`: a read of `steps.<id>.outputs.<name>` that the workflow step `<id>` runs does not declare;
+   * `undeclared_output`: a read names an output the workflow a step runs does not declare;
    *   the file may be unchanged while that workflow changed, and the kept copy would read null where it expects a value.
    * `undeclared_end`: an `if` compares `steps.<id>.end` with a name the workflow step `<id>` runs does not declare in `ends`;
    *   for the same reason, the kept copy would take a branch that can never match.
+   * `bad_loop`: a `loop`, `break` or `for_each` pull rejects; the kept copy would run once the steps the author wrote
+   *   to repeat or to run per item, or run on past the point the author wrote to stop at.
    */
-  code?: 'unknown_key' | 'missing_needs' | 'false_if' | 'bad_template' | 'dotted_name' | 'undeclared_output' | 'undeclared_end';
+  code?: 'unknown_key' | 'missing_needs' | 'false_if' | 'bad_template' | 'dotted_name' | 'undeclared_output' | 'undeclared_end' | 'bad_loop';
 }
 
-/** `running`: a workflow step whose child steps are in the run and not all settled. */
-export type StepStatus = 'pending' | 'leased' | 'running' | 'succeeded' | 'failed' | 'skipped';
 export type StepOutcome = 'success' | 'failed' | 'released';
 export type RunStatus = 'running' | 'succeeded' | 'failed';
 
@@ -105,30 +146,6 @@ export interface StepLease {
   attempt: string;
   revision: number;
   driver: DriverIdentity;
-}
-
-/**
- * One step instance. `id` is its path: a top-level step id, or `<workflow step path>.<child step id>`
- * for a step inside a sub-workflow, such as `check.classify`.
- */
-export interface StepState {
-  id: string;
-  status: StepStatus;
-  attempt?: string;
-  lease?: StepLease;
-  outcome?: StepOutcome;
-  outputs?: unknown;
-  /** The values `with` passed to the workflow this step runs, kept when that workflow declares inputs. */
-  inputs?: Record<string, unknown>;
-  /** The end the workflow this step runs reached. */
-  end?: string;
-  exitCode?: number;
-  message?: string;
-  tool?: string;
-  model?: string;
-  session?: string;
-  tokens?: TokenUsage;
-  failure?: WorkflowFailure;
 }
 
 export interface TokenUsage {
@@ -151,6 +168,8 @@ export interface RunState {
   status: RunStatus;
   /** The end this run reached, set when it settles. */
   end?: string;
+  /** Why the run failed when no end says it, such as `loop_exhausted` on a looping top-level workflow. */
+  failure?: WorkflowFailure;
   /** The validated `--inputs`, stored when the workflow declares inputs. */
   inputs?: Record<string, unknown>;
   /** Covers `definition` and every workflow in `workflows`. */
@@ -158,11 +177,22 @@ export interface RunState {
   definition: WorkflowDefinition;
   /** The sub-workflows the run uses, by name, as they were cached when it started. */
   workflows?: Record<string, WorkflowDefinition>;
-  /** Step instances in declaration order; a sub-workflow's steps follow the step that runs it. */
-  steps: StepState[];
+  /**
+   * Step instances in declaration order; a sub-workflow's steps follow the step that runs it. Never changed in place:
+   * adding or removing an instance assigns a new array, so an index the engine keeps per array never goes stale.
+   */
+  steps: readonly StepState[];
   settledAttempts: string[];
   /** Cumulative settled-attempt count; settledAttempts is bounded at 32 for dedup. */
   settledCount?: number;
+  /** Whether the run queued its end record when it settled. A run settled with usage reporting off, or before this field, queued none. */
+  endRecordQueued?: boolean;
+  /** Attempts whose lease the engine cancelled; a report of one is answered `lease_cancelled`. */
+  cancelledAttempts?: string[];
+  /** Passes of child and item instances a loop removed from `steps`. */
+  archive?: ArchivedPass[];
+  /** The round of a looping top-level workflow. */
+  round?: number;
   createdAt: string;
   updatedAt: string;
 }
