@@ -2,8 +2,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createLocalToolAdapter, definitionHandoff, type ToolSpawn } from '../workflow/local-tool-adapter.js';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { createLocalToolAdapter, type ToolSpawn } from '../workflow/local-tool-adapter.js';
 
 const files: string[] = [];
 
@@ -240,13 +240,56 @@ describe('local tool adapter', () => {
       env: expect.objectContaining({ TEAMAI_LAUNCHED_BY: 'workflow', TEAMAI_LAUNCHED_TOOL: 'claude', TEAMAI_LAUNCHED_CHECKOUT: 'checkout-1' }),
     }));
   });
-});
 
-describe('definitionHandoff (#1176)', () => {
-  it('hands Claude its own file and Codex the instructions with the model on argv, and knows no handoff for OpenCode', () => {
-    expect(definitionHandoff('tclaude', { model: 'opus' })).toEqual({ applied: 'main' });
-    expect(definitionHandoff('opencode', { model: 'opus' })).toEqual({});
-    expect(definitionHandoff('codex-internal', { model: 'gpt-5.4' })).toEqual({ applied: 'prompt', model: 'gpt-5.4' });
-    expect(definitionHandoff('codex', {})).toEqual({ applied: 'prompt' });
+  it('reports that Claude ran a definition from its own file and Codex from the prompt', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-applied-${Date.now()}.json`);
+    files.push(resultPath);
+    const agent = { name: 'reviewer', instructions: 'Read only.' };
+    const claude = vi.fn(() => child(claudeStream(undefined, { result: '{}' }))) as unknown as ToolSpawn;
+    const codex = vi.fn(() => child('{"type":"thread.started","thread_id":"thread-1"}')) as unknown as ToolSpawn;
+
+    expect(await createLocalToolAdapter(claude, () => 'claude').run('tclaude', { prompt: 'Review', cwd: os.tmpdir(), resultPath, agent }))
+      .toMatchObject({ started: true, applied: 'main' });
+    expect(await createLocalToolAdapter(codex, () => 'codex').run('codex-internal', { prompt: 'Review', cwd: os.tmpdir(), resultPath, agent }))
+      .toMatchObject({ started: true, applied: 'prompt' });
+    expect(await createLocalToolAdapter(claude, () => 'claude').run('claude', { prompt: 'Review', cwd: os.tmpdir(), resultPath }))
+      .not.toHaveProperty('applied');
+  });
+
+  it.each([['1.18.23', 'prompt'], ['opencode v2.0.30', 'main']])(
+    'reports the OpenCode %s handoff of a run that started and wrote no result',
+    async (version, applied) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-workflow-handoff-'));
+      onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
+      const executable = path.join(root, 'opencode');
+      await fs.writeFile(executable, `#!/usr/bin/env node
+if (process.argv[2] === '--version') { console.log(${JSON.stringify(version)}); process.exit(0); }
+process.exit(1);
+`, { mode: 0o755 });
+
+      const result = await createLocalToolAdapter(undefined, () => executable).run('opencode', {
+        prompt: 'Review', cwd: root, resultPath: path.join(root, 'result.json'),
+        agent: { name: 'reviewer', instructions: 'Read only.', settings: { mode: 'subagent' } },
+      });
+
+      expect(result).toMatchObject({ started: true, exitCode: 1, applied, failure: { code: 'tool_failed' } });
+    },
+  );
+
+  it('reports the handoff of a run that started and then failed', async () => {
+    const failsAfterSpawn = (() => {
+      const process = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: Object.assign(new EventEmitter(), { resume: () => undefined }) });
+      queueMicrotask(() => {
+        process.emit('spawn');
+        process.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      });
+      return process;
+    }) as unknown as ToolSpawn;
+
+    const result = await createLocalToolAdapter(failsAfterSpawn, () => 'claude').run('claude', {
+      prompt: 'Review', cwd: os.tmpdir(), resultPath: path.join(os.tmpdir(), 'never-result.json'), agent: { name: 'reviewer', instructions: 'Read only.' },
+    });
+
+    expect(result).toMatchObject({ started: true, applied: 'main', failure: { code: 'tool_failed' } });
   });
 });

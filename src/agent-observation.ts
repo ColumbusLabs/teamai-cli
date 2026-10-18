@@ -88,11 +88,13 @@ export type ToolLaunch = {
     stem: string;
     /** The absolute path the launch read, the key of `delivered`. */
     file: string;
-    /** Absent when the tool is not known to apply the file; then no model is requested from it. */
-    applied?: z.infer<typeof Applied>;
-    /** The model the launch passes on argv (Codex `--model`); absent when the tool reads its own file. */
+    /** The definition's model the launch passes on argv (Codex, OpenCode); absent when the tool reads its own file. */
     model?: string;
+    /** The definition's effort the launch passes on argv with its model (an OpenCode variant). */
+    effort?: string;
   };
+  /** The model the step or its `defaults.model` chose, which the launch passes on argv in place of the definition's. */
+  chosen?: { model: string; effort?: string; alias?: string };
 };
 
 /** Observe a launch before the tool starts. Never throws: each field it cannot observe is left out. */
@@ -108,18 +110,23 @@ export async function observeLaunch(launch: ToolLaunch): Promise<ReportedAgent> 
   const resolved = definition && await recordedUnchanged(record?.delivered, definition.file)
     ? record?.agentModels?.[definition.stem]?.[launch.tool]
     : undefined;
-  const model = definition?.applied === 'prompt'
-    ? names({ requested: definition.model, alias: definition.model && resolved?.model === definition.model ? resolved.alias : undefined })
-    : definition?.applied === 'main' ? names({ requested: resolved?.model, alias: resolved?.alias }) : undefined;
-  // No launch requests an effort: none passes one on argv. Claude does not apply an agent file's `effort:` under
-  // `--agent`, and OpenCode 2 takes one only as the model's `#variant`, so the file's value is not what ran.
+  const { chosen } = launch;
+  const model = chosen
+    ? names({ requested: chosen.model, alias: chosen.alias })
+    : definition?.model
+      ? names({ requested: definition.model, alias: resolved?.model === definition.model ? resolved.alias : undefined })
+      // With no model on argv, the tool runs the one its deployed file sets, as the pull recorded it.
+      : definition ? names({ requested: resolved?.model, alias: resolved?.alias }) : undefined;
+  // The effort requested is the one the launch passes on argv. Claude does not apply an agent file's `effort:` under
+  // `--agent`, so the file's value is not what ran.
+  const effort = names({ requested: chosen ? chosen.effort : definition?.effort }, LABEL);
   const team = delivery?.complete
     ? { revision: delivery.commit, localChanges: !await allUnchanged(delivery.record.delivered ?? {}) }
     : undefined;
   return {
-    ...(definition?.applied ? { definition: { applied: definition.applied } } : {}),
     ...(version ? { tool: { version } } : {}),
     ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
     ...(team ? { team } : {}),
     ...(head ? { project: { commit: head.head, dirty: head.dirty } } : {}),
   };

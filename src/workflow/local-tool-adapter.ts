@@ -3,8 +3,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crossSpawn from 'cross-spawn';
 import { launchEnv, type Launch } from '../launch-context.js';
+import { opencodeMajorVersion } from '../opencode-hooks.js';
 import { resolveCliPath } from '../utils/cli-path.js';
 import { writeJsonAtomic } from '../utils/fs.js';
+import { log } from '../utils/logger.js';
 import type { TokenUsage, WorkflowFailure } from './types.js';
 
 const LOCAL_WORKFLOW_TOOLS = ['claude', 'claude-internal', 'tclaude', 'codex', 'codex-internal', 'tcodex', 'opencode'] as const;
@@ -25,7 +27,10 @@ export interface LocalToolRun {
   prompt: string;
   cwd: string;
   resultPath: string;
-  agent?: { name: string; instructions: string; model?: string };
+  /** The definition the step runs as. `settings` are the deployed OpenCode file's other fields, such as `mode` and `variant`. */
+  agent?: { name: string; instructions: string; model?: string; settings?: Record<string, unknown> };
+  /** The model and effort the launch passes: the step's, which replaces the definition's, or on Codex and OpenCode the definition's own. */
+  model?: { name: string; effort?: string };
   /** The workflow launch the tool's session-start hook reads from its environment (#1176). */
   launch?: Launch;
 }
@@ -38,6 +43,8 @@ export type LocalToolResult =
   | {
     started: true;
     exitCode: number;
+    /** How the launch handed over the definition, when it ran one. */
+    applied?: 'main' | 'prompt';
     output?: unknown;
     model?: string;
     session?: string;
@@ -66,45 +73,32 @@ function resultInstruction(input: LocalToolRun, prompt: string): string {
     + 'Use this shape: {"output":{},"failure":{"code":"optional","message":"optional"}}.';
 }
 
-/**
- * How a launch hands `tool` its definition: Claude reads its own deployed file (`--agent`), while Codex gets the
- * instructions prepended to the prompt and the file's model on argv. OpenCode gets `--agent` too, but OpenCode 1 runs
- * its default agent in place of a `mode: subagent` file, and OpenCode 2 does not apply the file's model (#1193), so
- * how it applied the definition is not known.
- */
-export function definitionHandoff(
-  tool: LocalWorkflowTool,
-  spec: Pick<NonNullable<LocalToolRun['agent']>, 'model'>,
-): { applied?: 'main' | 'prompt'; model?: string } {
+/** Codex, and OpenCode 1 for a subagent, which `opencode run --agent` does not start, get the definition's instructions in the prompt. */
+function promptHandoff(tool: LocalWorkflowTool, input: LocalToolRun, opencodeMajor: number): boolean {
   const family = localToolFamily(tool);
-  if (family === 'claude') return { applied: 'main' };
-  if (family === 'opencode') return {};
-  return { applied: 'prompt', ...(spec.model ? { model: spec.model } : {}) };
+  return family === 'codex' || (family === 'opencode' && opencodeMajor < 2 && input.agent?.settings?.['mode'] === 'subagent');
 }
 
-function invocation(tool: LocalWorkflowTool, input: LocalToolRun): { command: string; args: string[] } {
+function invocation(tool: LocalWorkflowTool, input: LocalToolRun, opencodeMajor: number): string[] {
   const family = localToolFamily(tool);
+  const viaPrompt = promptHandoff(tool, input, opencodeMajor);
   const agentPrompt = input.agent?.instructions
     ? `${input.agent.instructions}\n\n${input.prompt}`
     : input.prompt;
-  const prompt = resultInstruction(input, family === 'codex' ? agentPrompt : input.prompt);
+  const prompt = resultInstruction(input, viaPrompt ? agentPrompt : input.prompt);
+  const agent = input.agent && !viaPrompt ? ['--agent', input.agent.name] : [];
+  const model = input.model ? ['--model', input.model.name] : [];
+  const effort = input.model?.effort;
   if (family === 'claude') {
-    return {
-      command: tool,
-      args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...(input.agent ? ['--agent', input.agent.name] : [])],
-    };
+    return ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...agent, ...model, ...(effort ? ['--effort', effort] : [])];
   }
   if (family === 'codex') {
-    const model = input.agent ? definitionHandoff(tool, input.agent).model : undefined;
-    return {
-      command: tool,
-      args: ['exec', '--json', ...(model ? ['--model', model] : []), prompt],
-    };
+    const codexModel = input.model?.name ?? input.agent?.model;
+    return ['exec', '--json', ...(codexModel ? ['--model', codexModel] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []), prompt];
   }
-  return {
-    command: tool,
-    args: ['run', '--format', 'json', prompt, ...(input.agent ? ['--agent', input.agent.name] : [])],
-  };
+  // OpenCode 2 has no `--variant` and reads the effort from `--model provider/model#variant`.
+  const opencodeModel = input.model && effort && opencodeMajor >= 2 ? ['--model', `${input.model.name}#${effort}`] : [...model, ...(effort ? ['--variant', effort] : [])];
+  return ['run', '--format', 'json', prompt, ...agent, ...opencodeModel];
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -283,8 +277,7 @@ export function createLocalToolAdapter(
   return {
     async run(tool, input) {
       await fs.mkdir(path.dirname(input.resultPath), { recursive: true });
-      const call = invocation(tool, input);
-      const executable = resolveTool(call.command);
+      const executable = resolveTool(tool);
       if (!executable) {
         return {
           started: false,
@@ -292,13 +285,44 @@ export function createLocalToolAdapter(
           failure: { code: 'tool_unavailable', message: `The ${tool} executable is not available on PATH` },
         };
       }
+      const opencode = localToolFamily(tool) === 'opencode';
+      const opencodeMajor = opencode && (input.agent || input.model?.effort) ? await opencodeMajorVersion(executable) : 1;
+      if (opencode && input.agent) {
+        const { name, model, settings = {} } = input.agent;
+        const viaPrompt = promptHandoff(tool, input, opencodeMajor);
+        // OpenCode 1 applies an agent's variant to a launch on the agent's own model that passes none.
+        if (opencodeMajor < 2 && !viaPrompt && settings['variant'] !== undefined && input.model && input.model.name === model && input.model.effort === undefined) {
+          return {
+            started: false,
+            exitCode: 1,
+            failure: {
+              code: 'model_unavailable',
+              message: `Agent "${name}" runs on its own model "${model}" with no effort, and ${tool} 1 applies the agent's variant "${String(settings['variant'])}" `
+                + `to that model. Remove model from the step to run at that variant, or set it to an alias with an effort for ${tool}.`,
+            },
+          };
+        }
+        // The variant goes on argv with a model, the definition's or the step's.
+        const dropped = Object.keys(settings).filter((key) => key !== 'mode' && (key !== 'variant' || !input.model));
+        if (viaPrompt && dropped.length > 0) {
+          log.warn(`Agent "${name}" runs on ${tool} 1 from the prompt, since opencode run does not start a subagent there, so it does not apply `
+            + `${dropped.join(', ')} from the deployed agent file. The step is not blocked.`);
+        } else if (opencodeMajor >= 2 && settings['variant'] !== undefined && !input.model) {
+          log.warn(`Agent "${name}" sets a variant with no model, and ${tool} 2 takes a variant only with a model, so it does not apply variant `
+            + 'from the deployed agent file. The step is not blocked.');
+        }
+      }
+      const args = invocation(tool, input, opencodeMajor);
+      const applied = input.agent ? { applied: promptHandoff(tool, input, opencodeMajor) ? 'prompt' as const : 'main' as const } : {};
       let started = false;
       const completed = await new Promise<{ exitCode: number; stdout: string; error?: NodeJS.ErrnoException }>((resolve) => {
         let child: ChildProcess;
         try {
-          child = spawnTool(executable, call.args, {
+          child = spawnTool(executable, args, {
             cwd: input.cwd,
             env: { ...process.env, ...(input.launch ? launchEnv(input.launch) : {}), TEAMAI_WORKFLOW_RESULT: input.resultPath },
+            // OpenCode waits for the end of a piped stdin before it starts.
+            stdio: ['ignore', 'pipe', 'pipe'],
             windowsHide: true,
           });
         } catch (error) {
@@ -325,6 +349,7 @@ export function createLocalToolAdapter(
         return {
           started: true,
           exitCode: completed.exitCode,
+          ...applied,
           failure: { code: 'tool_failed', message: `${tool} could not be started` },
         };
       }
@@ -335,6 +360,7 @@ export function createLocalToolAdapter(
         return {
           started: true,
           exitCode: completed.exitCode,
+          ...applied,
           failure: { code: 'tool_failed', message: `${tool} did not write a valid workflow result` },
         };
       }
@@ -343,7 +369,7 @@ export function createLocalToolAdapter(
         result.failure = { code: 'tool_failed', message: `${tool} exited with status ${completed.exitCode}` };
       }
       if (!fileResult) await persistFallback(input.resultPath, result);
-      return { started: true, exitCode: completed.exitCode, ...result };
+      return { started: true, exitCode: completed.exitCode, ...applied, ...result };
     },
   };
 }

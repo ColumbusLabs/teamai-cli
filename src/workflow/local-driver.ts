@@ -8,6 +8,7 @@ import {
   reverseFromClaude,
   reverseFromCodex,
   reverseFromOpencode,
+  toolExtrasFor,
   type AgentSpec,
   type ToolName,
 } from '../resources/agent-format.js';
@@ -19,7 +20,16 @@ import { readFileSafe, writeJsonAtomic } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { leaseNext, reportAttempt } from './engine.js';
 import { isRecord } from './expression.js';
-import { createLocalToolAdapter, definitionHandoff, isLocalWorkflowTool, localToolFamily, type LocalToolAdapter, type LocalToolResult, type LocalWorkflowTool } from './local-tool-adapter.js';
+import {
+  createLocalToolAdapter,
+  isLocalWorkflowTool,
+  localToolFamily,
+  type LocalToolAdapter,
+  type LocalToolResult,
+  type LocalToolRun,
+  type LocalWorkflowTool,
+} from './local-tool-adapter.js';
+import { chooseStepModel } from './step-model.js';
 import type { DriverIdentity, WorkflowEnvelope, WorkflowFailure } from './types.js';
 import { isWorkflowError } from './types.js';
 
@@ -120,12 +130,16 @@ export interface LocalDriverOptions {
 }
 
 interface Lease {
+  /** The step path, such as `check.classify` inside a sub-workflow. */
+  step: string;
   attempt: string;
   revision: number;
   command?: string;
   env?: Record<string, string>;
   prompt?: string;
   agent?: string;
+  model?: string;
+  defaultModel?: string;
 }
 
 function stringMap(value: unknown): Record<string, string> | undefined {
@@ -145,6 +159,11 @@ function supportedTool(value: string): value is LocalWorkflowTool {
 function ignoredCodexSettings(agent: AgentSpec): string[] {
   const extras = Object.keys(agent.tool_extras?.codex ?? {});
   return agent.tools?.length ? ['tools', ...extras] : extras;
+}
+
+function definitionRun(tool: LocalWorkflowTool, name: string, agent: AgentSpec): NonNullable<LocalToolRun['agent']> {
+  const settings = localToolFamily(tool) === 'opencode' ? toolExtrasFor(agent, 'opencode') : undefined;
+  return { name, instructions: agent.instructions, ...(agent.model ? { model: agent.model } : {}), ...(settings ? { settings } : {}) };
 }
 
 function reverseAgent(tool: LocalWorkflowTool, file: string, content: string) {
@@ -227,15 +246,18 @@ type ReportBody = Parameters<typeof reportAttempt>[2];
 
 function parseLease(raw: unknown): Lease | undefined {
   const rawLease = raw as Record<string, unknown> | undefined;
-  if (!rawLease || typeof rawLease.attempt !== 'string' || typeof rawLease.revision !== 'number') return undefined;
+  if (!rawLease || typeof rawLease.step !== 'string' || typeof rawLease.attempt !== 'string' || typeof rawLease.revision !== 'number') return undefined;
   const env = stringMap(rawLease.env);
   const lease: Lease = {
+    step: rawLease.step,
     attempt: rawLease.attempt,
     revision: rawLease.revision,
     ...(typeof rawLease.command === 'string' ? { command: rawLease.command } : {}),
     ...(env ? { env } : {}),
     ...(typeof rawLease.prompt === 'string' ? { prompt: rawLease.prompt } : {}),
     ...(typeof rawLease.agent === 'string' ? { agent: rawLease.agent } : {}),
+    ...(typeof rawLease.model === 'string' ? { model: rawLease.model } : {}),
+    ...(typeof rawLease.defaultModel === 'string' ? { defaultModel: rawLease.defaultModel } : {}),
   };
   return (lease.command === undefined) === (lease.prompt === undefined) ? undefined : lease;
 }
@@ -285,18 +307,28 @@ async function promptReport(
     };
     return { attempt: lease.attempt, revision: lease.revision, driver, tool: selected, ...failureReport(failure) };
   }
+  const chosen = await chooseStepModel({
+    step: lease.step, tool: selected, model: lease.model, defaultModel: lease.defaultModel, agent: agent ?? undefined, config,
+  });
+  if (!chosen.ok) return { attempt: lease.attempt, revision: lease.revision, driver, tool: selected, ...failureReport(chosen.failure) };
   if (agent && localToolFamily(selected) === 'codex') {
     const ignored = ignoredCodexSettings(agent);
     if (ignored.length > 0) {
       log.warn(`Agent "${agent.name}" on ${selected} does not apply ${ignored.join(', ')} from the deployed agent file. codex exec still has a shell. The step is not blocked.`);
     }
   }
+  const definitionModel = chosen.model && chosen.by === 'definition'
+    ? { model: chosen.model.name, ...(chosen.model.effort ? { effort: chosen.model.effort } : {}) }
+    : {};
   const [observed, launch] = await Promise.all([
     observeLaunch({
       config,
       tool: selected,
       cwd: driver.workspace,
-      ...(lease.agent && loaded ? { definition: { stem: lease.agent, file: loaded.file, ...definitionHandoff(selected, loaded.spec) } } : {}),
+      ...(lease.agent && loaded ? { definition: { stem: lease.agent, file: loaded.file, ...definitionModel } } : {}),
+      ...(chosen.model && chosen.by !== 'definition'
+        ? { chosen: { model: chosen.model.name, ...(chosen.model.effort ? { effort: chosen.model.effort } : {}), ...(chosen.alias ? { alias: chosen.alias } : {}) } }
+        : {}),
     }),
     workflowLaunch(config, selected),
   ]);
@@ -308,7 +340,8 @@ async function promptReport(
       cwd: driver.workspace,
       resultPath: attemptResultPath,
       ...(launch ? { launch } : {}),
-      ...(agent ? { agent: { name: lease.agent!, instructions: agent.instructions, ...(agent.model ? { model: agent.model } : {}) } } : {}),
+      ...(agent ? { agent: definitionRun(selected, lease.agent!, agent) } : {}),
+      ...(chosen.model ? { model: chosen.model } : {}),
     });
   } catch {
     result = {
@@ -333,7 +366,8 @@ async function promptReport(
     ...(ran?.session ? { session: ran.session } : {}),
     ...(ran?.tokens ? { tokens: ran.tokens } : {}),
     ...(ran?.output !== undefined ? { outputs: ran.output } : {}),
-    ...(ran ? { agent: observed } : {}),
+    // How the definition was handed over is known only once the launch resolved its tool: OpenCode's depends on its major.
+    ...(ran ? { agent: ran.applied ? { ...observed, definition: { applied: ran.applied } } : observed } : {}),
     exitCode: result.exitCode,
     ...(failure ? failureReport(failure) : { outcome: result.exitCode === 0 ? 'success' : 'failed' }),
   };
