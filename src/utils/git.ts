@@ -4,7 +4,9 @@ import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import fse from 'fs-extra';
 import simpleGit, { type SimpleGit } from 'simple-git';
+import { z } from 'zod';
 import { execCommand } from './exec.js';
+import { GitAnswers } from './git-answers.js';
 import { gitFindsNoRepository, linkedWorktreesStamp, repositoryStamp } from './git-discovery.js';
 import { log } from './logger.js';
 
@@ -1112,7 +1114,9 @@ export interface CheckoutLocation {
   excludeFile: string;
 }
 
-const checkoutLocations = new Map<string, { stamp: string; location: Promise<CheckoutLocation | null> }>();
+const checkoutLocations = GitAnswers.of('locations', z.object({
+  toplevel: z.string(), prefix: z.string(), commonDir: z.string(), excludeFile: z.string(),
+}) satisfies z.ZodType<CheckoutLocation>);
 
 /**
  * Where `dir` sits in its checkout, from one `git rev-parse` for what
@@ -1129,14 +1133,7 @@ const checkoutLocations = new Map<string, { stamp: string; location: Promise<Che
 export async function checkoutLocation(dir: string): Promise<CheckoutLocation | null> {
   const found = await repositoryStamp(dir);
   if (found === null) return null;
-  const { stamp } = found;
-  const key = path.resolve(dir);
-  const known = checkoutLocations.get(key);
-  if (known?.stamp === stamp) return known.location;
-  const location = readCheckoutLocation(dir, found.gitDir);
-  checkoutLocations.set(key, { stamp, location });
-  if (await location === null && checkoutLocations.get(key)?.location === location) checkoutLocations.delete(key);
-  return location;
+  return checkoutLocations.answer(path.resolve(dir), found.stamp, () => readCheckoutLocation(dir, found.gitDir));
 }
 
 async function readCheckoutLocation(dir: string, stampGitDir: string): Promise<CheckoutLocation | null> {
@@ -1236,7 +1233,7 @@ interface ListedWorktree extends WorktreeListEntry {
  * unchanged (linkedWorktreesStamp): one pull asks for the same list several
  * times.
  */
-const worktreeLists = new Map<string, { stamp: string; list: string }>();
+const worktreeLists = GitAnswers.of('worktreeLists', z.string());
 
 /**
  * The entries of `git worktree list --porcelain -z` for the repo containing
@@ -1250,21 +1247,20 @@ async function readWorktreeList(cwd?: string, newlineSplit = false): Promise<Lis
   if (await gitFindsNoRepository(dir)) return null;
   // Taken before git runs: a worktree changed meanwhile changes the next stamp.
   const commonDir = (await checkoutLocation(dir))?.commonDir ?? null;
-  const stamp = commonDir === null ? null : JSON.stringify([commonDir, await linkedWorktreesStamp(commonDir)]);
-  const key = `${newlineSplit}\0${dir}`;
-  const known = worktreeLists.get(key);
-  let list: string;
-  if (stamp !== null && known?.stamp === stamp) {
-    list = known.list;
-  } else {
+  const linked = commonDir === null ? null : await linkedWorktreesStamp(commonDir);
+  const readList = async (): Promise<string | null> => {
     try {
       // Inside the try: simple-git throws at once for a directory that does not exist.
-      list = await createGit(cwd).raw(['worktree', 'list', '--porcelain', ...newlineSplit ? [] : ['-z']]);
+      return await createGit(cwd).raw(['worktree', 'list', '--porcelain', ...newlineSplit ? [] : ['-z']]);
     } catch {
       return null;
     }
-    if (stamp !== null) worktreeLists.set(key, { stamp, list });
-  }
+  };
+  // The list is the repository's, whichever of its directories git runs in.
+  let list = commonDir === null || linked === null
+    ? await readList()
+    : await worktreeLists.answer(`${newlineSplit}\0${commonDir}`, linked, readList);
+  if (list === null) return null;
   if (newlineSplit) list = list.split(/\r?\n/).join('\0');
   return Promise.all(parseWorktreeList(list)
     .filter((entry) => entry.path)
