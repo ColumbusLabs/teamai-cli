@@ -3003,6 +3003,8 @@ export async function reconcileHooksToAllTools(
     selfLocalTeamHooks?: { relocate: boolean };
     /** Project scope: Codex team hooks may run from the dispatcher instead of the project's file (#915). */
     codexTeamHooks?: CodexTeamHookPlacement;
+    /** Collects the tools whose hook files a write failure left as they were. */
+    unwritten?: string[];
   } = {},
 ): Promise<Set<string>> {
   // Without the manifest, reconcileHooks manages the built-in entries only.
@@ -3058,6 +3060,7 @@ export async function reconcileHooksToAllTools(
         }
       } catch (e) {
         log.warn(`Failed to reconcile Hermes hooks: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3082,6 +3085,7 @@ export async function reconcileHooksToAllTools(
         }
       } catch (e) {
         log.warn(`Failed to reconcile OpenClaw hooks for ${tool}: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3094,6 +3098,7 @@ export async function reconcileHooksToAllTools(
         await reconcileOpencodePlugin(baseDir, opts.removeAll, opts.installedBaseDir);
       } catch (e) {
         log.warn(`Failed to reconcile OpenCode hooks: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3105,6 +3110,7 @@ export async function reconcileHooksToAllTools(
         await reconcileOmpExtension(opts.removeAll);
       } catch (e) {
         log.warn(`Failed to reconcile OMP hooks: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3117,6 +3123,7 @@ export async function reconcileHooksToAllTools(
         await reconcilePiExtension(baseDir, opts.removeAll, opts.installedBaseDir);
       } catch (e) {
         log.warn(`Failed to reconcile Pi hooks: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3138,6 +3145,7 @@ export async function reconcileHooksToAllTools(
         }
       } catch (e) {
         log.warn(`Failed to reconcile DeepSeek Harness hooks: ${(e as Error).message}`);
+        opts.unwritten?.push(tool);
       }
       continue;
     }
@@ -3225,6 +3233,7 @@ export async function reconcileHooksToAllTools(
       }
     } catch (e) {
       log.warn(`Failed to reconcile hooks for ${tool}: ${(e as Error).message}`);
+      opts.unwritten?.push(tool);
     }
   }
   return reconciledMainTools;
@@ -3654,9 +3663,13 @@ export async function sweepLegacyProjectHooks(
  * overrides when hooks/hooks.yaml parses, and otherwise with their defaults,
  * only in a tool that has no teamai hook yet (a first install).
  */
-export type TeamHooksReconcile =
+export type TeamHooksReconcile = {
+  /** The tools whose hook files a write failure left as they were; absent when none. */
+  unwritten?: string[];
+} & (
   | { ok: true; defs: HookDef[] }
-  | { ok: false; builtins: BuiltinsOnly };
+  | { ok: false; builtins: BuiltinsOnly }
+);
 
 /**
  * The tools a hook pass reaches: the explicit selection (or the config's
@@ -3777,6 +3790,7 @@ export async function reconcileTeamHooksForConfig(
   const codexProject = await codexTeamHookProject(localConfig);
   const codexHome = codexHomeHooksFile(teamConfig, localConfig);
   const mainCheckout = await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths);
+  const unwritten: string[] = [];
   const reconciledMainTools = await reconcileHooksToAllTools(hookToolPaths, baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
     builtinOverride: builtin,
@@ -3792,6 +3806,7 @@ export async function reconcileTeamHooksForConfig(
     builtinsOnly,
     mainCheckout,
     teamHookHistory: history,
+    unwritten,
     ...(isSelfMode(localConfig) && localConfig.scope === 'project' && localConfig.projectRoot
       ? { selfLocalTeamHooks: { relocate: isGitExcludeEnabled(localConfig, teamConfig) } }
       : {}),
@@ -3805,6 +3820,7 @@ export async function reconcileTeamHooksForConfig(
       await reconcileCodexDispatchers(codexHome);
     } catch (e) {
       log.warn(`Failed to reconcile the Codex team-hook dispatchers in ${codexHome}: ${(e as Error).message}`);
+      unwritten.push(CODEX_TOOL_ID);
     }
   }
 
@@ -3858,8 +3874,9 @@ export async function reconcileTeamHooksForConfig(
   // Last, so a repository whose hooks cannot be written still gets the agent
   // hooks above; the error then reaches the caller.
   if (!opts.removeAll) await installProjectGitHook(localConfig);
-  if (builtinsOnly) return { ok: false, builtins: builtinsOnly };
-  return { ok: true, defs: teamDefs };
+  const failed = unwritten.length > 0 ? { unwritten } : {};
+  if (builtinsOnly) return { ok: false, builtins: builtinsOnly, ...failed };
+  return { ok: true, defs: teamDefs, ...failed };
 }
 
 /**
