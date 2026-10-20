@@ -905,7 +905,9 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
     const restoredByForce = [...delivery.problems.keys()]
       .some((label) => label !== MODEL_CHANGED && label !== CHANGED_BY_YOU && label !== MEMBERS_OWN);
     return {
-      name: `Agents delivered to ${tool}`,
+      name: tool === 'cursor' && localConfig.scope === 'user'
+        ? 'Agents delivered to cursor (the Cursor IDE reads them; the Cursor CLI reads agents only from the workspace)'
+        : `Agents delivered to ${tool}`,
       source: 'local',
       check: async () => !hasDeliveryProblem(delivery),
       fix: [
