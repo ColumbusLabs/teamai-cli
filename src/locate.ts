@@ -65,8 +65,7 @@ export type Gate =
 
 /**
  * The directories teamai writes into are present whether or not the gates are
- * met, so uninstall and the release of an old location look wherever teamai
- * may have written.
+ * met, so uninstall looks wherever teamai may have written.
  */
 export type Location = {
   /** The tool's own directory; null when it has none (no configured path, no OpenClaw workspace). */

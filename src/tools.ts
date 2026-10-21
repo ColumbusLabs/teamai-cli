@@ -72,8 +72,9 @@ export type ToolDescriptor = {
    * Where teamai writes the tool's skills follows inputs of each session that
    * nothing records: OpenClaw's workspace follows `OPENCLAW_WORKSPACE_DIR`,
    * `OPENCLAW_CONFIG_PATH` and the directory a relative workspace resolves
-   * against. A move there may be another session's, so pull never releases it
-   * and syncs in full only when the tool's home moves (`sessionToolHomes`).
+   * against. A move there may be another session's, so pull never names the
+   * old one as left and syncs in full only when the tool's home moves
+   * (`sessionToolHomes`).
    */
   readonly skillsFollowSession?: true;
 };

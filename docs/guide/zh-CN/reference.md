@@ -103,7 +103,7 @@ Cursor CLI 会搬两个目录：`CURSOR_DATA_DIR` 放会话记录，`CURSOR_CONF
 
 第一次看到该变量的 `pull` 会在该目录存在时把主目录记到 `~/.teamai/tool-homes.json`，整台机器共用这一份记录；pull 不会替换已有的记录。`teamai init` 也会记录，并且会替换已有的记录：工具自己的变量（`HERMES_HOME`、`OPENCLAW_PROFILE` 等）在目录还不存在时也记，`XDG_CONFIG_HOME` 要等目录存在才记。Hermes 在 Windows 上的默认目录只会补上缺的记录。所以请在你的工具运行的 shell 里运行 `init`。之后即使在没设该变量的 shell 里 pull，各个 scope 也仍然同步到那里。要换主目录，带着新值运行 `teamai init`。要清掉记录，把变量设为空再运行一次。记录的目录不存在时，`teamai doctor` 会报 `<tool> home exists`；shell 里的变量指向别的目录时，会报 `<tool> home matches <variable>`。
 
-工具的技能目录变了之后，第一次把技能送到新目录的 pull 会删掉旧目录里 teamai 放的、没改过的副本，除非还有别的工具从那里取技能。你改过的副本会留下，pull 会点名。OpenClaw 的旧工作区不删：它的工作区跟着每个 shell 的 `OPENCLAW_WORKSPACE_DIR`、`OPENCLAW_CONFIG_PATH` 和当前目录走，旧的可能还在用。
+工具的技能目录变了之后，旧目录里 teamai 放的副本会留下。别的 shell、别的项目或别的工具可能还在读那个目录，teamai 无法判断。第一次把技能送到新目录的 pull 会点名旧目录，之后 teamai 不再更新那里的副本。确认没有工具再读那个目录后，自己删掉即可。
 
 ### Webhook 通知（`sharing.webhooks`）
 

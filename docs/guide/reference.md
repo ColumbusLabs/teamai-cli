@@ -103,7 +103,7 @@ Some tools move their home with a variable: `XDG_CONFIG_HOME` (OpenCode, Muse), 
 
 The first `pull` that sees the variable records the home for the whole machine in `~/.teamai/tool-homes.json` when the directory exists, and never replaces a record. `teamai init` records it too and replaces an earlier record: for a tool's own variable (`HERMES_HOME`, `OPENCLAW_PROFILE`, ...) even before the directory exists, for `XDG_CONFIG_HOME` only once it does. Hermes' Windows default only fills a missing record. So run `init` from a shell your tools run in. After that, a pull from a shell without the variable still syncs there, in every scope. To move the home, run `teamai init` with the new value. To clear the record, run it with the variable set but blank. `teamai doctor` reports `<tool> home exists` when the recorded directory is gone, and `<tool> home matches <variable>` when the shell names another directory.
 
-When a tool's skills directory moves, the first pull that delivers the skills to the new one removes teamai's unchanged copies from the old one, unless another tool still takes skills there. A copy you changed stays, and the pull names it. OpenClaw's old workspace keeps its copies: the workspace follows each shell's `OPENCLAW_WORKSPACE_DIR`, `OPENCLAW_CONFIG_PATH` and directory, so the old one may still be in use.
+When a tool's skills directory moves, teamai's copies in the old one stay. Another shell, another project or another tool may still read that directory, and teamai cannot tell. The first pull that delivers the skills to the new directory names the old one, and teamai no longer updates the copies there. Delete them once no tool reads that directory.
 
 ### Webhook notifications (`sharing.webhooks`)
 

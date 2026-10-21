@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
+import { execFileSync } from 'node:child_process';
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
@@ -48,7 +49,7 @@ import { resolveDesiredSkills } from '../resources/desired.js';
 import { deployBuiltinSkills } from '../builtin-skills.js';
 import { packagedSkillRoots } from '../skill-content.js';
 import { getHandler } from '../resources/index.js';
-import { loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
+import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import { TeamaiConfigSchema, type LocalConfig, type State } from '../types.js';
 import { realHost, recordedHomes, saveToolHomes, toolHomesPath } from '../tool-home.js';
@@ -56,6 +57,7 @@ import { realHost, recordedHomes, saveToolHomes, toolHomesPath } from '../tool-h
 describe('a pull and the homes the env moves', () => {
   let tmp: string; let home: string; let repo: string; let saved: State; let config: LocalConfig;
   const recordOnDisk = async (): Promise<unknown> => JSON.parse(await fse.readFile(toolHomesPath(), 'utf8'));
+  const notices = (): string[] => vi.mocked(log.info).mock.calls.map(([message]) => String(message)).filter((line) => line.includes('no longer updates'));
 
   beforeEach(async () => {
     tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-dirs-'));
@@ -73,8 +75,9 @@ describe('a pull and the homes the env moves', () => {
       additionalRoles: [], scope: 'user', enabledAgents: ['opencode', 'hermes'],
     } as LocalConfig;
     vi.mocked(loadLocalConfigForScope).mockImplementation(async (scope) => scope === 'user' ? config : null);
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
   });
-  afterEach(async () => { vi.unstubAllEnvs(); vi.mocked(log.warn).mockClear(); await fse.remove(tmp); });
+  afterEach(async () => { vi.unstubAllEnvs(); vi.mocked(log.warn).mockClear(); vi.mocked(log.info).mockClear(); await fse.remove(tmp); });
 
   it('records an env-moved home that exists on the first pull that sees it, and keeps an existing record', async () => {
     const xdg = path.join(tmp, 'xdg');
@@ -154,7 +157,7 @@ describe('a pull and the homes the env moves', () => {
       expect(await fse.pathExists(path.join(after, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
     });
 
-    it('keeps the old copies and the old record while a collision holds skills, and finishes the move once it is gone', async () => {
+    it('keeps the old record while a collision holds skills, and finishes the move once it is gone', async () => {
       await fse.outputFile(path.join(repo, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: review\n    resources:\n      knowledge: []\n      skills: [a, b]\n');
       for (const ns of ['a', 'b']) await fse.outputFile(path.join(repo, 'skills', ns, 'deploy', 'SKILL.md'), `---\nname: deploy\ndescription: ${ns}\n---\n${ns}\n`);
       Object.assign(config, { primaryRole: 'review', resourceProfileVersion: 1 });
@@ -169,7 +172,7 @@ describe('a pull and the homes the env moves', () => {
       await pull({});
 
       expect(await fse.pathExists(path.join(after, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
-      expect(await fse.pathExists(path.join(before, 'skills', 'deploy'))).toBe(false);
+      expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.skillDirs?.hermes)).toEqual([[path.join(after, 'skills')]]);
     });
 
     it('keeps the old copies when the new directory cannot take the skills', async () => {
@@ -199,7 +202,7 @@ describe('a pull and the homes the env moves', () => {
       await pull({});
 
       expect(await fse.pathExists(path.join(after, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
-      expect(await fse.pathExists(path.join(before, 'skills', 'deploy'))).toBe(false);
+      expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.skillDirs?.hermes)).toEqual([[path.join(after, 'skills')]]);
     });
 
     it('keeps the old copies while the new directory skips a skill', async () => {
@@ -259,7 +262,7 @@ describe('a pull and the homes the env moves', () => {
       expect(await fse.pathExists(path.join(before, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
     });
 
-    it('keeps on record the copies a held move wrote to the new directory, and releases them when the tool moves on', async () => {
+    it('keeps on record the copies a held move wrote to the new directory, and names both directories when the tool moves on', async () => {
       await fse.outputFile(path.join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: r\n---\nReview.\n');
       await fse.outputFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'This is a member skill, unrelated to team deploy.\n');
       await pull({});
@@ -273,44 +276,17 @@ describe('a pull and the homes the env moves', () => {
       await pull({});
 
       expect(await fse.pathExists(path.join(third, 'skills', 'review', 'SKILL.md'))).toBe(true);
-      expect(await fse.pathExists(path.join(after, 'skills', 'review'))).toBe(false);
+      expect(notices()).toEqual([before, after].map((dir) => `[user] hermes takes skills from ${path.join(third, 'skills')} now, so teamai no longer updates its copies in ${path.join(dir, 'skills')}. Delete them once no tool reads that directory.`));
       expect(await fse.readFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'utf8')).toContain('member skill');
     });
 
-    it('releases a tool that took every skill while a file of the member\'s holds one back in another tool', async () => {
+    it('moves the record of a tool that took every skill while a file of the member\'s holds one back in another tool', async () => {
       await fse.outputFile(path.join(home, '.config', 'opencode', 'skills', 'deploy', 'SKILL.md'), 'This is a member skill, unrelated to team deploy.\n');
 
       await pull({});
 
       expect(await fse.pathExists(path.join(after, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
-      expect(await fse.pathExists(path.join(before, 'skills', 'deploy'))).toBe(false);
       expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.skillDirs?.hermes)).toEqual([[path.join(after, 'skills')]]);
-    });
-
-    it('releases teamai\'s unchanged copies at the old directory, and keeps an edited one and the member\'s', async () => {
-      await fse.outputFile(path.join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: r\n---\nReview.\n');
-      await saveToolHomes({ ...recordedHomes(realHost()), hermes: before });
-      vi.stubEnv('HERMES_HOME', before);
-      await pull({ force: true });
-      await fse.appendFile(path.join(before, 'skills', 'review', 'SKILL.md'), 'My note.\n');
-      await fse.outputFile(path.join(before, 'skills', 'mine', 'SKILL.md'), '---\nname: mine\ndescription: m\n---\nMine.\n');
-      await saveToolHomes({ ...recordedHomes(realHost()), hermes: after });
-      vi.stubEnv('HERMES_HOME', after);
-
-      await pull({});
-
-      expect(await fse.pathExists(path.join(before, 'skills', 'deploy'))).toBe(false);
-      expect(await fse.pathExists(path.join(before, 'skills', 'teamai'))).toBe(false);
-      expect(await fse.readFile(path.join(before, 'skills', 'review', 'SKILL.md'), 'utf8')).toContain('My note.');
-      expect(await fse.pathExists(path.join(before, 'skills', 'mine', 'SKILL.md'))).toBe(true);
-      expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining(`Kept ${path.join(before, 'skills', 'review')}`));
-      expect(await fse.pathExists(path.join(after, 'skills', 'review', 'SKILL.md'))).toBe(true);
-
-      vi.mocked(log.warn).mockClear();
-      await pull({ force: true });
-
-      expect(await fse.readFile(path.join(before, 'skills', 'review', 'SKILL.md'), 'utf8')).toContain('My note.');
-      expect(await fse.pathExists(path.join(before, 'skills', 'mine', 'SKILL.md'))).toBe(true);
     });
   });
 
@@ -336,23 +312,6 @@ describe('a pull and the homes the env moves', () => {
 
       expect(await fse.pathExists(deployIn(hermes))).toBe(true);
       expect(await fse.pathExists(deployIn(shared))).toBe(true);
-    });
-
-    it('keeps the copies in a directory an installed tool still reads, though only the moved tool is selected', async () => {
-      const claude = path.join(home, '.claude');
-      await fse.ensureDir(claude); await fse.ensureDir(path.join(home, '.config', 'opencode'));
-      config.enabledAgents = ['hermes'];
-      vi.stubEnv('HERMES_HOME', claude);
-      await pull({});
-      expect(await fse.pathExists(deployIn(claude))).toBe(true);
-      await saveToolHomes({ hermes });
-      vi.stubEnv('HERMES_HOME', hermes);
-
-      await pull({});
-
-      expect(await fse.pathExists(deployIn(hermes))).toBe(true);
-      expect(await fse.pathExists(deployIn(claude))).toBe(true);
-      expect(await fse.pathExists(path.join(claude, 'skills', 'teamai', 'SKILL.md'))).toBe(true);
     });
 
     describe('while a file of the member\'s holds a skill back in the moved tool', () => {
@@ -393,7 +352,57 @@ describe('a pull and the homes the env moves', () => {
     });
   });
 
-  it('releases the old copies once a moved home that did not exist yet takes the skills', async () => {
+  describe('when only Hermes is selected and moves off a skills directory', () => {
+    it.each([
+      {
+        name: 'a user pull, while OpenCode, installed, reads the old directory',
+        scope: 'user', old: 'home/.claude', installed: ['home/.config/opencode'],
+      },
+      {
+        name: 'a project pull, while OpenCode, installed in the user scope only, reads the old directory',
+        scope: 'project', old: 'home/.claude', installed: ['home/.config/opencode'],
+      },
+      {
+        name: 'a user pull, while Claude Code reads the old directory in a project',
+        scope: 'user', old: 'project/.claude', installed: [],
+      },
+      {
+        name: 'a user pull, while no tool reads the old directory',
+        scope: 'user', old: 'hermes-a', installed: [],
+      },
+    ] as const)('keeps teamai\'s copies there and names the directory once: $name', async ({ scope, old, installed }) => {
+      const project = path.join(tmp, 'project'); const oldHome = path.join(tmp, old); const newHome = path.join(tmp, 'hermes-b');
+      for (const dir of [project, oldHome, newHome, ...installed.map((dir) => path.join(tmp, dir))]) await fse.ensureDir(dir);
+      execFileSync('git', ['init', '-q', project]);
+      config.enabledAgents = ['hermes'];
+      if (scope === 'project') {
+        const projectConfig = { ...config, scope: 'project', projectRoot: project } as LocalConfig;
+        vi.mocked(loadLocalConfigForScope).mockImplementation(async (s) => s === 'project' ? projectConfig : null);
+        vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+      }
+      vi.stubEnv('HERMES_HOME', oldHome);
+      await pull({});
+      expect(await fse.pathExists(path.join(oldHome, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
+      await saveToolHomes({ hermes: newHome });
+      vi.stubEnv('HERMES_HOME', newHome);
+      vi.mocked(log.info).mockClear();
+
+      await pull({});
+
+      expect(await fse.pathExists(path.join(newHome, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
+      expect(await fse.pathExists(path.join(oldHome, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
+      expect(await fse.pathExists(path.join(oldHome, 'skills', 'teamai', 'SKILL.md'))).toBe(true);
+      expect(notices()).toEqual([`[${scope === 'user' ? 'user' : 'workspace'}] hermes takes skills from ${path.join(newHome, 'skills')} now, so teamai no longer updates its copies in ${path.join(oldHome, 'skills')}. Delete them once no tool reads that directory.`]);
+
+      vi.mocked(log.info).mockClear();
+      await pull({ force: true });
+
+      expect(notices()).toEqual([]);
+      expect(await fse.pathExists(path.join(oldHome, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
+    });
+  });
+
+  it('keeps the old copies once a moved home that did not exist yet takes the skills', async () => {
     const old = path.join(home, '.hermes'); const later = path.join(tmp, 'hermes-later');
     await fse.ensureDir(old);
     await pull({});
@@ -408,7 +417,7 @@ describe('a pull and the homes the env moves', () => {
     await pull({});
 
     expect(await fse.pathExists(path.join(later, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(old, 'skills', 'deploy'))).toBe(false);
+    expect(await fse.pathExists(path.join(old, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
   });
 
   it('syncs in full into a recorded home that comes back after a pull it was gone for', async () => {

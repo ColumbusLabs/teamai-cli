@@ -31,7 +31,7 @@ import { CODEX_TOOL, mayDeleteSkillCopy, skillOrigin } from './resources/skills.
 import { installOf, locate, SHARED_AGENT_SKILLS_PATH, writableDir, writesOf } from './locate.js';
 import { describeToolHomeChange, recordToolHomes } from './tool-home-record.js';
 import { describeInvalidToolHomes, realHost } from './tool-home.js';
-import { releaseMovedSkillDirs, skillDirsInUse, skillDirsOf, skillDirsUnmoved, type SessionToolHomes, type SkillDirs } from './resources/skill-dirs.js';
+import { recordSkillDirs, skillDirsOf, skillDirsUnmoved, type SessionToolHomes, type SkillDirs } from './resources/skill-dirs.js';
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
@@ -1267,7 +1267,6 @@ function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<strin
       ...(record.agentModels ? { agentModels: record.agentModels } : {}),
       ...(record.gitExcludePaths ? { gitExcludePaths: record.gitExcludePaths } : {}),
       ...(record.skillDirs ? { skillDirs: record.skillDirs } : {}),
-      ...(record.formerSkillDirs ? { formerSkillDirs: record.formerSkillDirs } : {}),
       ...(record.rootsSeeded ? { rootsSeeded: true } : {}),
       ...(record.claudeMdExcludes ? { claudeMdExcludes: record.claudeMdExcludes } : {}),
     };
@@ -2264,22 +2263,20 @@ async function pullForScope(
     if (!dryRun) warnStubNotDeployed(scopeLabel, e);
   }
 
-  // Step 4b: Release teamai's copies where a tool took skills before and no
-  // longer does, once the skills and the stub had their chance at the new place.
+  // Step 4b: Record where each tool took skills, once the skills and the stub
+  // had their chance at the new place, and name the directories a tool left.
   const currentDirs = currentSkillDirs ?? await skillDirsOf(installOf(freshConfig, localConfig));
   let syncedSkillDirs: SkillDirs | undefined;
-  let syncedFormerSkillDirs: SkillDirs | undefined;
   let syncedSessionToolHomes: SessionToolHomes | undefined;
   if (!options.dryRun && resourceTypes.includes('skills')) {
     const previous = recordKey ? (await loadStateForScope(localConfig)).lastPullByWorkspace?.[recordKey] : undefined;
     const incomplete = workspaceHeldSkills || stubFailed ? new Set(Object.keys(currentDirs)) : ledger.toolsMissingSkills;
     if (skillsHeld) {
       syncedSkillDirs = previous?.skillDirs;
-      syncedFormerSkillDirs = previous?.formerSkillDirs;
       syncedSessionToolHomes = previous?.sessionToolHomes;
     } else {
-      ({ skillDirs: syncedSkillDirs, formerSkillDirs: syncedFormerSkillDirs, sessionToolHomes: syncedSessionToolHomes } = await releaseMovedSkillDirs({
-        previous, current: currentDirs, incomplete, inUse: await skillDirsInUse(installOf(freshConfig, localConfig)), ledger, localConfig, scopeLabel,
+      ({ skillDirs: syncedSkillDirs, sessionToolHomes: syncedSessionToolHomes } = await recordSkillDirs({
+        previous, current: currentDirs, incomplete, scopeLabel,
       }));
     }
   }
@@ -2362,7 +2359,6 @@ async function pullForScope(
       addPushBaseRev(record, deliveredRev);
       record.delivered = ledger.hashes;
       record.skillDirs = syncedSkillDirs;
-      record.formerSkillDirs = syncedFormerSkillDirs;
       record.sessionToolHomes = syncedSessionToolHomes;
       if (localConfig.repo.ref !== undefined) record.teamRef = localConfig.repo.ref;
       else delete record.teamRef;
@@ -2399,7 +2395,6 @@ async function pullForScope(
         targets: syncedTargets,
         delivered: ledger.hashes,
         ...(syncedSkillDirs ? { skillDirs: syncedSkillDirs } : {}),
-        ...(syncedFormerSkillDirs ? { formerSkillDirs: syncedFormerSkillDirs } : {}),
         ...(syncedSessionToolHomes ? { sessionToolHomes: syncedSessionToolHomes } : {}),
         ...(gitExcludePaths ? { gitExcludePaths } : {}),
         ...(seeded ? { rootsSeeded: true } : {}),
@@ -3036,7 +3031,7 @@ export async function pull(
     return;
   }
   // Every scope finds tool homes through the record: while it is invalid, a
-  // pull would write to homes it no longer names, and release what it wrote.
+  // pull would write to homes it no longer names.
   const toolHomes = realHost().toolHomes;
   if (toolHomes.kind === 'invalid') {
     const message = describeInvalidToolHomes(toolHomes.error);

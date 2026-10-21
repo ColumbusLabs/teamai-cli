@@ -1066,12 +1066,6 @@ export const StateSchema = z.object({
      * A record without it, from an older CLI, misses the fast path once.
      */
     skillDirs: z.record(z.string(), z.array(z.string())).optional(),
-    /**
-     * The skills directories of each tool that took skills nowhere at the last
-     * full pull, as the record had them, released once the tool takes skills
-     * elsewhere (`settleSkillDirs`).
-     */
-    formerSkillDirs: z.record(z.string(), z.array(z.string())).optional(),
     /** The home (`toolHome`) of each tool whose skills follow the session, at the last full pull that delivered it every skill. */
     sessionToolHomes: z.record(z.string(), z.string()).optional(),
     rootsSeeded: z.boolean().optional(),
