@@ -50,6 +50,30 @@ The run still ends `failed` unless it reaches an end. An `if` that does not pars
 
 `teamai pull` and `teamai push` check each file, and check a step that runs another workflow against that workflow's runnable version. A `prompt_file` must be a regular, non-symlink file under `prompts/` in the team repo. Its text is cached with the validated workflow, so an existing run keeps that revision even if the source is later changed or deleted. A file that was valid before keeps that version in the local cache when a new revision is invalid, as long as that version still fits the workflows it runs. A field this version of teamai does not know is different: that workflow has nothing to run until teamai is updated.
 
+`teamai review --branch <name>` checks that branch with the same rules. It exits 1 when any workflow file is invalid, writes nothing, and does not run the workflow. This file fails the check:
+
+```yaml (invalid)
+schemaVersion: v1alpha1
+name: deploy
+description: Ship the release candidate.
+steps:
+  - id: release
+    needs: [biuld]
+    command: echo release
+```
+
+```text
+teamai review --branch feature/deploy
+[review] branch feature/deploy: 1 fail, 0 warn, 0 info
+  ✖ [workflows] workflows/deploy.yaml:6: field "steps[0].needs": step "release" needs "biuld", which is not a step in this workflow
+```
+
+Gate that branch from CI with one step:
+
+```yaml
+- run: teamai review --branch feature/deploy
+```
+
 A workflow can declare named `ends`, each `succeeded` or `failed`, such as `ends: { dropped: succeeded, stuck: failed }`. A step with `end: <name>` finishes the workflow when it succeeds. A step with only `id`, `needs`, `if`, and `end` runs nothing: it ends the workflow as soon as its needs are done. When an end is reached, every step that has not run is skipped, and the run takes that end's outcome, even if another step failed. `done` then carries the end: `{"done":{"run":"<run>","outcome":"succeeded","end":"dropped"}}`. An `end` that is not in `ends`, an `end` without `ends`, a declared end that no step uses, or a step that needs a step that only ends the workflow makes the file invalid.
 
 A workflow can declare `inputs` with the same shorthand as `output`, such as `inputs: { issue: number, title: string }`. Every input is required. Pass them as a JSON object: `teamai workflow start fix --driver local --inputs '{"issue":42,"title":"Crash"}'`. A missing, extra, or mistyped input returns `invalid_inputs` naming the field, and no run is created. An `if` can read `inputs.<name>`.
