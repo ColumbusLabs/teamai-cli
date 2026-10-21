@@ -397,7 +397,7 @@ const TeamScriptSchema = z.object({
  * Tools left without `mcp` are skipped by MCP sync rather than guessed at, so a
  * wrong guess can never create a junk config file on a user's machine.
  */
-export const DEFAULT_TOOL_PATHS: Record<string, z.infer<typeof ToolPathsSchema>> = {
+export const DEFAULT_TOOL_PATHS = {
   claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
   // Codex reads no rules directory: `.codex/rules` holds its exec-policy
   // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
@@ -656,7 +656,10 @@ export const DEFAULT_TOOL_PATHS: Record<string, z.infer<typeof ToolPathsSchema>>
     agents: '.agents/agents',
     userScope: { skills: '.config/muse/skills', settings: '.config/muse/settings.json', agents: '.config/muse/agents' },
   },
-};
+} satisfies Record<string, z.infer<typeof ToolPathsSchema>>;
+
+/** A built-in tool. Custom tools in a team's `toolPaths` stay plain strings. */
+export type ToolId = keyof typeof DEFAULT_TOOL_PATHS;
 
 export const TeamaiConfigBaseSchema = z.object({
   team: z.string(),
@@ -1560,8 +1563,11 @@ export const TEAMAI_RECALL_RULES_END = '<!-- [teamai:recall-rules:end] -->';
 
 // ─── Usage tracking ────────────────────────────────────
 
-/** Regex for valid skill names: alphanumeric, hyphens, underscores, colons, dots. Max 200 chars. */
-export const SKILL_NAME_REGEX = /^[a-zA-Z0-9_\-:.]{1,200}$/;
+/** The characters a skill name may hold: alphanumeric, hyphens, underscores, colons, dots. */
+export const SKILL_NAME_CHARS = '[a-zA-Z0-9_\\-:.]';
+
+/** Regex for valid skill names: {@link SKILL_NAME_CHARS}, at most 200 of them. */
+export const SKILL_NAME_REGEX = new RegExp(`^${SKILL_NAME_CHARS}{1,200}$`);
 
 // TEAMAI_USAGE_PATH / TEAMAI_KNOWN_SKILLS_PATH / TEAMAI_PUSHIGNORE_PATH were
 // module-load consts with no live consumers — the code uses runtime getters
@@ -2717,7 +2723,7 @@ export function applyToolRoots(
  * HOME-relative member root has nothing to say about.
  */
 export function scopedToolPaths(
-  teamConfig: TeamaiConfig,
+  teamConfig: Pick<TeamaiConfig, 'toolPaths'>,
   localConfig: { scope?: Scope; toolRoots?: Record<string, string> },
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
   if (localConfig.scope !== 'user') return teamConfig.toolPaths;
