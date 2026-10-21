@@ -31,7 +31,7 @@ import { CODEX_TOOL, mayDeleteSkillCopy, skillOrigin } from './resources/skills.
 import { installOf, locate, SHARED_AGENT_SKILLS_PATH, writableDir, writesOf } from './locate.js';
 import { describeToolHomeChange, recordToolHomes } from './tool-home-record.js';
 import { describeInvalidToolHomes, realHost } from './tool-home.js';
-import { releaseMovedSkillDirs, skillDirsOf, skillDirsUnmoved, type SessionToolHomes, type SkillDirs } from './resources/skill-dirs.js';
+import { releaseMovedSkillDirs, skillDirsInUse, skillDirsOf, skillDirsUnmoved, type SessionToolHomes, type SkillDirs } from './resources/skill-dirs.js';
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
@@ -2279,7 +2279,7 @@ async function pullForScope(
       syncedSessionToolHomes = previous?.sessionToolHomes;
     } else {
       ({ skillDirs: syncedSkillDirs, formerSkillDirs: syncedFormerSkillDirs, sessionToolHomes: syncedSessionToolHomes } = await releaseMovedSkillDirs({
-        previous, current: currentDirs, incomplete, ledger, localConfig, scopeLabel,
+        previous, current: currentDirs, incomplete, inUse: await skillDirsInUse(installOf(freshConfig, localConfig)), ledger, localConfig, scopeLabel,
       }));
     }
   }

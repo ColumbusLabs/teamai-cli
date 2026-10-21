@@ -338,6 +338,23 @@ describe('a pull and the homes the env moves', () => {
       expect(await fse.pathExists(deployIn(shared))).toBe(true);
     });
 
+    it('keeps the copies in a directory an installed tool still reads, though only the moved tool is selected', async () => {
+      const claude = path.join(home, '.claude');
+      await fse.ensureDir(claude); await fse.ensureDir(path.join(home, '.config', 'opencode'));
+      config.enabledAgents = ['hermes'];
+      vi.stubEnv('HERMES_HOME', claude);
+      await pull({});
+      expect(await fse.pathExists(deployIn(claude))).toBe(true);
+      await saveToolHomes({ hermes });
+      vi.stubEnv('HERMES_HOME', hermes);
+
+      await pull({});
+
+      expect(await fse.pathExists(deployIn(hermes))).toBe(true);
+      expect(await fse.pathExists(deployIn(claude))).toBe(true);
+      expect(await fse.pathExists(path.join(claude, 'skills', 'teamai', 'SKILL.md'))).toBe(true);
+    });
+
     describe('while a file of the member\'s holds a skill back in the moved tool', () => {
       beforeEach(async () => {
         config.enabledAgents = ['hermes', 'pi'];

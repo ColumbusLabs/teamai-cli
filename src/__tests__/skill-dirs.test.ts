@@ -2,7 +2,10 @@ import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { sameSkillDir, settleSkillDirs, type SkillDirRelease, type SkillDirs } from '../resources/skill-dirs.js';
+import type { Install } from '../locate.js';
+import { sameSkillDir, settleSkillDirs, skillDirsInUse, type SkillDirRelease, type SkillDirs } from '../resources/skill-dirs.js';
+import type { Host } from '../tool-home.js';
+import { TeamaiConfigSchema } from '../types.js';
 
 type Case = {
   readonly name: string;
@@ -11,6 +14,7 @@ type Case = {
   readonly current: SkillDirs;
   readonly incomplete?: readonly string[];
   readonly followSession?: readonly string[];
+  readonly inUse?: readonly string[];
   readonly record: SkillDirs;
   readonly former?: SkillDirs;
   readonly release: readonly SkillDirRelease[];
@@ -107,12 +111,27 @@ const CASES: readonly Case[] = [
     previous: { codex: ['/home/.codex/skills', '/home/.agents/skills'] }, current: { codex: ['/x/skills', '/home/.agents/skills'] },
     record: { codex: ['/x/skills', '/home/.agents/skills'] }, release: [{ dir: '/home/.codex/skills', tool: 'codex', currentDir: '/x/skills' }],
   },
+  {
+    name: 'keeps a directory an installed or selected tool reads, though no tool writes it now',
+    previous: { hermes: ['/home/.claude/skills'] }, current: { hermes: ['/b'] }, inUse: ['/home/.claude/skills'],
+    record: { hermes: ['/b'] }, release: [],
+  },
+  {
+    name: 'keeps the former directory of a tool once it takes skills elsewhere, while another tool reads it',
+    previous: {}, previousFormer: { hermes: ['/a'] }, current: { hermes: ['/b'] }, inUse: ['/a/'],
+    record: { hermes: ['/b'] }, release: [],
+  },
+  {
+    name: 'releases only the directories no tool in use reads',
+    previous: { hermes: ['/a', '/c'] }, current: { hermes: ['/b'] }, inUse: ['/c'],
+    record: { hermes: ['/b'] }, release: [{ dir: '/a', tool: 'hermes', currentDir: '/b' }],
+  },
 ];
 
 describe('settleSkillDirs', () => {
-  it.each(CASES)('$name', async ({ previous, previousFormer, current, incomplete = [], followSession = [], record, former = {}, release }) => {
+  it.each(CASES)('$name', async ({ previous, previousFormer, current, incomplete = [], followSession = [], inUse = [], record, former = {}, release }) => {
     const settled = await settleSkillDirs({
-      previous, former: previousFormer, current, incomplete: new Set(incomplete), followsSession: (tool) => followSession.includes(tool),
+      previous, former: previousFormer, current, incomplete: new Set(incomplete), inUse, followsSession: (tool) => followSession.includes(tool),
     });
 
     expect(settled).toEqual({ record, former, release });
@@ -121,7 +140,7 @@ describe('settleSkillDirs', () => {
   it('compares Windows directories in their own flavor', async () => {
     const settled = await settleSkillDirs({
       previous: { hermes: ['C:\\Users\\M\\hermes\\skills'] }, former: undefined, current: { hermes: ['c:\\users\\m\\hermes\\skills\\'] },
-      incomplete: new Set(), followsSession: () => false,
+      incomplete: new Set(), inUse: [], followsSession: () => false,
     });
 
     expect(settled.release).toEqual([]);
@@ -133,7 +152,7 @@ describe('settleSkillDirs', () => {
       const real = path.join(tmp, 'real'); const link = path.join(tmp, 'link');
       await fse.ensureDir(real); await fse.symlink(real, link, 'junction');
 
-      const settled = await settleSkillDirs({ previous: { hermes: [real] }, former: undefined, current: { hermes: [link] }, incomplete: new Set(), followsSession: () => false });
+      const settled = await settleSkillDirs({ previous: { hermes: [real] }, former: undefined, current: { hermes: [link] }, incomplete: new Set(), inUse: [], followsSession: () => false });
 
       expect(settled).toEqual({ record: { hermes: [link] }, former: {}, release: [] });
     } finally {
@@ -168,5 +187,25 @@ describe('sameSkillDir', () => {
     { name: 'a POSIX path in another case', a: '/Users/M/skills', b: '/users/m/skills', same: false },
   ])('$name: $same', async ({ a, b, same }) => {
     expect(await sameSkillDir(a, b)).toBe(same);
+  });
+});
+
+describe('skillDirsInUse', () => {
+  const { toolPaths } = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/x/t.git' });
+  const opencodeDirs = ['/home/m/.config/opencode/skills', '/home/m/.config/opencode/skills', '/home/m/.claude/skills'];
+  const host = (installed: boolean): Host => ({
+    platform: 'linux', path: path.posix, home: '/home/m', env: {}, toolHomes: { kind: 'missing' }, cwd: () => '/home/m',
+    exists: async (file) => installed && file === '/home/m/.config/opencode', readJson: async () => ({ kind: 'missing' }),
+  });
+
+  it.each([
+    { name: 'installed and selected', installed: true, enabledAgents: ['opencode'], dirs: opencodeDirs },
+    { name: 'installed, not selected', installed: true, enabledAgents: ['hermes'], dirs: opencodeDirs },
+    { name: 'selected, not installed', installed: false, enabledAgents: ['opencode'], dirs: opencodeDirs },
+    { name: 'neither installed nor selected', installed: false, enabledAgents: ['hermes'], dirs: [] },
+  ])('counts a tool $name', async ({ installed, enabledAgents, dirs }) => {
+    const install: Install = { toolPaths: { opencode: toolPaths.opencode }, agents: { enabledAgents }, toolRoots: {}, scope: 'user' };
+
+    expect(await skillDirsInUse(install, host(installed))).toEqual(dirs);
   });
 });

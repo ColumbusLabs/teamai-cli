@@ -1,7 +1,7 @@
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { isCliOwnedSkillName, ownedSkillFiles, prunedWhole, removeOwnedFiles, skillsGuardBase } from '../builtin-skills.js';
-import { locate, writableDir, writesOf, type Install } from '../locate.js';
+import { locate, writableDir, writesOf, type Install, type Location } from '../locate.js';
 import { realHost, toolHome, type Host } from '../tool-home.js';
 import { isToolId, skillsFollowSession } from '../tools.js';
 import { resolveBaseDir, type LocalConfig, type State } from '../types.js';
@@ -27,6 +27,20 @@ export async function skillDirsOf(install: Install, host: Host = realHost()): Pr
   const dirs: SkillDirs = {};
   for (const { tool, where } of located) if (writableDir(where) !== null) dirs[tool] = writesOf(where);
   return dirs;
+}
+
+/**
+ * Every directory a tool of `install` that is installed or selected reads
+ * skills from or may take teamai's skills in, whether or not teamai writes to
+ * it this pull: no old directory among them is released.
+ */
+export async function skillDirsInUse(install: Install, host: Host = realHost()): Promise<string[]> {
+  const located = await Promise.all(Object.keys(install.toolPaths).map((tool) => locate(tool, 'skills', install, host)));
+  return located.filter((where) => where.gates.some((gate) => gate.met)).flatMap(destinationsOf);
+}
+
+function destinationsOf(where: Location): string[] {
+  return [...writesOf(where), ...(where.reads === 'unknown' ? [] : where.reads.map((read) => read.path))];
 }
 
 export function sessionToolHomesOf(current: SkillDirs, host: Host = realHost()): SessionToolHomes {
@@ -98,18 +112,20 @@ export type SkillDirRelease = { readonly dir: string; readonly tool: string; rea
 /**
  * What a full pull records as `skillDirs` and `formerSkillDirs`, and which old
  * directories it releases, decided over every tool at once: a directory any
- * tool takes skills from now, or an incomplete tool keeps on record, is never
+ * tool takes skills from now, an incomplete tool keeps on record, or an
+ * installed or selected tool reads or may take skills in (`inUse`), is never
  * released. `incomplete` names the tools that did not take every skill or the
  * built-in stub this pull: they keep their previous directories on record. A
  * tool that takes skills nowhere now keeps its previous directories as
  * `former`, out of `record`; they are released once it takes skills elsewhere.
  * Directories are compared by `sameSkillDir`.
  */
-export async function settleSkillDirs({ previous, former, current, incomplete, followsSession }: {
+export async function settleSkillDirs({ previous, former, current, incomplete, inUse, followsSession }: {
   readonly previous: SkillDirs | undefined;
   readonly former: SkillDirs | undefined;
   readonly current: SkillDirs;
   readonly incomplete: ReadonlySet<string>;
+  readonly inUse: readonly string[];
   readonly followsSession: (tool: string) => boolean;
 }): Promise<{ readonly record: SkillDirs; readonly former: SkillDirs; readonly release: readonly SkillDirRelease[] }> {
   const before: SkillDirs = { ...former, ...previous };
@@ -120,7 +136,7 @@ export async function settleSkillDirs({ previous, former, current, incomplete, f
     next[tool] = [...earlier, ...dirs];
   }
   const nextFormer = Object.fromEntries(Object.entries(before).filter(([tool]) => !(tool in current)));
-  const live = [...Object.values(current).flat(), ...[...incomplete].flatMap((tool) => before[tool] ?? [])];
+  const live = [...Object.values(current).flat(), ...[...incomplete].flatMap((tool) => before[tool] ?? []), ...inUse];
   const release: SkillDirRelease[] = [];
   for (const [tool, dirs] of Object.entries(before)) {
     const currentDirs = current[tool];
@@ -144,17 +160,18 @@ export async function settleSkillDirs({ previous, former, current, incomplete, f
  * record's `skillDirs` unchanged, so the next full pull repeats the release;
  * a second run with nothing moved does nothing.
  */
-export async function releaseMovedSkillDirs({ previous, current, incomplete, ledger, localConfig, scopeLabel, host = realHost() }: {
+export async function releaseMovedSkillDirs({ previous, current, incomplete, inUse, ledger, localConfig, scopeLabel, host = realHost() }: {
   readonly previous: Pick<CheckoutRecord, 'skillDirs' | 'formerSkillDirs' | 'sessionToolHomes'> | undefined;
   readonly current: SkillDirs;
   readonly incomplete: ReadonlySet<string>;
+  readonly inUse: readonly string[];
   readonly ledger: DeliveryLedger;
   readonly localConfig: LocalConfig;
   readonly scopeLabel: string;
   readonly host?: Host;
 }): Promise<{ readonly skillDirs: SkillDirs; readonly formerSkillDirs: SkillDirs; readonly sessionToolHomes: SessionToolHomes }> {
   const { record, former, release } = await settleSkillDirs({
-    previous: previous?.skillDirs, former: previous?.formerSkillDirs, current, incomplete, followsSession: skillsFollowSession,
+    previous: previous?.skillDirs, former: previous?.formerSkillDirs, current, incomplete, inUse, followsSession: skillsFollowSession,
   });
   for (const { dir, tool, currentDir } of release) {
     let released = 0;
