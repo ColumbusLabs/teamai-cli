@@ -52,7 +52,7 @@ steps:
 
 `teamai review --branch <name>` 用同样的规则检查该分支。任一工作流文件无效时退出码为 1，不写入任何文件，也不运行工作流。下面这个文件过不了检查：
 
-```yaml (invalid)
+```yaml
 schemaVersion: v1alpha1
 name: deploy
 description: Ship the release candidate.

@@ -52,7 +52,7 @@ The run still ends `failed` unless it reaches an end. An `if` that does not pars
 
 `teamai review --branch <name>` checks that branch with the same rules. It exits 1 when any workflow file is invalid, writes nothing, and does not run the workflow. This file fails the check:
 
-```yaml (invalid)
+```yaml
 schemaVersion: v1alpha1
 name: deploy
 description: Ship the release candidate.
