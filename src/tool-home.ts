@@ -41,9 +41,10 @@ export type EnvToolHome = { readonly dir: string; readonly variable: string; rea
 /**
  * Where the host env moves `tool`'s home (the first of
  * `TOOLS[tool].home.moves` that applies), or null when none does. Blank
- * values count as unset, and so do relative ones, as the XDG spec has it:
- * resolved against one session's directory, they name another home in the
- * next. An explicit default profile moves the home to the default one.
+ * values count as unset. A tool's own variable resolves as the tool resolves
+ * it: `~` expanded, a relative value against the session's directory.
+ * `XDG_CONFIG_HOME` and `LOCALAPPDATA` count only when absolute, as the XDG
+ * spec has it. An explicit default profile moves the home to the default one.
  */
 export function envToolHome(tool: ToolId, host: Host = realHost()): EnvToolHome | null {
   const { home } = TOOLS[tool];
@@ -52,8 +53,8 @@ export function envToolHome(tool: ToolId, host: Host = realHost()): EnvToolHome 
   for (const move of home.moves.by) {
     switch (move.kind) {
       case 'env': {
-        const dir = absoluteEnv(host, move.name);
-        if (dir !== null) return { dir, variable: move.name, kind: move.kind };
+        const value = host.env[move.name]?.trim();
+        if (value) return { dir: absoluteOn(value, host), variable: move.name, kind: move.kind };
         break;
       }
       case 'xdg': {

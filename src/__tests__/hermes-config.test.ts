@@ -45,9 +45,11 @@ describe('getHermesHome', () => {
     expect(getHermesHome()).toBe(tmpDir);
   });
 
-  it('ignores a relative HERMES_HOME, which names another home from each directory', () => {
+  it('resolves HERMES_HOME to an absolute path when it is relative', () => {
     process.env.HERMES_HOME = 'relative/path';
-    expect(getHermesHome()).toBe(defaultHermesHome());
+    const result = getHermesHome();
+    expect(path.isAbsolute(result)).toBe(true);
+    expect(result).toBe(path.resolve('relative/path'));
   });
 
   it('returns the platform default when HERMES_HOME is not set', () => {

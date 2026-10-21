@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { nextToolHomes } from '../tool-home-record.js';
 import { envToolHome, type Host } from '../tool-home.js';
+import { isToolId, TOOLS } from '../tools.js';
 import { sameSkillDirs } from '../resources/skill-dirs.js';
 
 function linuxHost(env: Record<string, string>, existing: readonly string[] = ['/new/hermes', '/x/opencode', '/home/m/.openclaw']): Host {
@@ -98,10 +99,36 @@ describe('nextToolHomes on Windows', () => {
 });
 
 describe('envToolHome', () => {
-  it('ignores a relative value, which names another home from each directory', () => {
-    expect(envToolHome('opencode', linuxHost({ XDG_CONFIG_HOME: 'config' }))).toBeNull();
-    expect(envToolHome('hermes', linuxHost({ HERMES_HOME: 'relative/hermes' }))).toBeNull();
-    expect(envToolHome('hermes', linuxHost({ HERMES_HOME: '~/hermes' }))).toEqual({ dir: '/home/m/hermes', variable: 'HERMES_HOME', kind: 'env' });
+  const atWork = (env: Record<string, string>): Host => ({ ...linuxHost(env), cwd: () => '/home/m/work' });
+  const cases = Object.keys(TOOLS).filter(isToolId).flatMap((tool) => {
+    const { home } = TOOLS[tool];
+    return 'moves' in home ? home.moves.by.flatMap((move) => {
+      switch (move.kind) {
+        case 'env':
+          return [
+            { tool, env: { [move.name]: 'rel/home' }, dir: '/home/m/work/rel/home' },
+            { tool, env: { [move.name]: '~/home' }, dir: '/home/m/home' },
+            { tool, env: { [move.name]: '/abs/home' }, dir: '/abs/home' },
+            { tool, env: { [move.name]: ' ' }, dir: null },
+          ];
+        case 'xdg':
+          return [
+            { tool, env: { XDG_CONFIG_HOME: 'rel/config' }, dir: null },
+            { tool, env: { XDG_CONFIG_HOME: '/abs/config' }, dir: `/abs/config/${move.child}` },
+          ];
+        case 'win32-appdata':
+        case 'profile-suffix':
+          return [];
+        default: {
+          const unhandled: never = move;
+          return unhandled;
+        }
+      }
+    }) : [];
+  });
+
+  it.each(cases)('moves $tool with $env to $dir: a tool\'s own variable as the tool resolves it, XDG_CONFIG_HOME only when absolute', ({ tool, env, dir }) => {
+    expect(envToolHome(tool, atWork(env))?.dir ?? null).toBe(dir);
   });
 
   it('puts Hermes in the Windows default when LOCALAPPDATA is relative', () => {
