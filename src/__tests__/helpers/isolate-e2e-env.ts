@@ -44,7 +44,5 @@ afterAll(() => {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
-  // A hook's detached background pass can still hold the sandbox on Windows
-  // (EBUSY); rmSync's retries wait for it to exit.
-  fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(sandbox, { recursive: true, force: true });
 });

@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { findGitBashWindows } from '../../bundled-runtime.js';
@@ -25,7 +26,9 @@ function dispatched(tool: string): boolean {
  * dispatch arguments intact; not which field a tool reads from the reply.
  */
 describe.runIf(process.platform === 'win32')('hook shells on Windows: session-start', () => {
-  const input = JSON.stringify({ cwd: getUserHome(), session_id: 'hook-shells-windows' });
+  // The detached background pass starts in the payload's cwd, and Windows cannot
+  // remove a process's cwd: the temp dir outlives the sandbox HOME.
+  const input = JSON.stringify({ cwd: os.tmpdir(), session_id: 'hook-shells-windows' });
 
   it('Git Bash runs the bash form, as Claude Code does', () => {
     const gitBash = findGitBashWindows();
