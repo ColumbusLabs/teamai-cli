@@ -428,14 +428,17 @@ describe('materializeRef — branch materialization from git', () => {
       execFileSync('git', ['-C', gitRepo, 'config', 'user.email', 'test@example.com']);
       await fse.outputFile(path.join(gitRepo, 'prompts', 'target.md'), '# target prompt\n');
       await fse.symlink('target.md', path.join(gitRepo, 'prompts', 'link.md'));
+      await fse.outputFile(path.join(gitRepo, 'prompts', 'target.md '), '# spaced target\n');
+      await fse.symlink('target.md ', path.join(gitRepo, 'prompts', 'spaced.md'));
       execFileSync('git', ['-C', gitRepo, 'add', '.']);
       execFileSync('git', ['-C', gitRepo, 'commit', '-q', '-m', 'add symlink']);
 
       const count = await materializeRef(gitRepo, 'HEAD', destDir);
-      expect(count).toBe(2);
+      expect(count).toBe(4);
       const linkStat = await fse.lstat(path.join(destDir, 'prompts', 'link.md'));
       expect(linkStat.isSymbolicLink()).toBe(true);
       expect(await fse.readlink(path.join(destDir, 'prompts', 'link.md'))).toBe('target.md');
+      expect(await fse.readlink(path.join(destDir, 'prompts', 'spaced.md'))).toBe('target.md ');
     } finally {
       await fse.remove(gitRepo);
       await fse.remove(destDir);

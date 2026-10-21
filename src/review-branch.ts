@@ -510,7 +510,7 @@ export async function materializeRef(repoPath: string, ref: string, destDir: str
       const dest = path.join(destDir, ...entry.path.split('/'));
       await ensureDir(path.dirname(dest));
       if (entry.mode === '120000') {
-        const target = content.toString('utf8').trim();
+        const target = content.toString('utf8');
         await fse.symlink(target, dest);
       } else {
         await writeFile(dest, content);
