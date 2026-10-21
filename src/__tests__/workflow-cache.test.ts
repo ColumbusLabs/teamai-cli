@@ -1291,7 +1291,7 @@ steps:
     const result = await syncWorkflowDefinitions(config);
 
     expect(result.invalid.map(formatDiagnostic)).toEqual([
-      'workflows/review.yaml:12: field "steps[1].prompt_file": step "review" prompt_file template {{ length(steps.build.result) }}: "steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes or steps.<id>.results',
+      'workflows/review.yaml:12: field "steps[1].prompt_file": step "review" prompt_file template {{ length(steps.build.result) }}: "steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results or steps.<id>.branches',
     ]);
     expect(result.invalid.map((diagnostic) => diagnostic.code)).toEqual(['bad_template']);
     expect(result.unrunnable).toEqual(['workflows/review.yaml']);

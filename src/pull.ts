@@ -2958,7 +2958,7 @@ export async function pull(
   if (!options.userScopeOnly) {
     try {
       projectConfig = await detectProjectConfig(
-        undefined,
+        options.cwd,
         (configPath, error) => { unreadable.push(`${configPath}: ${error}`); },
         { dryRun: options.dryRun },
       );
