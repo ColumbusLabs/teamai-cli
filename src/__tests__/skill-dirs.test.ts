@@ -1,6 +1,8 @@
+import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { settleSkillDirs, type SkillDirRelease, type SkillDirs } from '../resources/skill-dirs.js';
+import fse from 'fs-extra';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { sameSkillDir, settleSkillDirs, type SkillDirRelease, type SkillDirs } from '../resources/skill-dirs.js';
 
 type Case = {
   readonly name: string;
@@ -9,7 +11,6 @@ type Case = {
   readonly current: SkillDirs;
   readonly incomplete?: readonly string[];
   readonly followSession?: readonly string[];
-  readonly real?: Readonly<Record<string, string>>;
   readonly record: SkillDirs;
   readonly former?: SkillDirs;
   readonly release: readonly SkillDirRelease[];
@@ -106,29 +107,66 @@ const CASES: readonly Case[] = [
     previous: { codex: ['/home/.codex/skills', '/home/.agents/skills'] }, current: { codex: ['/x/skills', '/home/.agents/skills'] },
     record: { codex: ['/x/skills', '/home/.agents/skills'] }, release: [{ dir: '/home/.codex/skills', tool: 'codex', currentDir: '/x/skills' }],
   },
-  {
-    name: 'releases nothing when the tool takes skills from its old directory through a link',
-    previous: { hermes: ['/real'] }, current: { hermes: ['/link'] }, real: { '/real': '/real', '/link': '/real' },
-    record: { hermes: ['/link'] }, release: [],
-  },
 ];
 
 describe('settleSkillDirs', () => {
-  it.each(CASES)('$name', ({ previous, previousFormer, current, incomplete = [], followSession = [], real = {}, record, former = {}, release }) => {
-    const settled = settleSkillDirs({
-      previous, former: previousFormer, current, incomplete: new Set(incomplete), realDirs: new Map(Object.entries(real)), followsSession: (tool) => followSession.includes(tool),
-      host: { platform: 'linux', path: path.posix },
+  it.each(CASES)('$name', async ({ previous, previousFormer, current, incomplete = [], followSession = [], record, former = {}, release }) => {
+    const settled = await settleSkillDirs({
+      previous, former: previousFormer, current, incomplete: new Set(incomplete), followsSession: (tool) => followSession.includes(tool),
     });
 
     expect(settled).toEqual({ record, former, release });
   });
 
-  it('compares directories in the host\'s path flavor', () => {
-    const settled = settleSkillDirs({
+  it('compares Windows directories in their own flavor', async () => {
+    const settled = await settleSkillDirs({
       previous: { hermes: ['C:\\Users\\M\\hermes\\skills'] }, former: undefined, current: { hermes: ['c:\\users\\m\\hermes\\skills\\'] },
-      incomplete: new Set(), realDirs: new Map(), followsSession: () => false, host: { platform: 'win32', path: path.win32 },
+      incomplete: new Set(), followsSession: () => false,
     });
 
     expect(settled.release).toEqual([]);
+  });
+
+  it('releases nothing when the tool takes skills from its old directory through a link', async () => {
+    const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-settle-'));
+    try {
+      const real = path.join(tmp, 'real'); const link = path.join(tmp, 'link');
+      await fse.ensureDir(real); await fse.symlink(real, link, 'junction');
+
+      const settled = await settleSkillDirs({ previous: { hermes: [real] }, former: undefined, current: { hermes: [link] }, incomplete: new Set(), followsSession: () => false });
+
+      expect(settled).toEqual({ record: { hermes: [link] }, former: {}, release: [] });
+    } finally {
+      await fse.remove(tmp);
+    }
+  });
+});
+
+describe('sameSkillDir', () => {
+  let tmp: string;
+  beforeAll(async () => {
+    tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-same-dir-'));
+    await fse.ensureDir(path.join(tmp, 'real'));
+    await fse.ensureDir(path.join(tmp, 'other'));
+    await fse.symlink(path.join(tmp, 'real'), path.join(tmp, 'link'), 'junction');
+  });
+  afterAll(async () => { await fse.remove(tmp); });
+
+  it.each([
+    { name: 'the same existing path', a: 'real', b: 'real', same: true },
+    { name: 'a link and the directory it points to', a: 'link', b: 'real', same: true },
+    { name: 'a trailing separator', a: 'real', b: `real${path.sep}`, same: true },
+    { name: 'a path that does not exist yet, as written', a: 'missing', b: 'missing', same: true },
+    { name: 'a missing path and an existing one', a: 'missing', b: 'real', same: false },
+    { name: 'two existing directories', a: 'real', b: 'other', same: false },
+  ])('$name: $same', async ({ a, b, same }) => {
+    expect(await sameSkillDir(path.join(tmp, a), path.join(tmp, b))).toBe(same);
+  });
+
+  it.each([
+    { name: 'a Windows path in either case and separator', a: 'C:\\Users\\M\\skills', b: 'c:/users/m/skills/', same: true },
+    { name: 'a POSIX path in another case', a: '/Users/M/skills', b: '/users/m/skills', same: false },
+  ])('$name: $same', async ({ a, b, same }) => {
+    expect(await sameSkillDir(a, b)).toBe(same);
   });
 });

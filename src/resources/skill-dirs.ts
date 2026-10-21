@@ -5,6 +5,7 @@ import { locate, writableDir, writesOf, type Install } from '../locate.js';
 import { realHost, toolHome, type Host } from '../tool-home.js';
 import { isToolId, skillsFollowSession } from '../tools.js';
 import { resolveBaseDir, type LocalConfig, type State } from '../types.js';
+import { samePath } from '../utils/agent-path.js';
 import { listDirs, pathExists, remove } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { warnOnce } from '../utils/warn-once.js';
@@ -37,35 +38,59 @@ export function sessionToolHomesOf(current: SkillDirs, host: Host = realHost()):
  * them. A tool whose skills follow the session is compared by its home, as
  * each session may name another directory under it.
  */
-export function skillDirsUnmoved(
+export async function skillDirsUnmoved(
   recorded: { readonly skillDirs: SkillDirs; readonly sessionToolHomes?: SessionToolHomes },
   current: SkillDirs,
   host: Host = realHost(),
-): boolean {
+): Promise<boolean> {
   const asDirs = (homes: SessionToolHomes): SkillDirs => Object.fromEntries(Object.entries(homes).map(([tool, dir]) => [tool, [dir]]));
-  return sameSkillDirs(recorded.skillDirs, withoutSessionTools(current, skillsFollowSession), host)
-    && sameSkillDirs(asDirs(recorded.sessionToolHomes ?? {}), asDirs(sessionToolHomesOf(current, host)), host);
+  return await sameSkillDirs(recorded.skillDirs, withoutSessionTools(current, skillsFollowSession))
+    && await sameSkillDirs(asDirs(recorded.sessionToolHomes ?? {}), asDirs(sessionToolHomesOf(current, host)));
 }
 
 function withoutSessionTools(dirs: SkillDirs, followsSession: (tool: string) => boolean): SkillDirs {
   return Object.fromEntries(Object.entries(dirs).filter(([tool]) => !followsSession(tool)));
 }
 
-/** Whether two answers name the same directories for the same tools, compared as paths on `host`. */
-export function sameSkillDirs(recorded: SkillDirs, current: SkillDirs, host: Pick<Host, 'path' | 'platform'> = realHost()): boolean {
-  const tools = Object.keys(current);
-  if (Object.keys(recorded).length !== tools.length) return false;
-  return tools.every((tool) => {
-    const before = recorded[tool];
-    if (before === undefined) return false;
-    const after = new Set(current[tool].map((dir) => comparable(dir, host)));
-    return before.length === after.size && before.every((dir) => after.has(comparable(dir, host)));
-  });
+/**
+ * Whether `a` and `b` are one skills directory: the same path (`samePath`)
+ * once each is resolved through its links. A directory that does not exist
+ * yet is compared as written. Every comparison of the skills directories a
+ * pull recorded goes through here: the pull's fast path, the release of old
+ * directories, and doctor.
+ */
+export async function sameSkillDir(a: string, b: string): Promise<boolean> {
+  const [ra, rb] = await Promise.all([realOrSelf(a), realOrSelf(b)]);
+  return samePath(ra, rb);
 }
 
-function comparable(dir: string, host: Pick<Host, 'path' | 'platform'>): string {
-  const resolved = host.path.resolve(dir);
-  return host.platform === 'win32' ? resolved.toLowerCase() : resolved;
+async function realOrSelf(dir: string): Promise<string> {
+  try {
+    return await realpath(dir);
+  } catch (e) {
+    if (typeof e === 'object' && e !== null && 'code' in e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return dir;
+    throw e;
+  }
+}
+
+/** Whether `dir` is one of `dirs` (`sameSkillDir`). */
+export async function amongSkillDirs(dir: string, dirs: readonly string[]): Promise<boolean> {
+  for (const other of dirs) if (await sameSkillDir(dir, other)) return true;
+  return false;
+}
+
+/** Whether two answers name the same directories for the same tools (`sameSkillDir`). */
+export async function sameSkillDirs(recorded: SkillDirs, current: SkillDirs): Promise<boolean> {
+  const tools = Object.keys(current);
+  if (Object.keys(recorded).length !== tools.length) return false;
+  for (const tool of tools) {
+    const before = recorded[tool];
+    if (before === undefined) return false;
+    const after = current[tool];
+    for (const dir of before) if (!await amongSkillDirs(dir, after)) return false;
+    for (const dir of after) if (!await amongSkillDirs(dir, before)) return false;
+  }
+  return true;
 }
 
 export type SkillDirRelease = { readonly dir: string; readonly tool: string; readonly currentDir: string };
@@ -78,38 +103,33 @@ export type SkillDirRelease = { readonly dir: string; readonly tool: string; rea
  * built-in stub this pull: they keep their previous directories on record. A
  * tool that takes skills nowhere now keeps its previous directories as
  * `former`, out of `record`; they are released once it takes skills elsewhere.
- * Directories are compared by their `realDirs` entry where they have one, so a
- * link to a directory is that directory.
+ * Directories are compared by `sameSkillDir`.
  */
-export function settleSkillDirs({ previous, former, current, incomplete, realDirs, followsSession, host }: {
+export async function settleSkillDirs({ previous, former, current, incomplete, followsSession }: {
   readonly previous: SkillDirs | undefined;
   readonly former: SkillDirs | undefined;
   readonly current: SkillDirs;
   readonly incomplete: ReadonlySet<string>;
-  readonly realDirs: ReadonlyMap<string, string>;
   readonly followsSession: (tool: string) => boolean;
-  readonly host: Pick<Host, 'path' | 'platform'>;
-}): { readonly record: SkillDirs; readonly former: SkillDirs; readonly release: readonly SkillDirRelease[] } {
-  const keyOf = (dir: string): string => comparable(realDirs.get(dir) ?? dir, host);
+}): Promise<{ readonly record: SkillDirs; readonly former: SkillDirs; readonly release: readonly SkillDirRelease[] }> {
   const before: SkillDirs = { ...former, ...previous };
   const next: SkillDirs = {};
   for (const [tool, dirs] of Object.entries(current)) {
-    const writes = new Set(dirs.map(keyOf));
-    const earlier = incomplete.has(tool) ? (before[tool] ?? []).filter((dir) => !writes.has(keyOf(dir))) : [];
+    const earlier: string[] = [];
+    if (incomplete.has(tool)) for (const dir of before[tool] ?? []) if (!await amongSkillDirs(dir, dirs)) earlier.push(dir);
     next[tool] = [...earlier, ...dirs];
   }
   const nextFormer = Object.fromEntries(Object.entries(before).filter(([tool]) => !(tool in current)));
-  const live = new Set([...Object.values(current), ...[...incomplete].map((tool) => before[tool] ?? [])].flat().map(keyOf));
-  const release = new Map<string, SkillDirRelease>();
+  const live = [...Object.values(current).flat(), ...[...incomplete].flatMap((tool) => before[tool] ?? [])];
+  const release: SkillDirRelease[] = [];
   for (const [tool, dirs] of Object.entries(before)) {
     const currentDirs = current[tool];
     if (currentDirs === undefined || incomplete.has(tool) || followsSession(tool)) continue;
     for (const dir of dirs) {
-      const key = keyOf(dir);
-      if (!live.has(key) && !release.has(key)) release.set(key, { dir, tool, currentDir: currentDirs[0] });
+      if (!await amongSkillDirs(dir, [...live, ...release.map((released) => released.dir)])) release.push({ dir, tool, currentDir: currentDirs[0] });
     }
   }
-  return { record: withoutSessionTools(next, followsSession), former: withoutSessionTools(nextFormer, followsSession), release: [...release.values()] };
+  return { record: withoutSessionTools(next, followsSession), former: withoutSessionTools(nextFormer, followsSession), release };
 }
 
 /**
@@ -133,9 +153,8 @@ export async function releaseMovedSkillDirs({ previous, current, incomplete, led
   readonly scopeLabel: string;
   readonly host?: Host;
 }): Promise<{ readonly skillDirs: SkillDirs; readonly formerSkillDirs: SkillDirs; readonly sessionToolHomes: SessionToolHomes }> {
-  const realDirs = await realDirsOf([...Object.values(previous?.skillDirs ?? {}), ...Object.values(previous?.formerSkillDirs ?? {}), ...Object.values(current)].flat());
-  const { record, former, release } = settleSkillDirs({
-    previous: previous?.skillDirs, former: previous?.formerSkillDirs, current, incomplete, realDirs, followsSession: skillsFollowSession, host,
+  const { record, former, release } = await settleSkillDirs({
+    previous: previous?.skillDirs, former: previous?.formerSkillDirs, current, incomplete, followsSession: skillsFollowSession,
   });
   for (const { dir, tool, currentDir } of release) {
     let released = 0;
@@ -175,17 +194,4 @@ export async function releaseMovedSkillDirs({ previous, current, incomplete, led
     sessionToolHomes[tool] = incomplete.has(tool) ? (previous?.sessionToolHomes?.[tool] ?? home) : home;
   }
   return { skillDirs: record, formerSkillDirs: former, sessionToolHomes };
-}
-
-/** The real path of each of `dirs` that exists. */
-async function realDirsOf(dirs: readonly string[]): Promise<ReadonlyMap<string, string>> {
-  const real = new Map<string, string>();
-  await Promise.all([...new Set(dirs)].map(async (dir) => {
-    try {
-      real.set(dir, await realpath(dir));
-    } catch (e) {
-      if (!(typeof e === 'object' && e !== null && 'code' in e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'))) throw e;
-    }
-  }));
-  return real;
 }

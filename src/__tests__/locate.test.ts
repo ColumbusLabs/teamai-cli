@@ -143,11 +143,11 @@ describe('a skills directory outside locate', () => {
 });
 
 describe('skills directories compared on a host', () => {
-  it('compare in the host\'s path flavor, wherever the check runs', () => {
+  it('compare in the path\'s own flavor, wherever the check runs', async () => {
     const recorded = { hermes: ['C:\\Users\\M\\AppData\\Local\\hermes\\skills'] };
     const current = { hermes: ['c:\\users\\m\\appdata\\local\\hermes\\skills\\'] };
 
-    expect(sameSkillDirs(recorded, current, { platform: 'win32', path: path.win32 })).toBe(true);
-    expect(sameSkillDirs({ hermes: ['/Users/M/hermes/skills'] }, { hermes: ['/users/m/hermes/skills'] }, { platform: 'linux', path: path.posix })).toBe(false);
+    expect(await sameSkillDirs(recorded, current)).toBe(true);
+    expect(await sameSkillDirs({ hermes: ['/Users/M/hermes/skills'] }, { hermes: ['/users/m/hermes/skills'] })).toBe(false);
   });
 });
