@@ -59,10 +59,15 @@ function config(): LocalConfig {
   };
 }
 
+/** The captures come from POSIX shells, where a Windows path is spelled with forward slashes. */
+function posixPath(p: string): string {
+  return p.replaceAll(path.sep, '/');
+}
+
 function fixture(name: string): Record<string, unknown> {
   const text = fs.readFileSync(path.join(FIXTURES, `${name}.json`), 'utf-8')
-    .replaceAll('${HOME}', home)
-    .replaceAll('${CWD}', cwd);
+    .replaceAll('${HOME}', posixPath(home))
+    .replaceAll('${CWD}', posixPath(cwd));
   const payload: unknown = JSON.parse(text);
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) throw new Error(`${name} is not an object`);
   return { ...payload };
