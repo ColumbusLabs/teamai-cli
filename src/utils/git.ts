@@ -1481,6 +1481,31 @@ export async function isPastVersionOf(repoPath: string, absFile: string, relPath
 }
 
 /** The files under `dir` at `rev`, relative to the repo root; empty when either is unknown. */
+export interface GitTreeEntry {
+  path: string;
+  mode: string;
+}
+
+/** The files and modes under `dir` at `rev`, relative to the repo root; empty when either is unknown. */
+export async function listTreeAtRev(repoPath: string, rev: string, dir: string): Promise<GitTreeEntry[]> {
+  try {
+    const raw = await createGit(repoPath).raw(['ls-tree', '-r', '-z', rev, '--', dir]);
+    const entries: GitTreeEntry[] = [];
+    for (const line of raw.split('\0')) {
+      if (!line) continue;
+      const tabIndex = line.indexOf('\t');
+      if (tabIndex === -1) continue;
+      const meta = line.slice(0, tabIndex);
+      const filePath = line.slice(tabIndex + 1);
+      const mode = meta.split(' ')[0] ?? '';
+      entries.push({ path: filePath, mode });
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
 export async function listFilesAtRev(repoPath: string, rev: string, dir: string): Promise<string[]> {
   try {
     return (await createGit(repoPath).raw(['ls-tree', '-r', '-z', '--name-only', rev, '--', dir])).split('\0').filter(Boolean);

@@ -52,6 +52,30 @@ steps:
 
 `teamai pull` 和 `teamai push` 会检查每个文件，并按被运行工作流的可运行版本检查运行它的步骤。`prompt_file` 必须是团队仓库 `prompts/` 下的普通文件，不能是符号链接。校验时会把文件内容和工作流一起缓存，因此已经开始的运行会继续使用对应修订版，即使源文件后来被修改或删除。新修订版无效时，仍保留上一份有效缓存，前提是这份缓存仍与它运行的工作流相符。这一版 teamai 不认识的字段除外：该工作流没有可运行版本，需要先更新 teamai。
 
+`teamai review --branch <name>` 用同样的规则检查该分支。任一工作流文件无效时退出码为 1，不写入任何文件，也不运行工作流。下面这个文件过不了检查：
+
+```yaml
+schemaVersion: v1alpha1
+name: deploy
+description: Ship the release candidate.
+steps:
+  - id: release
+    needs: [biuld]
+    command: echo release
+```
+
+```text
+teamai review --branch feature/deploy
+[review] branch feature/deploy: 1 fail, 0 warn, 0 info
+  ✖ [workflows] workflows/deploy.yaml:6: field "steps[0].needs": step "release" needs "biuld", which is not a step in this workflow
+```
+
+CI 里用一步拦住这个分支：
+
+```yaml
+- run: teamai review --branch feature/deploy
+```
+
 工作流可以声明具名的 `ends`，每个结局是 `succeeded` 或 `failed`，例如 `ends: { dropped: succeeded, stuck: failed }`。带 `end: <name>` 的步骤成功后，工作流以该结局结束。只有 `id`、`needs`、`if` 和 `end` 的步骤不运行任何内容：它的依赖完成时就结束工作流。到达结局后，所有尚未运行的步骤都会被跳过，运行结果取该结局声明的结果，即使有其他步骤失败。此时 `done` 会带上结局：`{"done":{"run":"<run>","outcome":"succeeded","end":"dropped"}}`。`end` 不在 `ends` 中、有 `end` 但没有 `ends`、声明的结局没有步骤使用，或某个步骤依赖只用于结束工作流的步骤，都会让该文件无效。
 
 工作流可以用和 `output` 相同的简写声明 `inputs`，例如 `inputs: { issue: number, title: string }`。每个输入都必填。用 JSON 对象传入：`teamai workflow start fix --driver local --inputs '{"issue":42,"title":"Crash"}'`。缺少、多出或类型不对的输入会返回 `invalid_inputs` 并指出字段，且不会创建运行。`if` 可以读取 `inputs.<name>`。
