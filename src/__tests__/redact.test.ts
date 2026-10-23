@@ -80,6 +80,26 @@ describe('redact', () => {
       expect(redact('glpat-ABCDEFGHIJKLMNOPQRST')).toContain('<REDACTED:provider>');
       expect(redact('hf_ABCDEFGHIJKLMNOPQRSTUVWX')).toContain('<REDACTED:provider>');
     });
+
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV';
+    const pem =
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nsecretbody\n-----END RSA PRIVATE KEY-----';
+    const jwtPrefixes = 'eyJ-'.repeat(25_000);
+    const unendedPems = '-----BEGIN PRIVATE KEY-----\n'.repeat(40_000);
+
+    it.each([
+      ['JWT prefixes with no dot', `${jwtPrefixes} ${jwt}`, `${jwtPrefixes} <REDACTED:jwt>`],
+      ['PEM headers with no END', `${pem}\n${unendedPems}`, `<REDACTED:pem>\n${unendedPems}`],
+    ])('stays fast on %s and still masks a real one', (_shape, text, expected) => {
+      const start = performance.now();
+      const out = redact(text);
+      const elapsed = performance.now() - start;
+
+      expect(out).toBe(expected);
+      // Linear work here is a few milliseconds; rescanning to the end from every prefix takes seconds.
+      expect(elapsed).toBeLessThan(500);
+    }, 30_000);
   });
 
   describe('layer 2: structural patterns keep surrounding context', () => {
@@ -104,6 +124,31 @@ describe('redact', () => {
       const expected = dsn.replace(pw, '<REDACTED:conn>');
       expect(redact(dsn)).toBe(expected);
     });
+
+    const pw = ['hun', 'ter2', 'pass'].join('');
+    const dsn = ['postgres://user', pw].join(':') + '@' + 'db.example.com';
+
+    it('masks a connection string whose scheme follows digits or punctuation', () => {
+      for (const lead of ['', ' ', '1', '+', '9.x-']) {
+        const text = `${lead}${dsn}`;
+        expect(redact(text)).toBe(text.replace(pw, '<REDACTED:conn>'));
+      }
+    });
+
+    it.each([
+      ['a letter run', 'x'.repeat(100_000)],
+      ['an alphanumeric run', 'a1'.repeat(50_000)],
+    ])('stays fast on %s and still masks a connection string after it', (_shape, token) => {
+      const text = `${token} ${dsn}`;
+
+      const start = performance.now();
+      const out = redact(text);
+      const elapsed = performance.now() - start;
+
+      expect(out).toBe(text.replace(pw, '<REDACTED:conn>'));
+      // Linear work here is a few milliseconds; a per-offset rescan of the token takes seconds.
+      expect(elapsed).toBeLessThan(500);
+    }, 30_000);
   });
 
   it('can disable the pattern layer', () => {
