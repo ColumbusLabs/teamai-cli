@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentObservationSchema } from '../agent-observation.js';
 import type { DriverIdentity, StepLease, TokenUsage, WorkflowFailure } from './types.js';
+import type { WorkspaceMode } from './workspace.js';
 
 const TokenUsageSchema: z.ZodType<TokenUsage> = z.object({
   input: z.number().optional(),
@@ -13,7 +14,17 @@ const FailureSchema: z.ZodType<WorkflowFailure> = z.object({ code: z.string(), m
 /** Stored driver identity, with per-request capabilities omitted. */
 export const DriverSchema: z.ZodType<DriverIdentity> = z.object({ kind: z.string(), machine: z.string(), workspace: z.string() });
 
-const LeaseSchema: z.ZodType<StepLease> = z.object({ attempt: z.string(), revision: z.number(), driver: DriverSchema });
+const SessionRefSchema = z.object({ tool: z.string().min(1), id: z.string().min(1) });
+
+/** One entry of `RunState.sessionContinuations`: the session a step resumed, and the session it continued it in. */
+export const SessionContinuationSchema = z.object({ from: SessionRefSchema, to: SessionRefSchema });
+export type SessionContinuation = z.infer<typeof SessionContinuationSchema>;
+
+const LeaseSessionSchema = SessionRefSchema.extend({ earlier: z.array(SessionRefSchema).optional() });
+
+const LeaseSchema: z.ZodType<StepLease> = z.object({
+  attempt: z.string(), revision: z.number(), driver: DriverSchema, session: LeaseSessionSchema.optional(),
+});
 
 const ChangesSchema = z.object({
   branch: z.string(),
@@ -128,21 +139,49 @@ const settledFields = {
  * `waiting`: a ready HITL request with no answer, so nothing is leased yet.
  * `running`: a workflow step whose child steps are in the run and not all settled.
  */
+const PendingSchema = StepBaseSchema.extend({ status: z.literal('pending') });
+const WaitingSchema = StepBaseSchema.extend({ status: z.literal('waiting') });
+const RunningSchema = StepBaseSchema.extend({ status: z.literal('running') });
+const SucceededSchema = StepBaseSchema.extend({
+  status: z.literal('succeeded'), outcome: z.literal('success').default('success'), ...settledFields, loopFinal: z.boolean().optional(),
+});
+const FailedSchema = StepBaseSchema.extend({ status: z.literal('failed'), outcome: z.literal('failed').default('failed'), ...settledFields, failure: FailureSchema.optional() });
+const SkippedSchema = StepBaseSchema.extend({ status: z.literal('skipped'), settledAt: z.number().int().default(0) });
+const CancelledSchema = StepBaseSchema.extend({ status: z.literal('cancelled'), settledAt: z.number().int().default(0), attempt: z.string().optional(), failure: FailureSchema });
+
 export const StepStateSchema = z.discriminatedUnion('status', [
-  StepBaseSchema.extend({ status: z.literal('pending') }),
-  StepBaseSchema.extend({ status: z.literal('waiting') }),
+  PendingSchema,
+  WaitingSchema,
   StepBaseSchema.extend({ status: z.literal('leased'), attempt: z.string(), lease: LeaseSchema }),
-  StepBaseSchema.extend({ status: z.literal('running') }),
-  StepBaseSchema.extend({
-    status: z.literal('succeeded'), outcome: z.literal('success').default('success'), ...settledFields, loopFinal: z.boolean().optional(),
-  }),
-  StepBaseSchema.extend({ status: z.literal('failed'), outcome: z.literal('failed').default('failed'), ...settledFields, failure: FailureSchema.optional() }),
-  StepBaseSchema.extend({ status: z.literal('skipped'), settledAt: z.number().int().default(0) }),
-  StepBaseSchema.extend({ status: z.literal('cancelled'), settledAt: z.number().int().default(0), attempt: z.string().optional(), failure: FailureSchema }),
+  RunningSchema,
+  SucceededSchema,
+  FailedSchema,
+  SkippedSchema,
+  CancelledSchema,
 ]);
 type ReadonlyId<T> = T extends unknown ? Omit<T, 'id'> & { readonly id: string } : never;
 /** A step instance's `id` is read-only: the engine indexes instances by it, and every transition keeps it. */
 export type StepState = ReadonlyId<z.infer<typeof StepStateSchema>>;
+
+/**
+ * A step as a run handed to another machine carries it. A leased step keeps its attempt and the kind of driver that
+ * holds it, not that driver's machine or workspace, which mean nothing on the machine that takes the run.
+ */
+export const StepCheckpointSchema = z.discriminatedUnion('status', [
+  PendingSchema,
+  WaitingSchema,
+  StepBaseSchema.extend({
+    status: z.literal('leased'), attempt: z.string(), lease: z.object({ attempt: z.string(), revision: z.number(), driverKind: z.string() }),
+  }),
+  RunningSchema,
+  SucceededSchema,
+  FailedSchema,
+  SkippedSchema,
+  CancelledSchema,
+]);
+export type StepCheckpoint = ReadonlyId<z.infer<typeof StepCheckpointSchema>>;
+/** A lease another machine held when the run was handed over. */
+export type HandedLease = Extract<StepCheckpoint, { status: 'leased' }>;
 type StepStatus = StepState['status'];
 
 type StepIn<S extends StepStatus> = Extract<StepState, { status: S }>;
@@ -164,7 +203,7 @@ export const VISIBLE_OUTCOMES = { succeeded: 'success', failed: 'failed', skippe
  * Replaces a step's fields in place with `next`, keeping the fields every step has, and returns it as its new variant.
  * In place, because `run.steps` holds the instance and the engine finds positions in it by identity.
  */
-function become<T extends StepState>(state: StepState, next: Omit<T, keyof StepBase>): T {
+function become<T extends StepState>(state: StepState | HandedLease, next: Omit<T, keyof StepBase>): T {
   const fields = state as Record<string, unknown>;
   const kept = Object.fromEntries(BASE_KEYS.filter((key) => fields[key] !== undefined).map((key) => [key, fields[key]]));
   for (const key of Object.keys(fields)) delete fields[key];
@@ -196,8 +235,34 @@ export function skip(state: StepState, settledAt: number): SkippedStep {
 }
 
 /** A released lease returns the step to `pending` with nothing from the attempt. */
-export function release(state: LeasedStep): PendingStep {
+export function release(state: LeasedStep | HandedLease): PendingStep {
   return become<PendingStep>(state, { status: 'pending' });
+}
+
+export type UnleasedStep = Exclude<StepState, { status: 'leased' }>;
+
+/**
+ * A step of a run this machine takes over, which runs in workspace `mode`. A lease another machine held is released; one
+ * that opened a copy of its own moves to its next pass, so it gets a new branch rather than the one that machine may have
+ * pushed part of its work to. Every other step stays as it was.
+ */
+export function takeOver(step: StepCheckpoint, mode: WorkspaceMode | undefined): UnleasedStep {
+  switch (step.status) {
+    case 'leased':
+      return mode === 'new' ? repend(release(step)) : release(step);
+    case 'pending':
+    case 'waiting':
+    case 'running':
+    case 'succeeded':
+    case 'failed':
+    case 'skipped':
+    case 'cancelled':
+      return step;
+    default: {
+      const unknown: never = step;
+      return unknown;
+    }
+  }
 }
 
 export function lease(state: StepState, held: StepLease): LeasedStep {

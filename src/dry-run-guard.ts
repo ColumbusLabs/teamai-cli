@@ -133,6 +133,7 @@ export const NO_DRY_RUN_PREVIEW: Readonly<Record<string, string>> = {
   'workflow retry': 'reopens steps and writes a new revision',
   'workflow cancel': 'cancels steps or the run',
   'workflow resume': 'runs the local driver and writes the run',
+  'workflow publish': 'writes the run to teamai-reports',
 };
 
 /** The refusal printed when a command has no `--dry-run` preview. */

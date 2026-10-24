@@ -227,7 +227,7 @@ Generated: do not edit by hand. Regenerate with
     - `--auto-approve` — With --driver local, automatically answer optional approve HITL requests and choose defaults in this process
     - `--inputs <json>` — Values for the inputs the workflow declares, as a JSON object, for example {"issue":42}. Every declared input is required.
   - `teamai workflow next <run>` — Get a lease, hitl, wait, or done JSON envelope. Show hitl.message and hitl.respond to a person, who replaces <option> with a choice.
-    - `--json <payload>` — Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can.hitl, true when a person can answer HITL requests and work interactively. Send driver.can.hitl on every next request, including busy polls. Every answer lists in cancelled the running attempts whose tools the driver must stop.
+    - `--json <payload>` — Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can.hitl, true when a person can answer HITL requests and work interactively. Send driver.can.hitl on every next request, including busy polls. claim, true to take a run another install published from teamai-reports before leasing; a run this install owns stays as it is. Every answer lists in cancelled the running attempts whose tools the driver must stop.
   - `teamai workflow report <run>` — Report the outcome of a leased step. Prints a JSON envelope.
     - `--json <payload>` — attempt, revision, outcome (success, failed, or released), and driver
   - `teamai workflow respond <run> <step> <choice>` — Answer a waiting approve (yes/no) or choose HITL request. Required HITL requests accept terminal answers or declared person answers from a driver UI. Prints one JSON envelope.
@@ -235,9 +235,12 @@ Generated: do not edit by hand. Regenerate with
     - `--note <text>` — Keep a note with the answer, readable as steps.<id>.note
     - `--pass <n>` — Answer only this positive pass number; rejects an answered or replaced HITL request
   - `teamai workflow retry <run> <step>` — Retry a leased or stopped step, or a HITL request to answer it again, with a new pass and revision. Reopen its dependent steps and a settled run; keep earlier passes. After reopening, run resume or let your driver poll next. Prints one JSON envelope.
-  - `teamai workflow resume <run>` — Continue a run with the local driver after retry, respond, or a stopped driver (Ctrl-C or closed terminal). Uses this machine's open local lease workspace, then the latest local driver's workspace on this machine, then cwd. Another live local driver returns driver_running. A settled run returns done.
+  - `teamai workflow resume <run>` — Continue a run with the local driver after retry, respond, or a stopped driver (Ctrl-C or closed terminal). Uses this machine's open local lease workspace, then the latest local driver's workspace on this machine, then cwd. Another live local driver returns driver_running. A settled run returns done. A run this machine does not have is taken from teamai-reports, where workflow publish put it; a published run continues only while this install owns it, else not_owner names the owner.
     - `--tools <list>` — Override local prompt tools for this run, as comma-separated name=tool pairs
     - `--auto-approve` — Automatically answer optional approve HITL requests and choose defaults in this process
+    - `--claim` — Take the published run over from the install that owns it, replacing this machine's copy and releasing its leases
+  - `teamai workflow publish <run>` — Publish a run's state to teamai-reports so another member or a runner can continue it with workflow resume. The first publish makes this install the run's owner; publishing an unchanged run writes nothing. Refuses a run with records not yet on teamai-reports, or with a value that looks like a secret. Prints one JSON envelope listing the leases still in flight.
+    - `--sessions` — Also put the agent sessions that the run's unsettled steps continue (session: continue or session.from) in the team session archive, scrubbed, so whoever continues the run resumes them; listed in the envelope as sessions. Without it, those steps start new sessions on another machine
   - `teamai workflow cancel <run> [step]` — Cancel a whole run, or a pending, waiting, leased, or running step and its open descendants. Invalidates leases; drivers stop tools listed in next.cancelled. Prints one JSON envelope.
 
 ## hooks
@@ -313,7 +316,7 @@ Generated: do not edit by hand. Regenerate with
     - `--cwd <path>` — Working directory (defaults to current directory)
     - `--target-cwd <path>` — Override cwd for the target session
     - `--push` — Also push the migrated session to the team repo
-    - `--repo-root <path>` — Team repo root (for --push)
+    - `--repo-root <path>` — Team repo clone to archive into with --push (default: the teamai install for this directory, else your user install)
     - `--scrub` — Redact secrets (tokens/keys/passwords) from the session before writing it
     - `--all` — Migrate every session from source (not just the 5 most recent)
     - `--limit <n>` — Max sessions to migrate (only caps --all; ignored otherwise)
@@ -321,28 +324,28 @@ Generated: do not edit by hand. Regenerate with
     - `--json` — Print one {data}|{error} JSON envelope on stdout; never prompts (needs a session id, -s and -t)
   - `teamai session push` — Push local sessions to the team repo
     - `--source <platform>` — Source platform to read sessions from
-    - `--repo-root <path>` — Team repo root (defaults to cwd)
+    - `--repo-root <path>` — Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)
     - `--cwd <path>` — Working directory (defaults to current directory)
     - `--limit <n>` — Max sessions to push (default: 5; ignored with --all)
     - `--all` — Push every session of the platform across all workspace directories (ignores --limit)
     - `-y, --yes` — Skip confirmation prompts, including archiving unredacted transcripts (--all)
     - `--scrub` — Redact secrets before archiving (archived sessions are team-readable)
   - `teamai session pull` — Pull team sessions for the current project
-    - `--repo-root <path>` — Team repo root (defaults to cwd)
+    - `--repo-root <path>` — Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)
     - `--cwd <path>` — Working directory (defaults to current directory)
     - `--all` — Rebuild indexes for every repo in the team repo (not just the current project)
   - `teamai session list` — List team sessions for the current project
-    - `--repo-root <path>` — Team repo root (defaults to cwd)
+    - `--repo-root <path>` — Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)
     - `--cwd <path>` — Working directory (defaults to current directory)
     - `--author <name>` — Filter by author
     - `--all` — List sessions across all projects in the team repo (not just the current one)
   - `teamai session resume <sessionName>` — Restore a team session to a local platform
     - `--platform <platform>` — Target platform to restore into
-    - `--repo-root <path>` — Team repo root (defaults to cwd)
+    - `--repo-root <path>` — Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)
     - `--cwd <path>` — Working directory for the restored session (defaults to current directory)
     - `--author <name>` — Author of the session (if ambiguous)
   - `teamai session search <query>` — Search team session content
-    - `--repo-root <path>` — Team repo root (defaults to cwd)
+    - `--repo-root <path>` — Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)
     - `--cwd <path>` — Working directory (defaults to current directory)
     - `--limit <n>` — Max results (default: 10)
     - `--all` — Search across all projects (not just current)

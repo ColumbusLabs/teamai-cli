@@ -812,7 +812,7 @@ workflowCmd
 workflowCmd
   .command('next <run>')
   .description('Get a lease, hitl, wait, or done JSON envelope. Show hitl.message and hitl.respond to a person, who replaces <option> with a choice.')
-  .option('--json <payload>', 'Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can.hitl, true when a person can answer HITL requests and work interactively. Send driver.can.hitl on every next request, including busy polls. Every answer lists in cancelled the running attempts whose tools the driver must stop.')
+  .option('--json <payload>', 'Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can.hitl, true when a person can answer HITL requests and work interactively. Send driver.can.hitl on every next request, including busy polls. claim, true to take a run another install published from teamai-reports before leasing; a run this install owns stays as it is. Every answer lists in cancelled the running attempts whose tools the driver must stop.')
   .action(async (run: string, cmdOpts: { json?: string }) => {
     const { workflowNext } = await import('./workflow-commands.js');
     await workflowNext(run, cmdOpts);
@@ -848,12 +848,22 @@ workflowCmd
 
 workflowCmd
   .command('resume <run>')
-  .description("Continue a run with the local driver after retry, respond, or a stopped driver (Ctrl-C or closed terminal). Uses this machine's open local lease workspace, then the latest local driver's workspace on this machine, then cwd. Another live local driver returns driver_running. A settled run returns done.")
+  .description("Continue a run with the local driver after retry, respond, or a stopped driver (Ctrl-C or closed terminal). Uses this machine's open local lease workspace, then the latest local driver's workspace on this machine, then cwd. Another live local driver returns driver_running. A settled run returns done. A run this machine does not have is taken from teamai-reports, where workflow publish put it; a published run continues only while this install owns it, else not_owner names the owner.")
   .option('--tools <list>', 'Override local prompt tools for this run, as comma-separated name=tool pairs')
   .option('--auto-approve', 'Automatically answer optional approve HITL requests and choose defaults in this process')
-  .action(async (run: string, options: { tools?: string; autoApprove?: boolean }) => {
+  .option('--claim', 'Take the published run over from the install that owns it, replacing this machine\'s copy and releasing its leases')
+  .action(async (run: string, options: { tools?: string; autoApprove?: boolean; claim?: boolean }) => {
     const { workflowResume } = await import('./workflow-commands.js');
     await workflowResume(run, options);
+  });
+
+workflowCmd
+  .command('publish <run>')
+  .description("Publish a run's state to teamai-reports so another member or a runner can continue it with workflow resume. The first publish makes this install the run's owner; publishing an unchanged run writes nothing. Refuses a run with records not yet on teamai-reports, or with a value that looks like a secret. Prints one JSON envelope listing the leases still in flight.")
+  .option('--sessions', "Also put the agent sessions that the run's unsettled steps continue (session: continue or session.from) in the team session archive, scrubbed, so whoever continues the run resumes them; listed in the envelope as sessions. Without it, those steps start new sessions on another machine")
+  .action(async (run: string, options: { sessions?: boolean }) => {
+    const { workflowPublish } = await import('./workflow-commands.js');
+    await workflowPublish(run, options);
   });
 
 workflowCmd

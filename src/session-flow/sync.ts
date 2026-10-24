@@ -483,6 +483,11 @@ export class SyncManager {
     this.sessionsDir = path.join(repoRoot, 'sessions');
   }
 
+  /** The archive files this manager wrote, relative to the repo root: what `gitCommit` stages. */
+  writtenFiles(): string[] {
+    return [...this.writtenPaths];
+  }
+
   /** Record the write path, and confirm there is no symlink hijack before writing. */
   private guardWrite(target: string): void {
     assertNoSymlinkedAncestors(target, this.repoRoot);
@@ -678,6 +683,16 @@ export class SyncManager {
         // and then migrate --push to claude-code would overwrite the earlier archive.
         (!platform || s.platform === platform),
     );
+  }
+
+  /**
+   * The archived copy of source session `origin`, pushed by any author, or undefined. Reads the index as it is and
+   * never repairs it, so a lookup writes nothing; when several authors pushed the session, the latest update wins.
+   */
+  findArchived(repoIdentity: string | null, origin: { platform: string; sessionId: string }): IndexEntry | undefined {
+    return this.readIndex(repoIdentity).sessions
+      .filter((s) => s.sessionId === origin.sessionId && s.platform === origin.platform)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.author.localeCompare(b.author))[0];
   }
 
   /**

@@ -1,6 +1,7 @@
 /** Workflow types for the v1alpha1 local-driver subset. */
 
-import type { ArchivedPass, StepState } from './step-state.js';
+import type { ArchivedPass, SessionContinuation, StepState } from './step-state.js';
+import type { LeaseSession } from './workspace.js';
 
 /** The driver's lease ownership, independent of its per-request capabilities. */
 export interface DriverIdentity {
@@ -183,6 +184,8 @@ export interface StepLease {
   attempt: string;
   revision: number;
   driver: DriverIdentity;
+  /** The session the lease offers the step: the report may name it, or one it continued, as `resumed`. */
+  session?: LeaseSession;
 }
 
 export interface TokenUsage {
@@ -239,12 +242,32 @@ export interface RunState {
    * in a git checkout, else by the first `next` that sends `base`. A later `base` does not change it.
    */
   base?: { ref?: string; commit: string };
-  /** The checkout `workflow start` ran in. Local run state only: never on a lease or a record. */
+  /** The checkout `workflow start` ran in, or the one a claim took the run into. Local run state only: never on a lease or a record. */
   checkout?: string;
-  /** Workspaces this run has handed out, by branch. A `continue` step stays with the driver that opened the copy. */
-  copies?: Record<string, { owner: DriverIdentity; commit?: string }>;
+  /**
+   * Workspaces this run has handed out, by branch. A `continue` step stays with the driver that opened the copy. A copy a
+   * claim brought from another machine has no owner until a driver leases it.
+   */
+  copies?: Record<string, { owner?: DriverIdentity; commit?: string }>;
+  /**
+   * Sessions a step resumed and continued under another id, in report order: a copy on another machine or in another
+   * tool. `to` holds the turns of `from` and the ones that step added, so a step that would resume `from` resumes `to`.
+   */
+  sessionContinuations?: SessionContinuation[];
+  /** How this machine last published the run, or took it from another machine. Local run state only. */
+  publication?: RunPublication;
   createdAt: string;
   updatedAt: string;
+}
+
+/** What this machine knows of the run's snapshot on `teamai-reports`. */
+export interface RunPublication {
+  /** The snapshot's state revision when this machine last wrote it or took the run, as origin confirmed it. */
+  stateRevision: number;
+  /** The `write` of a snapshot this machine committed whose delivery it has not seen. Another reports write may push it later. */
+  pending?: string;
+  /** Set when this machine takes the run over: the local driver brings its copies' local branches to the recorded commits once. */
+  reconcileCopies?: true;
 }
 
 export interface CachedWorkflow {

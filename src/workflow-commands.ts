@@ -1,8 +1,9 @@
 import { autoDetectInit } from './config.js';
-import { setStderrOnly } from './utils/logger.js';
-import { leaseNext, parseNextPayload, parseReport, parseResponsePayload, reportAttempt, startRun, withIgnored, type ParsedResponsePayload } from './workflow/engine.js';
+import { log, setStderrOnly } from './utils/logger.js';
+import { leaseNext, parseNextPayload, parseReport, parseResponsePayload, reportAttempt, resumableSessions, startRun, withIgnored, type ParsedResponsePayload } from './workflow/engine.js';
+import { publishRun, resumeRun } from './workflow/handoff.js';
 import { cancelRun, respondToHitl, retryStep } from './workflow/run-controls.js';
-import { localDriver, runLocalDriver } from './workflow/local-driver.js';
+import { localDriver, runLocalDriver, withDriverLock } from './workflow/local-driver.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
 import { isRunId, readRun } from './workflow/store.js';
 import { headCommit } from './workflow/worktree.js';
@@ -105,6 +106,7 @@ export async function workflowStart(name: string, options: { driver?: string; to
     writeEnvelope({ error: { code: 'run_unreadable', message: 'The new run id was missing' } });
     return;
   }
+  log.info(`Run ${runId} started. If it stops before it ends, continue it with: teamai workflow resume ${runId}`);
   writeEnvelope(await runLocalDriver(config, runId, process.cwd(), { tools, toolPaths: teamConfig.toolPaths, autoApprove: options.autoApprove }));
 }
 
@@ -190,8 +192,20 @@ export async function workflowCancel(runId: string, step?: string): Promise<void
   await workflowControl((config) => cancelRun(config, runId, step));
 }
 
-/** Continues a local run in its retained workspace and claims its driver lock. */
-export async function workflowResume(runId: string, options: { tools?: string; autoApprove?: boolean }): Promise<void> {
+/** Publishes a run to teamai-reports, with the sessions its unsettled steps continue when asked. */
+export async function workflowPublish(runId: string, options: { sessions?: boolean } = {}): Promise<void> {
+  setStderrOnly(true);
+  const loaded = await readyConfig();
+  if (!loaded) return;
+  const published = await publishRun(loaded.config, runId, { checkout: process.cwd(), ...(options.sessions ? { sessions: resumableSessions } : {}) });
+  if (published.ok && published.value.skipped) {
+    const list = published.value.skipped.map((session) => `${session.tool} session ${session.id}`).join(', ');
+    log.warn(`Could not read ${list} on this machine, so they were not archived. Each step that continues them resumes the newest session of its chain that was.`);
+  }
+  writeEnvelope(published.ok ? { data: { ...published.value } } : { error: published.error });
+}
+
+export async function workflowResume(runId: string, options: { tools?: string; autoApprove?: boolean; claim?: boolean }): Promise<void> {
   setStderrOnly(true);
   const loaded = await readyConfig();
   if (!loaded) return;
@@ -204,16 +218,20 @@ export async function workflowResume(runId: string, options: { tools?: string; a
     writeEnvelope({ error: { code: 'invalid_tools', message: tools } });
     return;
   }
-  const stored = await readRun(loaded.config, runId);
-  if (typeof stored !== 'object') {
-    writeEnvelope(stored === 'missing'
-      ? { error: { code: 'run_not_found', message: `Run ${runId} was not found` } }
-      : { error: { code: 'run_unreadable', message: `Run ${runId} could not be read` } });
-    return;
-  }
-  const local = localDriver(process.cwd());
-  const lease = stored.steps.find((step) => step.status === 'leased' && step.lease.driver.kind === 'local' && step.lease.driver.machine === local.machine);
-  const cwd = lease?.status === 'leased' ? lease.lease.driver.workspace
-    : stored.driver?.kind === 'local' && stored.driver.machine === local.machine ? stored.driver.workspace : process.cwd();
-  writeEnvelope(await runLocalDriver(loaded.config, runId, cwd, { tools, toolPaths: loaded.teamConfig.toolPaths, autoApprove: options.autoApprove }));
+  // Claimed under the driver lock, so a driver of this run already running here never drives the claimed run.
+  writeEnvelope(await withDriverLock(loaded.config, runId, async (drive) => {
+    const resumed = await resumeRun(loaded.config, runId, { claim: options.claim === true, checkout: process.cwd() });
+    if (!resumed.ok) return { error: resumed.error };
+    const stored = await readRun(loaded.config, runId);
+    if (typeof stored !== 'object') {
+      return stored === 'missing'
+        ? { error: { code: 'run_not_found', message: `Run ${runId} was not found` } }
+        : { error: { code: 'run_unreadable', message: `Run ${runId} could not be read` } };
+    }
+    const local = localDriver(process.cwd());
+    const lease = stored.steps.find((step) => step.status === 'leased' && step.lease.driver.kind === 'local' && step.lease.driver.machine === local.machine);
+    const cwd = lease?.status === 'leased' ? lease.lease.driver.workspace
+      : stored.driver?.kind === 'local' && stored.driver.machine === local.machine ? stored.driver.workspace : process.cwd();
+    return drive(cwd, { tools, toolPaths: loaded.teamConfig.toolPaths, autoApprove: options.autoApprove });
+  }));
 }

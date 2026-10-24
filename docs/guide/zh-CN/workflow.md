@@ -159,7 +159,7 @@ teamai workflow report <run> --json '{"attempt":"<attempt>","revision":1,"outcom
 
 运行状态保存在当前 scope 的 TeamAI 数据目录里。命令结束后进程就退出。本地运行以 `failed` 或 `cancelled` 结束时，退出码是 1。不会留下常驻的工作流进程。
 
-等待 HITL 请求用 `workflow respond <run> <step> <choice>` 回答，失败或卡住的步骤用 `workflow retry <run> <step>` 重试，`workflow cancel <run> [step]` 停止工作，`workflow resume <run>` 继续本地执行。next 返回 lease、hitl、wait 或 done。参见[HITL](workflow-advanced.md#hitl人在回路中)和[重试、取消和继续运行](workflow-advanced.md#重试取消和继续运行)。本地运行以 failed 或 cancelled 结束时退出码为 1。结束运行的操作在锁内排队写入结束记录，在释放锁后发布；重试后仍更新同一路径。回答记录只发布 choice、channel 和 agent，备注、回答时间和回答驱动身份只保存在本地。
+等待 HITL 请求用 `workflow respond <run> <step> <choice>` 回答，失败或卡住的步骤用 `workflow retry <run> <step>` 重试，`workflow cancel <run> [step]` 停止工作，`workflow resume <run>` 继续本地执行，`workflow publish <run>` 让另一台机器接着运行（见[在另一台机器上继续运行](#在另一台机器上继续运行)）。next 返回 lease、hitl、wait 或 done。参见[HITL](workflow-advanced.md#hitl人在回路中)和[重试、取消和继续运行](workflow-advanced.md#重试取消和继续运行)。本地运行以 failed 或 cancelled 结束时退出码为 1。结束运行的操作在锁内排队写入结束记录，在释放锁后发布；重试后仍更新同一路径。回答记录只发布 choice、channel 和 agent，备注、回答时间和回答驱动身份只保存在本地。
 
 ## 工作区
 
@@ -173,9 +173,9 @@ teamai workflow report <run> --json '{"attempt":"<attempt>","revision":1,"outcom
 
 步骤看到的是运行开始时那个提交上的 agent 文件：`AGENTS.md`、`CLAUDE.md`、`.agents`、`.githooks`，每个工具的项目目录（如 `.claude` 或 `.tclaude`），项目级 MCP 文件 `.mcp.json` 和 `opencode.json`，以及 Copilot 在 `.github` 下的 agent 路径。前一个步骤提交的 hook 不会在后面的步骤里运行。团队的 skills、rules、agents 和 MCP 随后会交付到这个 worktree，和这个检出目录的其他新 worktree 一样。这些交付的文件不属于该步骤的提交。步骤自己改过的文件会被提交。
 
-检出目录有 `origin`，并且这一步产生了提交时，驱动会推送该分支。后一次尝试即使没有新提交，只要这个分支上有 `origin` 还没有的提交，仍会再推一次。这包括第一次推送根本没成功，以及 `origin` 上还没有任何分支。推送失败时步骤以 `push_failed` 失败，并保留 worktree。没有 `origin`，或 `origin` 已经有这个提交时，运行仍然成功，并报告该分支。
+检出目录有 `origin`，并且这一步产生了提交时，驱动会推送该分支，步骤失败时也一样。后一次尝试即使没有新提交，只要这个分支上有 `origin` 还没有的提交，仍会再推一次。这包括第一次推送根本没成功，以及 `origin` 上还没有任何分支。推送失败时，成功的步骤以 `push_failed` 失败，并保留 worktree。本身已失败的步骤保留自己的失败，消息里再补充推送失败。没有 `origin`，或 `origin` 已经有这个提交时，运行仍然成功，并报告该分支。
 
-`session: continue` 用同一个工具恢复这一步上一 pass 的会话。`session: { from: <步骤> }` 恢复这一步所依赖的步骤。换成别的工具会开一个新会话。OpenCode 总是新开会话。
+`session: continue` 用同一个工具恢复这一步上一 pass 的会话。`session: { from: <步骤> }` 恢复这一步所依赖的步骤。换成别的工具时，会把会话复制到该工具里，再恢复这份副本。OpenCode 也会拿到副本，但总是新开会话，因为它没有恢复会话的参数。步骤恢复的会话，是最后一个继续它的步骤留下的样子，不管那个步骤在哪个工具或哪台机器上运行。新开会话的步骤（例如 OpenCode 步骤）不会改变后续步骤恢复什么。
 
 自己启动沙箱的命令（例如 `docker`）仍然是只读的。它写出去的内容不会变成后续步骤可以合并的分支。
 
@@ -197,6 +197,25 @@ steps:
     workspace: new
     command: node -e "require('fs').writeFileSync('joined.txt', 'J')"
 ```
+
+## 在另一台机器上继续运行
+
+运行保存在启动它的那台机器的 TeamAI 数据目录里。要在别处接着运行，先发布它，再在另一台机器上继续。适用的情况：工具在运行中途用完了 token，把运行交给队友，或者 CI 里的运行失败了，你想在自己的机器上把它跑完。
+
+```text
+teamai workflow publish <run>     # 在有这个运行的机器上
+teamai workflow resume <run>      # 在另一台机器上，位于同一个仓库的检出目录中
+```
+
+`publish` 把运行状态写到团队的 `teamai-reports` 分支，并让本安装实例成为该运行的所有者。先停止驱动，让没有步骤在执行。发布时仍处于租约中的步骤会在另一台机器上重新运行。按 Ctrl-C 后，正在执行的步骤写下的内容会留在本机该步骤的工作树里，另一台机器仍然可以认领这个运行。之后你在运行仍在进行时把它接管回本机，认领会让本安装实例成为所有者，但 `resume` 会返回 `branch_diverged` 并指出那个工作树。把这些改动移到别处或删除，再执行 `resume`。在没有这个运行的机器上，`resume` 从 `teamai-reports` 取得它，让该安装实例成为所有者，并用本地驱动运行它。
+
+已发布的运行只有所有者能继续。在另一个已有该运行的安装实例上，`resume` 和 `publish` 都返回 `not_owner`，带上所有者的用户名和安装实例 id。同一成员的两个安装实例显示相同的用户名，靠安装实例 id 区分。要接管这个运行，执行 `teamai workflow resume <run> --claim`。认领会替换本机的运行副本，并释放其他机器持有的租约。此后原所有者不能再发布或继续这个运行，除非它再认领回来。
+
+已发布的运行结束时，teamai 会发布它的结束状态，不带 `--sessions`。之后接手该运行的成员不会重新运行它的任何步骤。
+
+无论[使用统计上报](reporting.md)是否开启，`publish` 都会写入运行状态：这是另一台机器继续运行所需的状态，不是使用统计上报。从未发布的运行留在本机。使用统计上报开启时，只有它的[运行记录](#运行记录)会进入 `teamai-reports`。
+
+带 `session: continue` 或 `session.from` 的步骤在另一台机器上会开一个新的 agent 会话，除非发布时加上 `--sessions`。运行在机器之间来回交接时，每台继续过会话的机器都要在下一次认领前用 `--sessions` 发布，这样下一个步骤能拿到所有对话轮次。[发布和认领](workflow-advanced.md#发布和认领)说明发布的状态包含什么、每个错误及下一步怎么做，以及如何从 CI 发布。
 
 ## 运行记录
 

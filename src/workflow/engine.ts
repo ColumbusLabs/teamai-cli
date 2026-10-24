@@ -1,9 +1,9 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { parseReportedAgent, settleObservation, type ReportedAgent } from '../agent-observation.js';
 import { log } from '../utils/logger.js';
-import { acquireLock, releaseLock } from '../update.js';
 import type { LocalConfig } from '../types.js';
-import { loadCachedWorkflow, workflowsRunBy } from './cache.js';
+import { loadCachedWorkflow, loadWorkflowTree } from './cache.js';
+import { claimRun, publishRunEnd } from './handoff.js';
 import {
   evaluateExpression, expressionPaths, isRecord, isTruthy, parseExpression, resolvePath,
   type Expression, type ExpressionPath,
@@ -23,25 +23,21 @@ import {
 import { addItems, afterStanding, expandItems, isItem, itemsAfter, itemsOf, itemsSettled, startedItems } from './fan-out.js';
 import { decideRound, decideStepLoop, exhaustedAtStart, firstPass, loopSettled } from './loop.js';
 import { childScope, contextOf, insertChildren, localId, statesIn, stepDefinitions, topScope, type Scope } from './scope.js';
-import { planWorkspace, plannedBranch, type WorkspaceContract, type WorkspaceMode, type WorkspacePlan } from './workspace.js';
-import { generateRunId, isRunId, readRun, runLockPath, writeRun } from './store.js';
+import { planWorkspace, plannedBranch, sessionOf, type LeaseSession, type SessionRef, type WorkspaceContract, type WorkspaceMode, type WorkspacePlan } from './workspace.js';
+import { generateRunId, isRunId, updateRun } from './store.js';
 import type {
-  CachedWorkflow,
   DriverIdentity,
   OutputSchema,
   RunState,
   RunStatus,
+  StepLease,
   StepOutcome,
   TokenUsage,
-  WorkflowDefinition,
   WorkflowEnvelope,
   WorkflowFailure,
   WorkflowStep,
 } from './types.js';
 import { hasAction } from './types.js';
-
-const LOCK_ATTEMPTS = 40;
-const LOCK_WAIT_MS = 25;
 
 /**
  * Recent settled attempt ids kept for `repeated_report`.
@@ -60,6 +56,8 @@ export interface ReportInput {
   tool?: string;
   model?: string;
   session?: string;
+  /** The lease's `session`, echoed when the attempt continued it, by that id or in a copy, rather than starting a new one. */
+  resumed?: SessionRef;
   tokens?: TokenUsage;
   failure?: WorkflowFailure;
   /** The branch this attempt committed, when it ran in a workspace. */
@@ -92,10 +90,6 @@ function sameDriver(left: DriverIdentity, right: DriverIdentity): boolean {
   return left.kind === right.kind && left.machine === right.machine && left.workspace === right.workspace;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /** Applies one operation under the run lock and saves only when requested. */
 export async function withRun<T extends WorkflowEnvelope>(
   config: LocalConfig,
@@ -103,27 +97,26 @@ export async function withRun<T extends WorkflowEnvelope>(
   mutate: (run: RunState, now: string) => Promise<{ envelope: T; save: boolean }>,
 ): Promise<T> {
   if (!isRunId(runId)) return error('invalid_run', 'Run id must look like r followed by 8 or 16 hex digits') as T;
-  const lock = runLockPath(config, runId);
-  let held = false;
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS && !held; attempt += 1) {
-    held = await acquireLock(lock);
-    if (!held) await delay(LOCK_WAIT_MS);
-  }
-  if (!held) return error('busy', `Run ${runId} is locked by another process`) as T;
-  try {
-    const loaded = await readRun(config, runId);
-    if (loaded === 'missing') return error('run_not_found', `Run ${runId} was not found`) as T;
-    if (loaded === 'corrupt') return error('run_unreadable', `Run ${runId} could not be read`) as T;
+  const updated = await updateRun(config, runId, async (loaded) => {
+    if (loaded === 'missing') return { value: error('run_not_found', `Run ${runId} was not found`) as T };
     // One timestamp per operation, so a settled run's end record and its run file agree.
     const now = new Date().toISOString();
     const result = await mutate(loaded, now);
-    if (result.save) {
-      loaded.updatedAt = now;
-      await writeRun(config, loaded);
+    if (!result.save) return { value: result.envelope };
+    loaded.updatedAt = now;
+    return { value: result.envelope, write: loaded };
+  });
+  switch (updated.status) {
+    case 'done':
+      return updated.value;
+    case 'busy':
+      return error('busy', `Run ${runId} is locked by another process`) as T;
+    case 'corrupt':
+      return error('run_unreadable', `Run ${runId} could not be read`) as T;
+    default: {
+      const unhandled: never = updated;
+      return unhandled;
     }
-    return result.envelope;
-  } finally {
-    await releaseLock(lock);
   }
 }
 
@@ -262,11 +255,13 @@ function leaseData(
   } };
 }
 
-/** Records who opened a workspace the first time this driver takes its branch. */
+/** Records who opened a workspace the first time a driver takes its branch, or who first leases a copy a claim brought in. */
 function rememberCopy(run: RunState, plan: WorkspacePlan, driver: DriverIdentity): void {
   const branch = plan.contract?.branch;
-  if (!branch || run.copies?.[branch]) return;
-  (run.copies ??= {})[branch] = { owner: driver };
+  if (!branch) return;
+  const copy = (run.copies ??= {})[branch];
+  if (copy) copy.owner ??= driver;
+  else run.copies[branch] = { owner: driver };
 }
 
 /**
@@ -761,46 +756,6 @@ function inputsMismatch(name: string, declared: Record<string, OutputSchema> | u
   return extra === undefined ? null : `inputs.${extra} is not an input workflow "${name}" declares`;
 }
 
-/** Every workflow `cached` runs through its steps, directly or not, from the cache, and one hash over all of their sources. */
-async function loadWorkflows(
-  config: LocalConfig,
-  cached: CachedWorkflow,
-): Promise<{ workflows: Record<string, WorkflowDefinition>; sourceHash: string; teamRevision?: string } | { failed: WorkflowEnvelope }> {
-  const workflows: Record<string, WorkflowDefinition> = {};
-  const hashes: Array<[string, string]> = [];
-  const revisions: Array<string | undefined> = [cached.teamRevision];
-  const visit = async (definition: WorkflowDefinition, through: string[]): Promise<WorkflowEnvelope | undefined> => {
-    for (const { step, workflow } of workflowsRunBy(definition)) {
-      if (through.includes(workflow)) {
-        const cycle = [...through.slice(through.indexOf(workflow)), workflow].join(' -> ');
-        return error('workflow_recursion', `Workflow "${cached.definition.name}" cannot start: its sub-workflows run in a cycle: ${cycle}`);
-      }
-      if (Object.hasOwn(workflows, workflow)) continue;
-      const child = await loadCachedWorkflow(config, workflow);
-      if (!child) {
-        return error('workflow_not_found', `Workflow "${definition.name}" step "${step}" runs workflow "${workflow}", which has no runnable version. Check workflows/${workflow}.yaml and pull again.`);
-      }
-      workflows[workflow] = child.definition;
-      hashes.push([workflow, child.sourceHash]);
-      revisions.push(child.teamRevision);
-      const failed = await visit(child.definition, [...through, workflow]);
-      if (failed) return failed;
-    }
-    return undefined;
-  };
-  const failed = await visit(cached.definition, [cached.definition.name]);
-  if (failed) return { failed };
-  const teamRevision = cached.teamRevision !== undefined && revisions.every((revision) => revision === cached.teamRevision)
-    ? cached.teamRevision
-    : undefined;
-  if (hashes.length === 0) return { workflows, sourceHash: cached.sourceHash, ...(teamRevision ? { teamRevision } : {}) };
-  const hash = createHash('sha256').update(cached.sourceHash);
-  for (const [name, sourceHash] of hashes.sort(([left], [right]) => left.localeCompare(right))) {
-    hash.update('\0').update(name).update('\0').update(sourceHash);
-  }
-  return { workflows, sourceHash: hash.digest('hex'), ...(teamRevision ? { teamRevision } : {}) };
-}
-
 /** Creates a run. `inputs` are checked against the declared inputs before the run file exists. */
 export async function startRun(
   config: LocalConfig,
@@ -814,8 +769,8 @@ export async function startRun(
   }
   const mismatch = inputsMismatch(cached.definition.name, cached.definition.inputs, inputs);
   if (mismatch) return error('invalid_inputs', mismatch);
-  const tree = await loadWorkflows(config, cached);
-  if ('failed' in tree) return tree.failed;
+  const tree = await loadWorkflowTree(config, cached);
+  if ('failed' in tree) return error(tree.failed.code, tree.failed.message);
   const now = new Date().toISOString();
   const run: RunState = {
     schemaVersion: 'v1alpha1',
@@ -835,7 +790,19 @@ export async function startRun(
     createdAt: now,
     updatedAt: now,
   };
-  await writeRun(config, run);
+  const written = await updateRun(config, run.id, async () => ({ value: undefined, write: run }));
+  switch (written.status) {
+    case 'done':
+      break;
+    case 'busy':
+      return error('busy', `Run ${run.id} is locked by another process, so it was not started. Start it again.`);
+    case 'corrupt':
+      return error('run_unreadable', `An unreadable file already holds run ${run.id}, so it was not started. Start it again.`);
+    default: {
+      const unhandled: never = written;
+      return unhandled;
+    }
+  }
   // #1083: publish the start record; a failed publication is queued locally
   // and retried on the next pull — it never fails the run itself.
   const record = await queueRunRecord(config, run, options.driver, 'start') ? await publishRunRecords(config) : undefined;
@@ -872,10 +839,16 @@ export interface NextOptions {
   hitl?: boolean;
   /** Process-only override of the member's automatic HITL approval setting. */
   autoApprove?: boolean;
+  /** Take the run over from the install that published it before leasing; a run this install owns stays as it is. */
+  claim?: boolean;
 }
 
 export async function leaseNext(config: LocalConfig, runId: string, driver: DriverIdentity, options: NextOptions = {}): Promise<WorkflowEnvelope> {
   driver = { kind: driver.kind, machine: driver.machine, workspace: driver.workspace };
+  if (options.claim) {
+    const claimed = await claimRun(config, runId, { checkout: driver.workspace });
+    if (!claimed.ok) return { error: claimed.error };
+  }
   const running = new Set(options.running);
   // The end record is queued under the run lock, so the run stores whether it
   // was in the same save. It publishes AFTER withRun releases the lock (#1126
@@ -952,7 +925,7 @@ export async function leaseNext(config: LocalConfig, runId: string, driver: Driv
             break;
           }
           if (plan.contract && options.base && !run.base) run.base = options.base;
-          const step = lease(state, { attempt: `a${randomBytes(4).toString('hex')}`, revision: run.revision, driver });
+          const step = lease(state, offering({ attempt: `a${randomBytes(4).toString('hex')}`, revision: run.revision, driver }, plan.session));
           rememberCopy(run, plan, driver);
           return answer(leaseData(run, step, definition, rendered, plan));
         }
@@ -972,16 +945,23 @@ export async function leaseNext(config: LocalConfig, runId: string, driver: Driv
         const plan = planWorkspace(run, located.scope, leased, located.step, {
           driver, modes: options.workspaceModes, base: run.base ?? options.base,
         }, true);
-        return answer(leaseData(run, leased, located.step, rendered, plan.fail ? undefined : plan));
+        const offered = plan.fail ? undefined : plan;
+        leased.lease = offering(leased.lease, offered?.session);
+        return answer(leaseData(run, leased, located.step, rendered, offered));
       }
       failStep(leased, rendered, leased.lease.revision);
     }
   });
+  const done = (envelope as { data?: { done?: Record<string, unknown> } }).data?.done;
+  // Every `next` that answers `done` publishes the end again, so an end saved by a process that stopped before it was
+  // published still reaches teamai-reports; an end already there writes nothing.
+  const notPublished = done ? await publishRunEnd(config, runId, driver.workspace) : undefined;
   const record = queued
     ? await publishRunRecords(config)
     : alreadySettled && await runRecordState(config, alreadySettled);
-  const done = (envelope as { data?: { done?: Record<string, unknown> } }).data?.done;
-  if (done && record) done.record = record;
+  // A run another install owns had its record dropped, not published.
+  if (done && record && notPublished?.code !== 'not_owner') done.record = record;
+  if (done && notPublished) done.notPublished = notPublished;
   return envelope;
 }
 
@@ -997,11 +977,11 @@ function driverFrom(value: unknown): DriverIdentity | undefined {
 const DRIVER_FIELDS = new Set(['kind', 'machine', 'workspace', 'can']);
 
 /** The top-level payload fields `parseNextPayload` reads. */
-const NEXT_PAYLOAD_FIELDS = new Set(['driver', 'running', 'canTakeLease', 'base']);
+const NEXT_PAYLOAD_FIELDS = new Set(['driver', 'running', 'canTakeLease', 'base', 'claim']);
 
 /** The top-level payload fields `parseReport` reads. Keep in sync with the fields it picks. */
 const REPORT_FIELDS = new Set([
-  'attempt', 'revision', 'outcome', 'driver', 'outputs', 'exitCode', 'message', 'tool', 'model', 'session', 'tokens', 'failure', 'changes', 'read', 'agent',
+  'attempt', 'revision', 'outcome', 'driver', 'outputs', 'exitCode', 'message', 'tool', 'model', 'session', 'resumed', 'tokens', 'failure', 'changes', 'read', 'agent',
 ]);
 
 /**
@@ -1068,6 +1048,13 @@ export function parseReport(value: unknown): ParsedReport | string {
     if (record[field] === undefined) continue;
     if (typeof record[field] !== 'string') return `${field} must be a string`;
     report[field] = record[field];
+  }
+  if (record.resumed !== undefined) {
+    const resumed = record.resumed;
+    if (!isRecord(resumed) || typeof resumed.tool !== 'string' || resumed.tool === '' || typeof resumed.id !== 'string' || resumed.id === '') {
+      return 'resumed must be a session: a tool and an id';
+    }
+    report.resumed = { tool: resumed.tool, id: resumed.id };
   }
   if (record.tokens !== undefined) {
     if (!record.tokens || typeof record.tokens !== 'object' || Array.isArray(record.tokens)) return 'tokens must be an object';
@@ -1140,6 +1127,10 @@ export function parseNextPayload(value: unknown): ParsedNextPayload | string {
     }
     request.base = { ...(typeof base.ref === 'string' ? { ref: base.ref } : {}), commit: base.commit };
   }
+  if (record.claim !== undefined) {
+    if (typeof record.claim !== 'boolean') return 'claim must be a boolean';
+    request.claim = record.claim;
+  }
   const ignored = unreadFields(record, NEXT_PAYLOAD_FIELDS);
   const can = isRecord(record.driver) ? record.driver.can : undefined;
   if (can !== undefined) {
@@ -1205,6 +1196,59 @@ function branchStillUsed(run: RunState, branch: string): boolean {
   return false;
 }
 
+/**
+ * The session chains the steps that have not settled will continue, once each: each chain is the session a step resumes
+ * with the sessions it continued before, newest first. Like `branchStillUsed`, it reads the run as the next `next` settles
+ * it, so a step a loop runs again counts. The steps of a workflow that has not started count by their definitions: such a
+ * step continues a pass a loop archived, or resumes the step it names around its workflow.
+ */
+export function resumableSessions(run: RunState): LeaseSession[] {
+  const ahead = structuredClone(run);
+  reconcileRun(ahead);
+  const sessions = new Map<string, LeaseSession>();
+  const visit = (scope: Scope, state: StepState, step: WorkflowStep, unstarted: boolean): void => {
+    // A step of a workflow that has not started reads none of that workflow's steps yet.
+    const from = step.session && 'from' in step.session ? step.session.from : undefined;
+    const own = unstarted && scope.definition.steps.some((item) => item.id === from);
+    const session = own ? undefined : sessionOf(ahead, scope, state, step);
+    if (session && !('code' in session)) sessions.set(`${session.tool}\0${session.id}`, session);
+    if (state.status !== 'pending' || step.forEach) return;
+    const child = childScope(ahead, scope, statesIn(ahead, scope), state, step);
+    if (!child) return;
+    for (const inner of child.definition.steps) visit(child, { id: `${child.prefix}${inner.id}`, status: 'pending' }, inner, true);
+  };
+  for (const state of ahead.steps) {
+    if (settled(state)) continue;
+    const located = locateStep(ahead, state.id);
+    if (located) visit(located.scope, state, located.step, false);
+  }
+  return [...sessions.values()];
+}
+
+/** Why `resumed` is not a session the lease of `step` offered: its session, or one of the earlier ones it names. */
+function resumedMismatch(step: LeasedStep, resumed: SessionRef | undefined): string | undefined {
+  if (!resumed) return undefined;
+  const offered = step.lease.session;
+  if (!offered) return `step "${step.id}" resumes no session, so its report cannot name one as resumed`;
+  if ([offered, ...(offered.earlier ?? [])].some((session) => session.tool === resumed.tool && session.id === resumed.id)) return undefined;
+  return `resumed names ${resumed.tool} session ${resumed.id}, which attempt ${step.lease.attempt} did not offer. Report the lease's session, or an earlier one it names, or leave resumed out for a new session`;
+}
+
+/** `held` offering `session`, the session its report may name as resumed; a lease that offers none keeps none. */
+function offering(held: StepLease, session: LeaseSession | undefined): StepLease {
+  const { session: _previous, ...rest } = held;
+  return session ? { ...rest, session } : rest;
+}
+
+/** Records that the session the attempt ran in continues the one it resumed, when that is another session. */
+function continueSession(run: RunState, report: ReportInput): void {
+  const from = report.resumed;
+  if (!from || !report.tool || !report.session) return;
+  const to = { tool: report.tool, id: report.session };
+  if (from.tool === to.tool && from.id === to.id) return;
+  (run.sessionContinuations ??= []).push({ from, to });
+}
+
 export async function reportAttempt(config: LocalConfig, runId: string, report: ReportInput): Promise<WorkflowEnvelope> {
   return withRun(config, runId, async (run) => {
     // Settled membership wins. An old revision of a settled attempt is still repeated_report.
@@ -1238,10 +1282,11 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
 
     const located = locateStep(run, step.id);
     const defined = located?.step;
-    const contract = located && planWorkspace(run, located.scope, step, located.step, {
+    const plan = located && planWorkspace(run, located.scope, step, located.step, {
       driver: step.lease.driver, modes: ['read-only', 'new', 'continue'],
-    }, true).contract;
-    const mismatch = workspaceMismatch(report, contract);
+    }, true);
+    const contract = plan?.contract;
+    const mismatch = workspaceMismatch(report, contract) ?? resumedMismatch(step, report.resumed);
     if (mismatch) return { save: false, envelope: error('invalid_report', mismatch) };
     let outcome = report.outcome;
     let message = report.message;
@@ -1270,8 +1315,10 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
       ...(report.read ? { read: report.read } : {}),
       agent: settleObservation(report, defined?.agent),
     };
+    if (outcome !== 'released') continueSession(run, report);
     if (report.changes) {
       const copy = (run.copies ??= {})[report.changes.branch] ?? { owner: report.driver };
+      copy.owner ??= report.driver;
       copy.commit = report.changes.to;
       run.copies[report.changes.branch] = copy;
     }

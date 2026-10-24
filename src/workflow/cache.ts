@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { log } from '../utils/logger.js';
 import { pathExists, readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
@@ -438,6 +439,106 @@ function dropsKeptVersion(diagnostics: WorkflowDiagnostic[]): boolean {
 export function workflowsRunBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; workflow: string }> {
   return definition.steps.flatMap((step) => (typeof step.workflow === 'object' ? workflowsRunBy(step.workflow, `${prefix}${step.id}.`)
     : step.workflow === undefined ? [] : [{ step: `${prefix}${step.id}`, workflow: step.workflow }]));
+}
+
+/** The workflows a cached workflow runs, by name, and one hash over its sources and theirs. */
+export interface WorkflowTree {
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+  /** The team commit that stores every one of those sources, when one does. */
+  teamRevision?: string;
+}
+
+type TreeFailure = { code: 'workflow_recursion' | 'workflow_not_found'; message: string };
+
+/** Every workflow `cached` runs through its steps, directly or not, from the cache, and one hash over all of their sources. */
+export async function loadWorkflowTree(
+  config: LocalConfig,
+  cached: CachedWorkflow,
+): Promise<WorkflowTree | { failed: TreeFailure }> {
+  const workflows: Record<string, WorkflowDefinition> = {};
+  const hashes: Array<[string, string]> = [];
+  const revisions: Array<string | undefined> = [cached.teamRevision];
+  const visit = async (definition: WorkflowDefinition, through: string[]): Promise<TreeFailure | undefined> => {
+    for (const { step, workflow } of workflowsRunBy(definition)) {
+      if (through.includes(workflow)) {
+        const cycle = [...through.slice(through.indexOf(workflow)), workflow].join(' -> ');
+        return { code: 'workflow_recursion', message: `Workflow "${cached.definition.name}" cannot start: its sub-workflows run in a cycle: ${cycle}` };
+      }
+      if (Object.hasOwn(workflows, workflow)) continue;
+      const child = await loadCachedWorkflow(config, workflow);
+      if (!child) {
+        return { code: 'workflow_not_found', message: `Workflow "${definition.name}" step "${step}" runs workflow "${workflow}", which has no runnable version. Check workflows/${workflow}.yaml and pull again.` };
+      }
+      workflows[workflow] = child.definition;
+      hashes.push([workflow, child.sourceHash]);
+      revisions.push(child.teamRevision);
+      const failed = await visit(child.definition, [...through, workflow]);
+      if (failed) return failed;
+    }
+    return undefined;
+  };
+  const failed = await visit(cached.definition, [cached.definition.name]);
+  if (failed) return { failed };
+  const teamRevision = cached.teamRevision !== undefined && revisions.every((revision) => revision === cached.teamRevision)
+    ? cached.teamRevision
+    : undefined;
+  if (hashes.length === 0) return { workflows, sourceHash: cached.sourceHash, ...(teamRevision ? { teamRevision } : {}) };
+  const hash = createHash('sha256').update(cached.sourceHash);
+  for (const [name, sourceHash] of hashes.sort(([left], [right]) => left.localeCompare(right))) {
+    hash.update('\0').update(name).update('\0').update(sourceHash);
+  }
+  return { workflows, sourceHash: hash.digest('hex'), ...(teamRevision ? { teamRevision } : {}) };
+}
+
+/** A workflow, every workflow it runs, and one hash over all of their sources. */
+export interface WorkflowBundle {
+  definition: WorkflowDefinition;
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+}
+
+export async function loadWorkflowBundle(config: LocalConfig, name: string): Promise<WorkflowBundle | { failed: string }> {
+  const cached = await loadCachedWorkflow(config, name);
+  if (!cached) return { failed: `workflow "${name}" has no runnable version` };
+  const tree = await loadWorkflowTree(config, cached);
+  if ('failed' in tree) return { failed: tree.failed.message };
+  return { definition: cached.definition, workflows: tree.workflows, sourceHash: tree.sourceHash };
+}
+
+/**
+ * Workflow `name` and the workflows it runs as team commit `revision` stores them, synced from a `--shared` clone at that
+ * commit into a cache of its own, so this member's checkout and cache stay as they are. Only a fetch of origin, when the
+ * team repo lacks the commit, touches the member's repository.
+ */
+export async function loadWorkflowBundleAt(config: LocalConfig, name: string, revision: string): Promise<WorkflowBundle | { failed: string }> {
+  const repoRoot = isSelfMode(config) ? getBusinessRoot(config) : config.repo.localPath;
+  const git = createGit(repoRoot);
+  const present = (): Promise<boolean> => git.raw(['cat-file', '-e', `${revision}^{commit}`]).then(() => true, () => false);
+  if (!await present()) {
+    const fetched = await git.fetch(['origin']).then(() => '', (error: unknown) => (error instanceof Error ? error.message.trim() : String(error)));
+    if (!await present()) {
+      return { failed: `the team repo at ${repoRoot} does not have it, even after fetching origin${fetched ? ` (${fetched})` : ''}` };
+    }
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-revision-'));
+  try {
+    const clone = path.join(dir, 'team');
+    await git.raw(['clone', '--quiet', '--shared', '--no-checkout', repoRoot, clone]);
+    await createGit(clone).raw(['checkout', '--quiet', '--detach', revision]);
+    const knowledge = path.join(clone, path.relative(repoRoot, config.repo.localPath));
+    const at: LocalConfig = {
+      ...config,
+      repo: isSelfMode(config) ? { ...config.repo, localPath: knowledge, businessRepoRoot: clone } : { ...config.repo, localPath: knowledge },
+      dataHome: path.join(dir, 'data'),
+    };
+    await syncWorkflowDefinitions(at, { scopeLabel: `team commit ${revision.slice(0, 7)}` });
+    return await loadWorkflowBundle(at, name);
+  } catch (error) {
+    return { failed: error instanceof Error ? error.message.trim() : String(error) };
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 /**
