@@ -171,7 +171,10 @@ export function skipToolsWithoutShell(tools: string[]): Set<string> {
       skipped.add(tool);
     }
   }
-  if (withShell) ensureTeamaiWrapper();
+  // Non-login POSIX dispatch must not rely on a project git hook creating this.
+  const nonLoginWrapper = process.platform !== 'win32'
+    && tools.some(tool => tool === 'zcode' || tool === 'dsh') && hasShell();
+  if (withShell || nonLoginWrapper) ensureTeamaiWrapper();
   if (skipped.size > 0) {
     log.warn(
       `Skipping hook injection for ${[...skipped].join(', ')}: no shell is available in this environment to execute hooks. ` +
@@ -274,7 +277,7 @@ export function getTeamHookDispatchCommandWindows(event: string, tool: string): 
 /**
  * Raw dispatch command without a shell wrapper. Used by ZCode, whose hook
  * entries are `process`-typed (an executable plus an argv vector): the writer
- * puts `bash -lc <raw>` into `args` itself, so the wrapper must not be baked
+ * puts `bash -c <raw>` into `args` itself, so the wrapper must not be baked
  * into the command string.
  */
 export function getRawDispatchCommand(event: string, tool: string, matcher?: string): string {
@@ -424,7 +427,8 @@ export function builtinHookDefs(tool: string): HookDef[] {
     key: spec.key,
     event: spec.event,
     matcher: spec.matcher,
-    command: buildCommand(spec.dispatchEvent, tool, spec.matcher),
+    command: (tool === 'zcode' && process.platform !== 'win32' ? `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" ` : '')
+      + buildCommand(spec.dispatchEvent, tool, spec.matcher),
     timeout: withTimeout ? spec.timeoutSec : undefined,
     // The team rules reach the Codex family through its start hooks (#938);
     // Codex would otherwise keep only the start and end of a large rule set.
