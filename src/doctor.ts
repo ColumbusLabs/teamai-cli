@@ -32,6 +32,7 @@ import { describeInvalidToolHomes, envToolHome, realHost, reloadToolHomes, toolH
 import { isToolId } from './tools.js';
 import { isCodexTool } from './utils/tool-names.js';
 import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, keptTeamHookEntries, readCodexHookTrustForScope } from './hooks.js';
+import { codexBuildSkewMessage } from './codex-trust.js';
 import {
   buildDeliveryChecks,
   toolPathsDroppedKeyNotes,
@@ -456,19 +457,24 @@ function usageReportNote({ localConfig, teamConfig }: DoctorContext): string {
  * Whether the public Codex will run the hooks teamai wrote in this scope (#955),
  * asked read-only through `codex app-server` `hooks/list`. A check when Codex
  * answers; the trust reminder as a note when it cannot (no `codex` on PATH, the
- * app-server failed). Nothing when teamai wrote no Codex hook here.
+ * app-server failed). Nothing when teamai wrote no Codex hook here. A failing
+ * build check when the Codex builds teamai found disagree on version (#1244).
  */
 async function codexHookTrust(ctx: DoctorContext): Promise<{ checks: Check[]; notes: string[] }> {
   const report = ctx.teamConfig ? await readCodexHookTrustForScope(ctx.teamConfig, ctx.localConfig) : null;
   if (!report) return { checks: [], notes: [] };
+  const skew = report.skew;
+  const builds: Check[] = skew
+    ? [{ name: 'Codex builds agree', source: 'local', check: async () => false, fix: codexBuildSkewMessage(skew) }]
+    : [];
   if (report.kind !== 'listed') {
     const reason = report.kind === 'failed' ? ` (could not ask Codex: ${report.reason})` : '';
-    return { checks: [], notes: [`${codexTrustReminder()}${reason}`] };
+    return { checks: builds, notes: [`${codexTrustReminder()}${reason}`] };
   }
   const notLoaded = report.notTrusted.some((h) => h.status === 'not loaded');
   const notTrusted = report.notTrusted.map((h) => `${h.command} in ${h.file} (${h.status})`);
   return {
-    checks: [{
+    checks: [...builds, {
       name: 'Codex trusts the teamai hooks',
       source: 'local',
       check: async () => notTrusted.length === 0,

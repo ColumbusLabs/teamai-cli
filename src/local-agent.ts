@@ -23,7 +23,7 @@ import {
   writeJsonAtomic,
 } from './utils/fs.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
-import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS } from './hooks.js';
+import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { isInteractive } from './utils/prompt.js';
@@ -574,33 +574,30 @@ async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: str
   return [...new Set([settings, legacy ?? settings])].map((rel) => path.join(getUserHome(), rel));
 }
 
+async function memberCodexTrust(): Promise<CodexTrustPolicy> {
+  const { loadLocalConfig } = await import('./config.js');
+  return codexTrustPolicy(await loadLocalConfig() ?? {});
+}
+
 /** The member turned off teamai's Codex trust writes (`codexTrustEnabled: false`). */
 async function codexTrustDisabled(): Promise<boolean> {
   const { loadLocalConfig } = await import('./config.js');
   return (await loadLocalConfig())?.codexTrustEnabled === false;
 }
 
-/**
- * Remove a settings-file agent hook from every file it can sit in. In Codex,
- * the hooks after it move up, so the ones Codex trusted are trusted again.
- */
+function agentHookCodexTrust(disabled: boolean, settingsPath: string): CodexTrustPolicy {
+  return disabled ? { kind: 'disabled' } : { kind: 'enabled', codexHome: path.dirname(settingsPath) };
+}
+
+/** Remove a settings-file agent hook from every file it can sit in. */
 async function removeSettingsAgentHook(
   config: LocalAgentConfig | null,
   tool: string,
   opts: { slug: string; command?: string },
 ): Promise<void> {
-  const keepTrust = isCodexTrustGatedTool(tool) && !(await codexTrustDisabled());
+  const disabled = await codexTrustDisabled();
   for (const settingsPath of await agentHookSettingsPaths(config, tool)) {
-    const remove = () => removeAgentHook(settingsPath, tool, opts);
-    if (!keepTrust || !(await pathExists(settingsPath))) {
-      await remove();
-      continue;
-    }
-    const { keepCodexHookTrust } = await import('./codex-trust.js');
-    const trust = await keepCodexHookTrust({ codexHome: path.dirname(settingsPath), cwd: getUserHome(), file: settingsPath }, remove);
-    if (trust.kind === 'failed') {
-      log.warn(`Codex may skip the hooks after agent hook [${opts.slug}] in ${settingsPath} until you approve them in /hooks: ${trust.reason}`);
-    }
+    await removeAgentHook(settingsPath, tool, opts, agentHookCodexTrust(disabled, settingsPath));
   }
 }
 
@@ -3793,7 +3790,7 @@ async function runHookRuleCommand(
     }
   }
 
-  let codexTrustPath: string | undefined;
+  let codexTrust: { settingsPath: string; policy: CodexTrustPolicy } | undefined;
   if (tool === 'hermes') {
     const { applyHermesAgentHook } = await import('./hermes-hooks.js');
     await applyHermesAgentHook({ slug, event, command: cmd, matcher, timeout });
@@ -3809,16 +3806,17 @@ async function runHookRuleCommand(
     await applyPiAgentHook({ slug, event, command: cmd, matcher, timeout });
   } else {
     const [settingsPath] = await agentHookSettingsPaths(config, tool);
-    await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout });
-    if (isCodexTrustGatedTool(tool)) codexTrustPath = settingsPath;
+    const policy = agentHookCodexTrust(await codexTrustDisabled(), settingsPath);
+    await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout }, policy);
+    if (isCodexTrustGatedTool(tool)) codexTrust = { settingsPath, policy };
   }
   manifest[slug] = { tool, event, command: cmd, matcher, timeout };
   await saveAgentHookManifest(manifest);
-  if (codexTrustPath) {
+  if (codexTrust) {
     // Recorded first, so an uninstall still finds the hook Codex will not run.
-    const trust = await codexTrustDisabled()
+    const trust = codexTrust.policy.kind === 'disabled'
       ? { kind: 'disabled' as const }
-      : await trustCodexAgentHook(codexTrustPath, event, cmd);
+      : await trustCodexAgentHook(codexTrust.settingsPath, event, cmd);
     if (trust.kind !== 'trusted') {
       const why = trust.kind === 'disabled' ? 'codexTrustEnabled is false, so approve it in Codex /hooks' : 'reason' in trust ? trust.reason : trust.kind;
       throw new Error(`Codex will not run agent hook [${slug}] until it is trusted: ${why}`);
@@ -4727,6 +4725,7 @@ export async function initLocalAgentHttp(options: {
     getUserHome(),
     options.filterAgents,
     toolRoots,
+    await memberCodexTrust(),
   );
   log.success(`HTTP local agent initialized at ${getConfigPath()}`);
 }

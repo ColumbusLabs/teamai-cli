@@ -38,7 +38,6 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
-import { homedir } from 'node:os';
 import crossSpawn from 'cross-spawn';
 import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
@@ -49,6 +48,7 @@ import { findSqlite3 } from '../sqlite.js';
 import { log } from '../../utils/logger.js';
 import { execCommand, probeBinary } from '../../utils/exec.js';
 import { isOnPath } from '../../utils/lookpath.js';
+import { desktopCodexBinaries } from '../../codex-desktop.js';
 import {
   getCodexSessionsDir,
   resolveRealCwd,
@@ -218,20 +218,13 @@ function pushItemCompleted(records: Record<string, unknown>[], args: ItemComplet
   records.push(buildItemCompletedRecord(args));
 }
 
-/** Location of the codex CLI bundled with Codex Desktop (ChatGPT.app) on macOS. */
-const DESKTOP_CODEX_CANDIDATES = [
-  '/Applications/ChatGPT.app/Contents/Resources/codex',
-  `${homedir()}/Applications/ChatGPT.app/Contents/Resources/codex`,
-  '/Applications/Codex.app/Contents/Resources/codex',
-];
-
 /**
  * The codex CLI that runs: `codex` on PATH (npm / brew install), else the one bundled with
  * Codex Desktop. Probed and later started through cross-spawn, which resolves the npm
  * `codex.cmd` shim on Windows that a plain PATH join and `spawn` miss.
  */
 async function findCodexCli(): Promise<string | null> {
-  for (const candidate of ['codex', ...DESKTOP_CODEX_CANDIDATES]) {
+  for (const candidate of ['codex', ...desktopCodexBinaries()]) {
     if (await probeBinary(candidate)) return candidate;
   }
   return null;

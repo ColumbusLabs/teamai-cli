@@ -1007,6 +1007,17 @@ export type RecordedAgentModel = z.infer<typeof RecordedAgentModelSchema>;
 /** `RecordedAgentModel` by agent stem, then tool. */
 export type AgentModelRecords = Record<string, Record<string, RecordedAgentModel>>;
 
+/** One Codex binary teamai found, and the version its `--version` printed (null when it did not parse). */
+const CodexBuildSchema = z.object({ path: z.string(), version: z.string().nullable() });
+export type CodexBuild = z.infer<typeof CodexBuildSchema>;
+
+/**
+ * Builds that hash a teamai hook differently: teamai trusts with `chosen`, the
+ * newest, and each of `others` hashes at least one of those hooks another way.
+ */
+const CodexBuildSkewSchema = z.object({ chosen: CodexBuildSchema, others: z.array(CodexBuildSchema) });
+export type CodexBuildSkew = z.infer<typeof CodexBuildSkewSchema>;
+
 /** A repo-backed placement that landed: the placed path and the blob push delivered there. */
 const PlacementRecordSchema = z.object({ path: z.string(), blob: z.string() });
 export type PlacementRecord = z.infer<typeof PlacementRecordSchema>;
@@ -1181,6 +1192,10 @@ export const StateSchema = z.object({
    * inputs still match skips spawning `codex app-server`. Absent = run it.
    */
   codexTrustFingerprint: z.string().optional(),
+  /** The Codex builds that disagreed in that pass (#1244), so a pull that skips it still warns. Absent = none. */
+  codexBuildSkew: CodexBuildSkewSchema.optional(),
+  /** The Codex builds that could not list the hooks in the last uncached pass; the same set failing again is cached. Absent = none. */
+  codexBuildUncompared: z.array(CodexBuildSchema).optional(),
   /** Project grants this installation actually created; pre-existing user choices are never recorded. */
   codexProjectTrust: z.array(z.object({ home: z.string(), project: z.string() })).optional(),
   /**

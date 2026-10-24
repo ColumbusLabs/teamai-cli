@@ -287,9 +287,12 @@ Codex runs a non-managed hook only once it is **trusted**. `teamai init`, `pull`
 and `teamai hooks inject` trust the hooks they write (and, in a project, the main
 checkout, or the current worktree when Git cannot locate a main checkout) through `codex app-server`.
 Trust written by a session-start pull applies from the next Codex session. `teamai doctor` names any teamai hook Codex will not
-run. Then: run `teamai pull`; if `codex` is not on PATH or `codexTrustEnabled: false`
+run. Then: run `teamai pull`; if teamai finds no Codex (neither `codex` on PATH nor
+the desktop app's bundled one) or `codexTrustEnabled: false`
 is set in `config.yaml`, guide the user to trust the teamai hooks in Codex `/hooks`,
-then reopen a session. A new linked worktree gets the team hooks from its second
+then reopen a session. When pull or doctor says `Codex builds disagree:`, teamai trusted
+with the newest build and the older one skips the hooks it hashes differently: have the
+user update or remove the older build it names, then run `teamai pull`. A new linked worktree gets the team hooks from its second
 Codex session (the first creates its `.codex/`). Member hooks with the same command
 are preserved and remain untouched by automatic trust. Codex ownership uses the
 recorded event, position and complete entry. A moved entry is recovered only by a

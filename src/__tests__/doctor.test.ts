@@ -490,6 +490,27 @@ describe('doctor — hook checks', () => {
             expect(fix).toContain('then open a new session');
         });
 
+        it('fails "Codex builds agree" naming each build when they hash a teamai hook differently', async () => {
+            const skew = {
+                chosen: { path: '/Applications/Codex.app/Contents/Resources/codex', version: '0.163.0' },
+                others: [{ path: '/usr/local/bin/codex', version: '0.142.5' }],
+            };
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [], skew });
+            const ok = await doctor({});
+            expect(ok).toBe(false);
+            const lines = consoleSpy.mock.calls.map((c) => String(c[0]));
+            expect(lines.filter((msg) => msg.includes('Codex builds agree'))).toEqual([expect.stringContaining('✖')]);
+            const fix = lines.find((msg) => msg.includes('Codex builds disagree:'));
+            expect(fix).toContain('/Applications/Codex.app/Contents/Resources/codex (codex-cli 0.163.0)');
+            expect(fix).toContain('/usr/local/bin/codex (codex-cli 0.142.5) hashes some of them differently');
+        });
+
+        it('adds no build check when the builds agree', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [] });
+            await doctor({});
+            expect(consoleSpy.mock.calls.some((c) => String(c[0]).includes('Codex builds'))).toBe(false);
+        });
+
         it('includes the app-server failure cause in the note', async () => {
             mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'failed', reason: 'hooks/list: boom' });
             await doctor({});

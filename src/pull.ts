@@ -1,6 +1,7 @@
 import { hookToolPathsForConfig } from './types.js';
 import path from 'node:path';
 import { readFile, realpath, stat } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import matter from 'gray-matter';
 import {
   buildRolePullContext, collectClaudemdFiles, describeDeliveryConflict, indexedRuleFiles,
@@ -40,7 +41,7 @@ import {
   type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import type { AgentModelRecords, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
+import type { AgentModelRecords, CodexBuildSkew, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
 import {
   getUserLearningsDir,
   TEAMAI_CULTURE_START,
@@ -2875,7 +2876,7 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   log.debug('Auto-migrating hooks to dispatch format...');
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!teamConfig) return;
-  const { injectHooksToAllTools } = await import('./hooks.js');
+  const { codexTrustPolicy, injectHooksToAllTools } = await import('./hooks.js');
   // Reinject where hooks actually live (resolveHookScope), not resolveBaseDir.
   // The old-format check reads HOME; for a non-self project scope resolveBaseDir
   // → <projectRoot>, so reinjecting there never clears HOME's legacy format and
@@ -2889,7 +2890,7 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   }
   // Paths follow the same scope decision as `baseDir`: a non-self project scope
   // injects into HOME, so it must use the user-scope paths there.
-  await injectHooksToAllTools(hookToolPathsForConfig(teamConfig, localConfig), baseDir, hookFilter, localConfig.toolRoots);
+  await injectHooksToAllTools(hookToolPathsForConfig(teamConfig, localConfig), baseDir, hookFilter, localConfig.toolRoots, codexTrustPolicy(localConfig));
   log.debug('Hooks migrated to dispatch format');
 }
 
@@ -3822,13 +3823,16 @@ async function trustCodexAllScopes(
 ): Promise<void> {
   if (options.dryRun) return;
   const scopes = [userConfig, projectConfig].filter((c): c is LocalConfig => !!c);
+  let warnedSkew: CodexBuildSkew | undefined;
   for (const localConfig of scopes) {
     try {
       const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
       if (!teamConfig) continue;
       const { reportCodexTrust, trustCodexForScope } = await import('./hooks.js');
       const trust = await trustCodexForScope(teamConfig, localConfig);
-      if (!options.silent) reportCodexTrust(trust, 'problems');
+      const skewAlreadyWarned = trust?.skew !== undefined && isDeepStrictEqual(trust.skew, warnedSkew);
+      if (trust?.skew) warnedSkew = trust.skew;
+      if (!options.silent) reportCodexTrust(skewAlreadyWarned ? { ...trust, skew: undefined } : trust, 'problems');
       else if (trust) log.debug(`[${installScopeName(localConfig.scope)}] Codex trust: ${trust.kind}${'reason' in trust ? ` (${trust.reason})` : ''}`);
     } catch (e) {
       log.debug(`[${installScopeName(localConfig.scope)}] Codex trust skipped: ${(e as Error).message}`);
