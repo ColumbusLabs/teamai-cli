@@ -23,6 +23,7 @@ import {
 } from '../workflow/records.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { generateRunId, isRunId, runLockPath } from '../workflow/store.js';
+import { PrUrlSchema } from '../workflow/pr-url.js';
 import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowDiagnostic } from '../workflow/types.js';
 
 const dirs: string[] = [];
@@ -204,7 +205,7 @@ describe('#1083 workflow run records', () => {
 
   it('publishes the failure code of every step failure teamai writes, and only codes it can name', () => {
     // Codes a module writes, as `code: '…'`, `error('…', …)` or `failure('…', …)`, that never become a run's failure: every module of src/workflow and src/scorers, and every other one that imports src/scorers or answers a WorkflowEnvelope.
-    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop', 'bad_workspace', 'workflow_namespace_conflict', 'prompt_namespace_conflict'] satisfies Array<WorkflowDiagnostic['code']>;
+    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop', 'bad_workspace', 'workflow_namespace_conflict', 'prompt_namespace_conflict', 'bad_delivery'] satisfies Array<WorkflowDiagnostic['code']>;
     const answers = ['invalid_json', 'driver_running', 'invalid_run', 'repeated_response', 'agent_in_path', 'stale_response', 'retried', 'end_reached', 'repeated_report', 'wrong_attempt', 'invalid_report', 'lease_cancelled', 'interrupted', 'run_unreadable', 'driver_stuck', 'busy', 'workflow_recursion', 'workflow_not_found',
       // Refusals of a run handover, answered to the command or driver that asked for it.
       'not_owner', 'unsupported_repo', 'reports_unreachable', 'reports_failed', 'run_not_found', 'run_not_published', 'run_mismatch',
@@ -218,6 +219,8 @@ describe('#1083 workflow run records', () => {
       'judge_model_unavailable',
       // Refusals of a teamai score or teamai workflow command line before it reads any run or judge work.
       'invalid_arguments', 'invalid_pass', 'not_initialized', 'unsupported_driver', 'invalid_tools',
+      // Refusals of teamai workflow start for a run whose pull requests would have no branch to target.
+      'no_base_branch',
       // Refusals of teamai score --run, answered to the member who asked for a pass to be judged.
       'scoring_unavailable', 'pass_not_found', 'scorer_not_found', 'entry_leased',
       // Refusals of teamai score --session, answered to the member who asked for a session to be judged.
@@ -234,7 +237,7 @@ describe('#1083 workflow run records', () => {
       ...[...text.matchAll(/(?<![.\w]|function )(?:error|failure)\('([^']+)'/g)].flatMap((match) => match[1] ?? []),
     ]));
     // An `error(…)` whose code is not a literal passes on a code written as a literal elsewhere; each one is named here.
-    const passedOn = ['session-flow/scoring.ts: result.code', 'workflow/engine.ts: tree.failed.code', 'workflow/scoring.ts: built.code', 'workflow/scoring.ts: result.code'];
+    const passedOn = ['session-flow/scoring.ts: result.code', 'workflow/engine.ts: tree.failed.code', 'workflow/engine.ts: undeliverable.code', 'workflow/scoring.ts: built.code', 'workflow/scoring.ts: result.code'];
     const unnamed = files.flatMap(({ file, text }) => [...text.matchAll(/(?<![.\w]|function )(?:error|failure)\((?!')([^,)]+)/g)].map((match) => `${file}: ${match[1]}`)).sort();
     const failedWith = (code: string): RunState => runState({
       status: 'failed',
@@ -392,6 +395,29 @@ describe('#1083 workflow run records', () => {
     expect(remerged.phase).toBe('end');
     expect(remerged.status).toBe('succeeded');
     expect(remerged.endedAt).toBe(end.endedAt);
+  });
+
+  it('lists the pull requests delivered on the run in the order they first appeared, and never a step output', () => {
+    const pr = (n: number): string => `https://github.com/acme/app/pull/${n}`;
+    const receipt = (n: number, step: string, pass: number) => ({ url: PrUrlSchema.parse(pr(n)), branch: `teamai/r1234567890abcdef/${step}/p${pass}`, base: 'main', step, pass });
+    const run = runState({
+      steps: [
+        { id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success', outputs: { pr_url: 'https://untrusted.example/1' } },
+        { id: 'two', status: 'succeeded', attempt: 'a2', settledAt: 3, outcome: 'success' },
+      ],
+      deliveries: [receipt(3, 'two', 1), receipt(1, 'loop.write', 1), receipt(2, 'one', 1)],
+    });
+
+    expect(buildEndRecord(run, driver, 'tester').prs).toEqual([pr(3), pr(1), pr(2)]);
+    expect(buildEndRecord(runState(), driver, 'tester')).not.toHaveProperty('prs');
+  });
+
+  it('drops the prs of an earlier end when a retried run ends again without them', () => {
+    const delivered = { ...buildEndRecord(runState(), driver, 'tester'), prs: ['https://github.com/acme/app/pull/1'] };
+    const again = buildEndRecord(runState(), driver, 'tester');
+
+    expect(mergeRecord(delivered, again)).not.toHaveProperty('prs');
+    expect(mergeRecord(again, delivered).prs).toEqual(['https://github.com/acme/app/pull/1']);
   });
 
   it('queues records durably and keeps them across failure', async () => {

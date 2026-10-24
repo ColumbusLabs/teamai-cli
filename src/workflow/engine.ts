@@ -18,21 +18,28 @@ import {
 } from './template.js';
 import { parseStepPath } from './step-path.js';
 import {
-  ReadSchema, answerHitl, fail, lease, release, settled, skip, start, stopAttempt, stopWhere, stopped, succeed, waitForAnswer,
-  type ItemResult, type LeasedStep, type StepRead, type StepState,
+  ReadSchema, answerHitl, fail, inProgress, lease, release, settled, skip, start, startDelivery, stopAttempt, stopWhere, stopped,
+  succeed, waitForAnswer, type ItemResult, type LeasedStep, type StepRead, type StepState,
 } from './step-state.js';
 import { budgetSpent, countLateTokens, expire, itemsSpent, leaseDeadline, ownDeadline, startLimits } from './limits.js';
 import { addItems, afterStanding, expandItems, isItem, itemsAfter, itemsOf, itemsSettled, startedItems } from './fan-out.js';
 import { decideRound, decideStepLoop, exhaustedAtStart, firstPass, isUnder, loopSettled } from './loop.js';
 import { childScope, contextOf, insertChildren, localId, statesIn, stepDefinitions, topScope, type Scope } from './scope.js';
-import { planWorkspace, plannedBranch, sessionOf, type LeaseSession, type SessionRef, type WorkspaceContract, type WorkspacePlan } from './workspace.js';
+import { deliverableOf, deliveryProblem, deliveryTarget, planWorkspace, plannedBranch, sessionOf, workLeftUndelivered, type LeaseSession, type SessionRef, type WorkspaceContract, type WorkspacePlan } from './workspace.js';
+import {
+  deliverPr, deliveryFailure, findDelivered, reportedPrMismatch, type DeliveryJob,
+} from './pr-delivery.js';
+import { sanitizePrUrl, type PrUrl } from './pr-url.js';
+import { completeDelivery, deliveringStep, nextDelivery, resolveCreate, sameCreate, unresolvedCreate } from './delivery-ledger.js';
+import type { DeliveryKey, UnresolvedCreate } from './delivery-schema.js';
 import {
   CAN_KEYS, CanSchema, ReportedUnenforcedSchema, heldFor, mergeRequirements, negotiate, reportedUnenforced, requiredEnvKeys, unionUnenforced,
   type Allow, type DriverCan, type EnvFacts, type Held, type Negotiation, type ReportedUnenforced, type Terms,
 } from './requirements.js';
 import { knownSecrets, resolveWorkflowEnv, secretKey, type WorkflowEnv } from '../env-resolution.js';
 import { redactJson } from '../utils/redact.js';
-import { generateRunId, installOwner, isRunId, updateRun } from './store.js';
+import { deliveryLockPath, generateRunId, installOwner, isRunId, readRun, updateRun } from './store.js';
+import { withFileLock } from '../update.js';
 import { pinScorers } from '../scorers/cache.js';
 import { isLeaseRef } from '../scorers/entry.js';
 import type {
@@ -72,6 +79,8 @@ export interface ReportInput {
   failure?: WorkflowFailure;
   /** The branch this attempt committed, when it ran in a workspace. */
   changes?: { branch: string; base: string; from: string; to: string; commits: string[] };
+  /** `changes.pr_url` as the driver sent it: a pull request it opened itself, kept only once it is sanitized. */
+  prUrl?: unknown;
   /** The branch and commit this attempt read, when it ran read-only in a workspace. */
   read?: StepRead;
   agent?: ReportedAgent;
@@ -281,13 +290,20 @@ function leaseData(
   } };
 }
 
-/** Records who opened a workspace the first time a driver takes its branch, or who first leases a copy a claim brought in. */
+/**
+ * Records who opened a workspace the first time a driver takes its branch, or who first leases a copy a claim brought in,
+ * and, before the copy has a commit, the branch it starts from.
+ */
 function rememberCopy(run: RunState, plan: WorkspacePlan, driver: DriverIdentity): void {
   const branch = plan.contract?.branch;
   if (!branch) return;
+  const from = plan.contract?.start.branch ?? plan.contract?.merge[0]?.branch;
   const copy = (run.copies ??= {})[branch];
-  if (copy) copy.owner ??= driver;
-  else run.copies[branch] = { owner: driver };
+  if (copy) {
+    copy.owner ??= driver;
+    if (!copy.from && !copy.commit && from && from !== branch) copy.from = from;
+  }
+  else run.copies[branch] = { owner: driver, ...(from && from !== branch ? { from } : {}) };
 }
 
 /** Whether a step holds a lease in copy `branch`. */
@@ -535,17 +551,30 @@ function startWorkflowStep(
 
 /**
  * A step takes how what it ran settled: a workflow step, the outcome, the end, and the outputs of its workflow; a
- * `for_each` step, the outcome and the results of its items.
+ * `for_each` step, the outcome and the results of its items. A workflow step or `for_each` item that delivers goes on
+ * to deliver what it wrote; a `for_each` step delivers nothing of its own, its items do.
  */
-function finishStep(state: StepState, result: WorkflowResult): void {
+function finishStep(run: RunState, state: StepState, definition: WorkflowStep, result: WorkflowResult): void {
   const settlement = {
     settledAt: result.settledAt,
     ...(result.end !== undefined ? { end: result.end } : {}),
     ...(result.outputs !== undefined ? { outputs: result.outputs } : {}),
     ...(result.results ? { results: result.results } : {}),
   };
-  if (result.outcome === 'succeeded') succeed(state, settlement);
-  else fail(state, { ...settlement, ...(result.failure ? { message: result.failure.message, failure: result.failure } : {}) });
+  if (result.outcome !== 'succeeded') {
+    fail(state, { ...settlement, ...(result.failure ? { message: result.failure.message, failure: result.failure } : {}) });
+    return;
+  }
+  const delivers = definition.deliver === 'pr' && (!definition.forEach || isItem(state));
+  const delivery = delivers ? deliverableOf(run, state, definition) : undefined;
+  // A branch that holds nothing beyond the run base opens no pull request, so work a step inside wrote elsewhere would be lost.
+  const left = delivers && !delivery && definition.workflow !== undefined ? workLeftUndelivered(run, state) : undefined;
+  if (delivery) startDelivery(state, settlement, delivery);
+  else if (left) {
+    const key = { step: state.id, pass: state.pass ?? 1, settledAt: result.settledAt, branch: left.branch, head: left.head };
+    const failure = deliveryFailure({ runId: run.id, key }, { kind: 'child_work_left_out', step: left.child.step, branch: left.child.branch });
+    fail(state, { ...settlement, message: failure.message, failure });
+  } else succeed(state, settlement);
 }
 
 function childOrUnreadable(run: RunState, scope: Scope, states: StepState[], state: StepState, definition: WorkflowStep): Scope | { unreadable: string } {
@@ -570,7 +599,7 @@ function advanceInstance(
   if (state.status === 'running') {
     const result = settleRunning(run, scope, states, state, definition, now);
     if (!('outcome' in result)) return result;
-    finishStep(state, result);
+    finishStep(run, state, definition, result);
     return undefined;
   }
   if (definition.forEach && !isItem(state)) {
@@ -759,7 +788,7 @@ function settleScope(run: RunState, scope: Scope, now: string): Settled {
       return decided === 'ended' ? result : { ...result, outcome: 'failed', failure: decided };
     }
     if (ready.length > 0) return { ready };
-    if (states.some((item) => item.status === 'waiting' || item.status === 'leased' || item.status === 'running')) return { inProgress: true };
+    if (states.some(inProgress)) return { inProgress: true };
     return { unreadable: `Run ${run.id} has pending steps whose needs cannot be met` };
   }
 }
@@ -837,6 +866,8 @@ export async function startRun(
   if (mismatch) return error('invalid_inputs', mismatch);
   const tree = await loadWorkflowTree(config, cached);
   if ('failed' in tree) return error(tree.failed.code, tree.failed.message);
+  const undeliverable = deliveryProblem(cached.definition, tree.workflows, options.base);
+  if (undeliverable) return error(undeliverable.code, undeliverable.message);
   const scorers = await pinScorers(config, listedScorers([cached.definition, ...Object.values(tree.workflows)]));
   const pinned = Object.fromEntries([
     ...[cached.definition, ...Object.values(tree.workflows)].map((definition) => [`workflows/${definition.name}.yaml`, definition]),
@@ -937,16 +968,99 @@ export interface NextOptions {
   env?: WorkflowEnv;
 }
 
+/**
+ * The gate before a pull request is opened: with what reports and controls left pending applied, whether the step still
+ * delivers `job`, the branch's recorded commit is still the one `job` checked, and no step that writes the branch is
+ * leased. If so, the run lists its request in the same write, so one opened by a process that then stops is looked up,
+ * whatever becomes of the step, rather than lost.
+ */
+async function markCreating(config: LocalConfig, runId: string, secrets: Record<string, string>, job: DeliveryJob): Promise<'open' | 'refused' | 'busy'> {
+  const marked = await updateRun(config, runId, secrets, async (run): Promise<{ value: 'open' | 'refused' | 'busy'; write?: RunState }> => {
+    if (run === 'missing' || run.status !== 'running') return { value: 'refused' };
+    const now = new Date().toISOString();
+    const settledRun = reconcileRun(run, now);
+    const step = 'unreadable' in settledRun || 'outcome' in settledRun ? undefined : deliveringStep(run, job.key);
+    if (!step) return { value: 'refused' };
+    if (run.copies?.[job.key.branch]?.commit !== job.recordedHead || branchWriterLeased(run, job.key.branch)) return { value: 'busy' };
+    const create = { ...job.key, target: job.target };
+    const listed = run.creating?.find((item) => sameCreate(item, create));
+    // A request listed before is asked again now, so its lookups count from this create.
+    const lookups = { total: 0, none: 0, failed: 0 };
+    if (listed) listed.lookups = lookups;
+    else (run.creating ??= []).push({ ...create, lookups });
+    return { value: 'open', write: { ...run, updatedAt: now } };
+  });
+  return marked.status === 'done' ? marked.value : 'busy';
+}
+
+/**
+ * Delivers the run's delivering steps one at a time, before `next` answers, whichever driver called it, then looks up
+ * each request in `run.creating` once, on an ended run too. The run lock is held to pick a delivery and to apply its
+ * outcome, never across git or a provider. While another process of this machine delivers, it holds the delivery lock,
+ * and this call leaves the work to it.
+ */
+async function drainDeliveries(config: LocalConfig, runId: string, secrets: Record<string, string>): Promise<void> {
+  if (!isRunId(runId)) return;
+  const loaded = await readRun(config, runId);
+  if (typeof loaded === 'string') return;
+  const delivering = loaded.status === 'running' && loaded.steps.some((step) => step.status === 'delivering');
+  if (!delivering && !unresolvedCreate(loaded, [])) return;
+  const drained = await withFileLock(deliveryLockPath(config, runId), { attempts: 1, delayMs: 0 }, async () => {
+    let requeued = false;
+    const tried: Array<Omit<UnresolvedCreate, 'lookups'>> = [];
+    const waiting: DeliveryKey[] = [];
+    for (;;) {
+      const picked = await updateRun(config, runId, secrets, async (run) => {
+        if (run === 'missing') return { value: undefined };
+        const before = JSON.stringify(run);
+        const now = new Date().toISOString();
+        const job = nextDelivery(run, (item) => reconcileRun(item, now), branchWriterLeased, waiting);
+        const value = job ? { job } : unresolvedCreate(run, tried);
+        return { value, ...(JSON.stringify(run) !== before ? { write: { ...run, updatedAt: now } } : {}) };
+      });
+      if (picked.status !== 'done' || !picked.value) return requeued;
+      let apply: (run: RunState, now: string) => { requeueEnd: boolean };
+      if ('job' in picked.value) {
+        const { job } = picked.value;
+        tried.push({ ...job.key, target: job.target });
+        const outcome = await deliverPr(job, () => markCreating(config, runId, secrets, job));
+        // As when the pick is busy: the step still delivers, and a later call checks and delivers it.
+        if (outcome === 'busy') return requeued;
+        if (!outcome.ok && outcome.fault.kind === 'branch_ahead') waiting.push(job.key);
+        apply = (run, now) => completeDelivery(run, job, outcome, (item) => reconcileRun(item, now), branchWriterLeased);
+      } else {
+        const { create, checkout } = picked.value;
+        tried.push(create);
+        const found = await findDelivered(checkout, create);
+        apply = (run) => resolveCreate(run, create, found);
+      }
+      const applied = await updateRun(config, runId, secrets, async (run) => {
+        if (run === 'missing') return { value: undefined };
+        const before = JSON.stringify(run);
+        const now = new Date().toISOString();
+        const { requeueEnd } = apply(run, now);
+        // Queued under the lock with the receipt, as finishRun queues an end; it publishes once the lock is released.
+        if (requeueEnd) run.endRecordQueued = await queueRunRecord(config, run, run.driver, 'end', secrets);
+        return { value: requeueEnd, ...(JSON.stringify(run) !== before ? { write: { ...run, updatedAt: now } } : {}) };
+      });
+      if (applied.status !== 'done' || applied.value === undefined) return requeued;
+      requeued ||= applied.value;
+    }
+  });
+  if (drained.held && drained.value) await publishRunRecords(config);
+}
+
 export async function leaseNext(config: LocalConfig, runId: string, driver: DriverIdentity, options: NextOptions = {}): Promise<WorkflowEnvelope> {
   driver = { kind: driver.kind, machine: driver.machine, workspace: driver.workspace };
   if (options.claim) {
     const claimed = await claimRun(config, runId, { checkout: driver.workspace });
     if (!claimed.ok) return { error: claimed.error };
   }
+  // Resolved once, so the env this `next` offers against and the secrets its writes, deliveries' included, mask agree.
+  const env = options.env ?? await resolveWorkflowEnv(config);
+  await drainDeliveries(config, runId, env.secrets);
   const running = new Set(options.running);
   const can = options.can ?? {};
-  // Resolved once, so the env this `next` offers against and the secrets its writes mask agree.
-  const env = options.env ?? await resolveWorkflowEnv(config);
   const context: OfferContext = { can, allow: config.workflows?.allow ?? {}, facts: env.facts };
   const maxParallel = config.workflows?.max_parallel;
   // The end record is queued under the run lock, so the run stores whether it
@@ -971,9 +1085,14 @@ export async function leaseNext(config: LocalConfig, runId: string, driver: Driv
       queued = await finishRun(config, run, now, result, env.secrets, driver);
       return answer(doneData(run));
     };
-    const wait = (open = run.steps.find((step) => step.status === 'leased')): { save: boolean; envelope: WorkflowEnvelope } => (
-      answer({ wait: { reason: open ? `${open.id} is leased` : 'canTakeLease is false' } })
-    );
+    const wait = (open = run.steps.find((step) => step.status === 'leased')): { save: boolean; envelope: WorkflowEnvelope } => {
+      // Steps still delivering here are being delivered by another process of this machine, waited for a busy run
+      // lock, or wait for a report: of the commit their branch is ahead at on origin, or of a leased step that writes
+      // their branch. A driver polls until they settle.
+      const delivering = run.steps.filter((step) => step.status === 'delivering').map((step) => step.id);
+      const reason = open ? `${open.id} is leased` : delivering.length > 0 ? `${delivering[0]} is delivering` : 'canTakeLease is false';
+      return answer({ wait: { reason, ...(delivering.length > 0 ? { delivering } : {}) } });
+    };
     if (run.status !== 'running') {
       // Settled by an earlier next, which queued the end record unless usage
       // reporting was off; the done envelope reports that record's state.
@@ -1211,6 +1330,7 @@ export function parseReport(value: unknown): ParsedReport | string {
       return 'changes.commits must be an array of strings';
     }
     report.changes = { branch: value.branch, base: value.base, from: value.from, to: value.to, commits: value.commits };
+    if (value.pr_url !== undefined) report.prUrl = value.pr_url;
   }
   if (record.read !== undefined) {
     const read = ReadSchema.safeParse(record.read);
@@ -1232,7 +1352,12 @@ export function parseReport(value: unknown): ParsedReport | string {
     if (!unenforced.success) return 'unenforced must list the requirements the driver did not enforce: max_turns';
     report.unenforced = unenforced.data;
   }
-  return { report, ignored: unreadFields(record, REPORT_FIELDS) };
+  const ignored = unreadFields(record, REPORT_FIELDS);
+  if (isRecord(record.changes)) {
+    const known = new Set(['branch', 'base', 'from', 'to', 'commits', 'pr_url']);
+    ignored.push(...Object.keys(record.changes).filter((key) => !known.has(key)).map((key) => `changes.${key}`));
+  }
+  return { report, ignored };
 }
 
 /** A `next` payload: who the driver is, and what else it tells `next`. */
@@ -1322,11 +1447,23 @@ function branchStillUsed(run: RunState, branch: string, now: string): boolean {
   const ahead = structuredClone(run);
   if ('unreadable' in reconcileRun(ahead, now)) return true;
   for (const item of ahead.steps) {
-    if (item.status === 'running' || settled(item)) continue;
+    if (item.status === 'running' || item.status === 'delivering' || settled(item)) continue;
     const located = locateStep(ahead, item.id);
     if (located && plannedBranch(ahead, located.scope, item, located.step) === branch) return true;
   }
   return false;
+}
+
+/** Whether a leased step writes `branch`, so a commit it pushed before it reported may already be on origin. */
+function branchWriterLeased(run: RunState, branch: string): boolean {
+  return run.steps.some((item) => {
+    if (item.status !== 'leased') return false;
+    const located = locateStep(run, item.id);
+    const plan = located && planWorkspace(run, located.scope, item, located.step, {
+      driver: item.lease.driver, modes: ['read-only', 'new', 'continue'],
+    }, true);
+    return plan !== undefined && plan.mode !== 'read-only' && plan.contract?.branch === branch;
+  });
 }
 
 /**
@@ -1383,6 +1520,20 @@ function continueSession(run: RunState, report: ReportInput): void {
 }
 
 /**
+ * Why the URL a delivering step's report keeps after sanitizing is still dropped, read from the run before its lock is
+ * taken, since the provider's lookup is a network call. The locked report checks the step again.
+ */
+async function reportedPrUnmatched(config: LocalConfig, runId: string, report: ReportInput, url: PrUrl): Promise<string | undefined> {
+  if (report.outcome !== 'success' || !report.changes || !isRunId(runId)) return undefined;
+  const run = await readRun(config, runId);
+  if (typeof run === 'string' || !run.checkout) return undefined;
+  const target = deliveryTarget(run, report.changes.branch);
+  const step = run.steps.find((item) => item.status === 'leased' && item.lease.attempt === report.attempt);
+  if (!step || target === undefined || locateStep(run, step.id)?.step.deliver !== 'pr') return undefined;
+  return reportedPrMismatch({ checkout: run.checkout, url, branch: report.changes.branch, target });
+}
+
+/**
  * Counts the tokens a report of an attempt the engine stopped says it spent, so a budget does not undercount the work a
  * stop cut short. Only the driver that held the lease counts, and only once. Returns whether it counted them.
  */
@@ -1399,6 +1550,8 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
     return error('judge_lease', `Attempt ${report.attempt} is a judge lease, which workflow report does not settle. Submit its answer with: teamai score --lease ${report.attempt} --submit --stdin`);
   }
   const install = await installOwner(config);
+  const reported = report.prUrl === undefined ? undefined : sanitizePrUrl(report.prUrl);
+  const unmatched = reported?.url ? await reportedPrUnmatched(config, runId, report, reported.url) : undefined;
   return withRun(config, runId, secrets ?? await knownSecrets(config), async (run, now) => {
     // Settled membership wins. An old revision of a settled attempt is still repeated_report.
     if (run.settledAttempts.includes(report.attempt)) {
@@ -1491,11 +1644,22 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
     if (contract && (report.outcome === 'success' || report.exitCode !== undefined || report.changes || report.read)) {
       ((run.copies ??= {})[contract.branch] ??= { owner: report.driver }).used = true;
     }
+    const successful = { ...settlement, ...(report.outputs !== undefined ? { outputs: report.outputs } : {}) };
+    const delivery = outcome === 'success' && defined?.deliver === 'pr' ? deliverableOf(run, step, defined, report.changes) : undefined;
     const settledStep = outcome === 'released' ? release(step)
-      : outcome === 'success' ? succeed(step, { ...settlement, ...(report.outputs !== undefined ? { outputs: report.outputs } : {}) })
-        : fail(step, { ...settlement, failure });
-    // From the lease, so a reader that was the copy's last user lets the driver remove the worktree.
+      : outcome !== 'success' ? fail(step, { ...settlement, failure })
+        : delivery ? startDelivery(step, successful, { ...delivery, ...(reported?.url && !unmatched ? { reported: reported.url } : {}) })
+          : succeed(step, successful);
+    // From the lease, so a reader that was the copy's last user lets the driver remove the worktree. Delivery reads the
+    // pushed branch, so it does not keep the worktree.
     const cleanup = outcome === 'success' && contract !== undefined && !branchStillUsed(run, contract.branch, now);
+    // A URL that is not kept, or that no delivery uses, is named without its value, which may hold a token, and the
+    // report still counts.
+    const dropReason = reported?.reason ?? unmatched ?? (reported?.url === undefined || delivery ? undefined
+      : defined?.deliver !== 'pr' ? 'the step has no deliver: pr'
+        : outcome === 'released' ? 'the step was released'
+          : outcome !== 'success' ? 'the step failed'
+            : 'the branch has no changes beyond the run base');
     return {
       save: true,
       envelope: ok({
@@ -1503,6 +1667,7 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
         revision: run.revision,
         step: { id: settledStep.id, status: settledStep.status, outcome, ...(settlement.unenforced ? { unenforced: settlement.unenforced } : {}) },
         ...(cleanup ? { cleanup: true } : {}),
+        ...(dropReason ? { dropped: [{ field: 'changes.pr_url', reason: dropReason }] } : {}),
       }),
     };
   });

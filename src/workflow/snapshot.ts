@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { canonicalJson } from '../utils/canonical-json.js';
 import { redact } from '../utils/redact.js';
 import { isRecord } from './expression.js';
+import { CommitIdSchema, DeliveryReceiptSchema, UnresolvedCreateSchema } from './delivery-schema.js';
 import {
   ArchivedPassSchema, LimitsFromSchema, ReleasedTokensSchema, SessionContinuationSchema, StepCheckpointSchema, type ArchivedPass, type HitlAnswer, type StepPass, type StepState,
 } from './step-state.js';
@@ -18,9 +19,6 @@ import type { RunState, StepLease, WorkflowDefinition, WorkflowFailure } from '.
 /** The install that owns a published run: a random id kept under its data home, and the member's team username for messages. */
 const OwnerSchema = z.object({ id: z.string().min(1), user: z.string() });
 export type HandoffOwner = z.infer<typeof OwnerSchema>;
-
-/** A claim hands every commit a snapshot names to git, so each is only ever a full commit id. */
-const CommitIdSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 
 const ReportedCommitsSchema = z.object({
   changes: z.object({ base: CommitIdSchema, from: CommitIdSchema, to: CommitIdSchema, commits: z.array(CommitIdSchema) }).optional(),
@@ -53,7 +51,10 @@ const BodySchema = z.object({
   round: z.number().int().optional(),
   base: z.object({ ref: z.string().optional(), commit: CommitIdSchema }).optional(),
   /** The run's workspaces by branch, with the commit each was last reported at. Which driver holds one stays local. */
-  copies: z.record(z.object({ commit: CommitIdSchema.optional() })),
+  copies: z.record(z.object({ commit: CommitIdSchema.optional(), from: z.string().optional() })),
+  deliveries: z.array(DeliveryReceiptSchema).optional(),
+  /** The requests a claimer looks up before anything opens another: the machine that handed the run over may have opened them. */
+  creating: z.array(UnresolvedCreateSchema).optional(),
   sessionContinuations: z.array(SessionContinuationSchema).optional(),
   releasedTokens: z.array(ReleasedTokensSchema).optional(),
   /** The scorers the run pinned, by hash only: the machine that claims the run uses its own copy when the hash matches. */
@@ -75,8 +76,12 @@ const SnapshotSchema = z.object({
   write: z.string().min(1),
 }).merge(BodySchema).superRefine((snapshot, ctx) => {
   // A claim hands each copy's branch to git, so a snapshot never names a branch outside its own run.
-  for (const branch of Object.keys(snapshot.copies)) {
+  for (const [branch, copy] of Object.entries(snapshot.copies)) {
     if (!branch.startsWith(`teamai/${snapshot.run}/`)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['copies', branch], message: 'is not a branch of this run' });
+    // A pull request from the copy may target the branch it started from.
+    if (copy.from !== undefined && !copy.from.startsWith(`teamai/${snapshot.run}/`)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['copies', branch, 'from'], message: 'is not a branch of this run' });
+    }
   }
 });
 export type RunSnapshot = z.infer<typeof SnapshotSchema>;
@@ -193,8 +198,8 @@ const RUN_RULES = {
   end: 'publish', failure: 'rewrite', inputs: 'publish', sourceHash: 'publish', teamRevision: 'publish',
   definition: 'rewrite', workflows: 'rewrite', scorers: 'rewrite', steps: 'rewrite', settledAttempts: 'rewrite', settledCount: 'rewrite',
   endRecordQueued: 'drop', cancelledAttempts: 'rewrite', archive: 'rewrite', round: 'publish', base: 'publish',
-  checkout: 'drop', copies: 'rewrite', sessionContinuations: 'publish', releasedTokens: 'publish', stoppedAttempts: 'drop', publication: 'drop', createdAt: 'publish', limitsFrom: 'publish',
-  updatedAt: 'publish',
+  checkout: 'drop', copies: 'rewrite', deliveries: 'publish', creating: 'publish', sessionContinuations: 'publish', releasedTokens: 'publish',
+  stoppedAttempts: 'drop', publication: 'drop', createdAt: 'publish', limitsFrom: 'publish', updatedAt: 'publish',
 } satisfies FieldRules<RunState>;
 
 const STEP_RULES = {
@@ -202,15 +207,15 @@ const STEP_RULES = {
   iteration: 'publish', round: 'publish', status: 'publish', attempt: 'publish', lease: 'rewrite', outcome: 'publish',
   outputs: 'publish', end: 'publish', results: 'publish', settledAt: 'publish', exitCode: 'publish', message: 'drop',
   tool: 'publish', model: 'publish', session: 'publish', tokens: 'publish', changes: 'publish', read: 'publish',
-  agent: 'publish', used: 'publish', installId: 'publish', loopFinal: 'publish', failure: 'rewrite', unenforced: 'publish', expiresAt: 'publish',
-  limitsFrom: 'publish',
+  agent: 'publish', used: 'publish', installId: 'publish', loopFinal: 'publish', failure: 'rewrite', delivery: 'publish', unenforced: 'publish',
+  expiresAt: 'publish', limitsFrom: 'publish',
 } satisfies FieldRules<StepState>;
 
 const PASS_RULES = {
   pass: 'publish', attempt: 'publish', outcome: 'publish', outputs: 'publish', end: 'publish', results: 'publish',
   failure: 'rewrite', exitCode: 'publish', message: 'drop', tool: 'publish', model: 'publish', session: 'publish',
   tokens: 'publish', changes: 'publish', read: 'publish', agent: 'publish', used: 'publish', installId: 'publish', answer: 'rewrite',
-  unenforced: 'publish',
+  delivery: 'publish', unenforced: 'publish',
 } satisfies FieldRules<StepPass>;
 
 const ARCHIVED_RULES = { ...PASS_RULES, step: 'publish', within: 'publish' } satisfies FieldRules<ArchivedPass>;
@@ -225,7 +230,7 @@ const FAILURE_RULES = { 'code': 'publish', message: 'rewrite' } satisfies FieldR
 // A lease another machine held is released when the run is handed over, so the session it offered stays here.
 const LEASE_RULES = { attempt: 'publish', revision: 'publish', driver: 'rewrite', session: 'drop', unenforced: 'drop', expiresAt: 'drop' } satisfies FieldRules<StepLease>;
 
-const COPY_RULES = { owner: 'drop', commit: 'publish', used: 'drop' } satisfies FieldRules<NonNullable<RunState['copies']>[string]>;
+const COPY_RULES = { owner: 'drop', commit: 'publish', from: 'publish', used: 'drop' } satisfies FieldRules<NonNullable<RunState['copies']>[string]>;
 
 const FAILURE_REWRITES = {
   message: () => ({ message: HANDED_FAILURE_MESSAGE }),

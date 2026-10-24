@@ -1,6 +1,7 @@
 /** Workflow types for the v1alpha1 local-driver subset. */
 
 import type { PinnedScorer } from '../scorers/pin.js';
+import type { DeliveryReceipt, UnresolvedCreate } from './delivery-schema.js';
 import type { ArchivedPass, LimitsFrom, ReleasedTokens, SessionContinuation, StepState, StoppedAttempt } from './step-state.js';
 import type { Requirements, Setup, Unenforced } from './requirements.js';
 import type { LeaseSession } from './workspace.js';
@@ -77,6 +78,8 @@ export interface WorkflowStep {
    * A prompt that omits it continues an enclosing `new` or `continue` copy, or stays read-only.
    */
   workspace?: typeof WORKSPACE_MODES[number];
+  /** Opens a review request after the branch's work succeeds. TeamAI never merges it. */
+  deliver?: 'pr';
   /** A session this step resumes. `continue` uses this step's previous pass. `from` names another step. */
   session?: { continue: true } | { from: string };
   /** What the driver that runs this step, or every step of the workflow it runs, must provide. */
@@ -214,8 +217,9 @@ export interface WorkflowDiagnostic {
    *   to repeat or to run per item, or run on past the point the author wrote to stop at.
    * `bad_session`: a `session.from` pull rejects; the kept copy would resume a step the author did not name.
    * `bad_workspace`: `workspace` is not read-only, new, or continue; the kept copy would run the step in the wrong place.
+   * `bad_delivery`: delivery is not PR creation on a writable branch; the kept copy would apply a different policy.
    */
-  code?: 'unknown_key' | 'missing_needs' | 'false_if' | 'bad_template' | 'dotted_name' | 'undeclared_output' | 'undeclared_end' | 'bad_loop' | 'bad_session' | 'bad_workspace' | 'workflow_namespace_conflict' | 'prompt_namespace_conflict';
+  code?: 'unknown_key' | 'missing_needs' | 'false_if' | 'bad_template' | 'dotted_name' | 'undeclared_output' | 'undeclared_end' | 'bad_loop' | 'bad_session' | 'bad_workspace' | 'workflow_namespace_conflict' | 'prompt_namespace_conflict' | 'bad_delivery';
 }
 
 export type StepOutcome = 'success' | 'failed' | 'released';
@@ -291,11 +295,23 @@ export interface RunState {
   checkout?: string;
   /**
    * Workspaces this run has handed out, by branch. A `continue` step stays with the driver that opened the copy. A copy a
-   * claim brought from another machine has no owner until a driver leases it. `used` is set once a step ran in the copy:
-   * a report on a lease of it was accepted, neither `released` nor a setup failure. Only a lease on an unused copy
-   * carries setup, and only an unused copy's owner gives it up when it hands its lease back. Local run state only.
+   * claim brought from another machine has no owner until a driver leases it. `from` is the run branch the copy started
+   * from, `after` items before other needs, so a pull request from it targets the nearest delivered branch it grew from.
+   * `used` is set once a step ran in the copy: a report on a lease of it was accepted, neither `released` nor a setup
+   * failure. Only a lease on an unused copy carries setup, and only an unused copy's owner gives it up when it hands its
+   * lease back. `used` is local run state only.
    */
-  copies?: Record<string, { owner?: DriverIdentity; commit?: string; used?: true }>;
+  copies?: Record<string, { owner?: DriverIdentity; commit?: string; from?: string; used?: true }>;
+  /**
+   * The pull requests delivered on this run, once each, in the order they first appeared. Append-only: a receipt says a
+   * request was opened, never that it is still open, so whether a delivery reuses one is its host's lookup to say.
+   */
+  deliveries?: DeliveryReceipt[];
+  /**
+   * The pull requests TeamAI asked a host to open and has no receipt for, listed under the run lock right before each
+   * create. A receipt or a lookup removes one; a retry, a cancel or an archive of its step does not.
+   */
+  creating?: UnresolvedCreate[];
   /**
    * Sessions a step resumed and continued under another id, in report order: a copy on another machine or in another
    * tool. `to` holds the turns of `from` and the ones that step added, so a step that would resume `from` resumes `to`.

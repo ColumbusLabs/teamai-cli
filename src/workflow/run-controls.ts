@@ -10,7 +10,7 @@ import { archiveUnder, isUnder } from './loop.js';
 import { spentTokens, startLimits } from './limits.js';
 import { publishRunRecords, removeQueuedEndRecord } from './records.js';
 import { contextOf, localId, statesIn } from './scope.js';
-import { answerHitl, cancel, repend, resetIteration, resetPending, settled, start, stopAttempt, stopWhere, stopped, type HitlAnswer, type StepState } from './step-state.js';
+import { answerHitl, cancel, cancellable, redeliver, repend, resetIteration, resetPending, settled, start, stopAttempt, stopWhere, stopped, type HitlAnswer, type StepState } from './step-state.js';
 import type { RunState, WorkflowEnvelope } from './types.js';
 
 async function controlRun(
@@ -121,7 +121,7 @@ export async function cancelRun(config: LocalConfig, runId: string, secrets: Rec
     } else {
       const state = run.steps.find((state) => state.id === step);
       if (!state) return missingStepError(run, step);
-      if (state.status !== 'pending' && state.status !== 'waiting' && state.status !== 'leased' && state.status !== 'running') return error('not_cancellable', `Step "${state.id}" is ${state.status}; only pending, waiting, leased or running steps can be cancelled`);
+      if (!cancellable(state)) return error('not_cancellable', `Step "${state.id}" is ${state.status}; only pending, waiting, leased, running or delivering steps can be cancelled`);
       const located = locateStep(run, step);
       if (!located) return missingStepError(run, step);
       changed = state.status === 'running' ? stopWhere(run, isUnder(state.id), failure, run.revision, now) : [];
@@ -230,6 +230,7 @@ function retryInstance(run: RunState, state: StepState, now: string): void {
       cancel(state, failure, run.revision);
       break;
     case 'running':
+    case 'delivering':
       stopWhere(run, isUnder(state.id), failure, run.revision, now);
       break;
     case 'succeeded':
@@ -273,7 +274,9 @@ export async function retryStep(config: LocalConfig, runId: string, secrets: Rec
     const reopened = run.status !== 'running';
     for (const container of containers) {
       if (container.child === target) {
-        retryInstance(run, target, now);
+        // A failed delivery delivers the same branch again; the agent's work it delivers does not change.
+        if (target.status === 'failed' && target.failure?.code === 'delivery_failed' && target.delivery) redeliver(target, target.delivery);
+        else retryInstance(run, target, now);
         resetIteration(target);
       }
       for (const state of container.states) {

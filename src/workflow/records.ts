@@ -40,6 +40,7 @@ const RECORDED_FAILURES = [
   'tool_failed', 'tool_unavailable', 'agent_unavailable', 'model_unavailable', 'read_only_dirty', 'tool_unconfigured', 'tool_unsupported',
   'merge_conflict', 'base_config', 'push_failed', 'workspace_base', 'bad_session',
   ...LIMIT_FAILURES,
+  'delivery_failed', 'protected_path',
 ] as const;
 type RecordedFailure = (typeof RECORDED_FAILURES)[number];
 
@@ -101,6 +102,8 @@ export type WorkflowRunRecord = {
   stepCounts?: { total: number; succeeded: number; failed: number; skipped: number; cancelled: number };
   /** Settled attempts across the run — the cumulative iteration count. */
   iterations?: number;
+  /** The pull requests the run delivered, in the order they first appeared. Public on a public team repo; absent when it delivered none. */
+  prs?: string[];
   username: string;
   publishedAt: string;
 };
@@ -215,6 +218,8 @@ export function buildEndRecord(
     ]),
     ...(run.archive ?? []).map((archived) => entry(archived.step, archived.pass, archived)),
   ];
+  // Receipts are what delivery recorded, never a step's outputs, and each URL appears once.
+  const prs = (run.deliveries ?? []).map((receipt) => receipt.url);
   return {
     ...buildStartRecord(run, driver, username, now),
     phase: 'end',
@@ -236,6 +241,7 @@ export function buildEndRecord(
     // Cumulative when present; runs from before the counter fall back to the
     // bounded history length (their true count is unknowable now).
     iterations: run.settledCount ?? run.settledAttempts.length,
+    ...(prs.length ? { prs } : {}),
   };
 }
 
@@ -253,6 +259,7 @@ export function mergeRecord(origin: WorkflowRunRecord | null, next: WorkflowRunR
   const merged = { ...origin, ...next, startedAt: origin.startedAt };
   if (next.end === undefined) delete merged.end;
   if (next.failure === undefined) delete merged.failure;
+  if (next.prs === undefined) delete merged.prs;
   return merged;
 }
 

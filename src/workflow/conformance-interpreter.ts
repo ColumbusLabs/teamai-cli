@@ -1,4 +1,5 @@
 /** The conformance scenario language, the driver profiles it speaks as, and the interpreter that runs a scenario. */
+import { z } from 'zod';
 import type { DriverIdentity, RunState, WorkflowEnvelope } from './types.js';
 
 export interface WorkflowClient {
@@ -87,9 +88,22 @@ export type ConformanceOperation =
     as?: DriverProfile;
     attempt?: string;
     revision?: number;
+    /** Fields added to the `changes` the harness reports from the workspace of this operation's saved lease. */
+    changes?: Record<string, unknown>;
     body: Record<string, unknown>;
     expect: Record<string, unknown>;
   };
+
+const SavedLeaseSchema = z.object({
+  attempt: z.string(), revision: z.number(), workspace: z.object({ branch: z.string(), base: z.object({ commit: z.string() }) }).optional(),
+});
+type SavedLease = z.infer<typeof SavedLeaseSchema>;
+
+/** The `changes` a report of `lease` carries: the branch and base of its workspace, and the scenario's own fields. */
+function leasedChanges(lease: SavedLease | undefined, fields: Record<string, unknown>): Record<string, unknown> {
+  if (!lease?.workspace) throw new Error('A report with changes needs a saved lease that ran in a workspace');
+  return { branch: lease.workspace.branch, base: lease.workspace.base.commit, from: 'a'.repeat(40), to: 'b'.repeat(40), commits: [], ...fields };
+}
 
 /** The assertions a runner lends the interpreter, so the scenarios do not depend on a test framework. */
 export type ConformanceExpect = (actual: unknown, message?: string) => {
@@ -117,7 +131,7 @@ export async function runConformanceScenario(scenario: ConformanceScenario, runn
   const started = await client.start(scenario.workflowName);
   if ('error' in started) throw new Error(started.error.message);
   const runId = String(started.data.run);
-  const leases = new Map<string, { attempt: string; revision: number }>();
+  const leases = new Map<string, SavedLease>();
   const attemptOf = (name: string): string | undefined => leases.get(name)?.attempt;
   for (const operation of scenario.operations) {
     switch (operation.kind) {
@@ -140,7 +154,7 @@ export async function runConformanceScenario(scenario: ConformanceScenario, runn
         if (operation.cancelled) expect('data' in envelope && envelope.data.cancelled).toEqual(operation.cancelled.map(attemptOf));
         for (const field of operation.absent ?? []) expect('data' in envelope ? envelope.data.lease : undefined).not.toHaveProperty(field);
         if ('data' in envelope && envelope.data.lease) {
-          leases.set(operation.saveAs, envelope.data.lease as { attempt: string; revision: number });
+          leases.set(operation.saveAs, SavedLeaseSchema.parse(envelope.data.lease));
         }
         break;
       }
@@ -165,6 +179,7 @@ export async function runConformanceScenario(scenario: ConformanceScenario, runn
           revision: operation.revision ?? lease?.revision,
           driver: profileDriver(operation.as ?? 'local'),
           ...operation.body,
+          ...(operation.changes ? { changes: leasedChanges(lease, operation.changes) } : {}),
         })).toMatchObject(operation.expect);
         break;
       }

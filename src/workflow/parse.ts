@@ -21,7 +21,7 @@ import { REQUIREMENT_KEYS, RequirementsSchema, SetupSchema, type Requirements, t
 
 const HEADER_KEYS = new Set(['schemaVersion', 'name', 'description', 'inputs', 'defaults', 'ends', 'outputs', 'loop', 'timeout', 'budget', 'setup', 'steps']);
 const ACTION_KEYS = Object.keys(STEP_ACTIONS);
-const STEP_KEYS = new Set(['id', 'needs', 'if', ...ACTION_KEYS, 'env', 'with', 'agent', 'model', 'output', 'end', 'loop', 'break', 'for_each', 'approve', 'choose', 'interactive', 'workspace', 'session', 'scorers', 'requires', 'timeout', 'budget', 'max_turns']);
+const STEP_KEYS = new Set(['id', 'needs', 'if', ...ACTION_KEYS, 'env', 'with', 'agent', 'model', 'output', 'end', 'loop', 'break', 'for_each', 'approve', 'choose', 'interactive', 'workspace', 'session', 'scorers', 'requires', 'timeout', 'budget', 'max_turns', 'deliver']);
 const STEP_LOOP_KEYS = new Set(['back_to', 'while', 'max_iterations']);
 const FOR_EACH_KEYS = new Set(['items', 'max_parallel']);
 const WORKFLOW_LOOP_KEYS = new Set(['while', 'max_iterations']);
@@ -523,6 +523,20 @@ function parseBody(
         });
       }
       const sessionPair = item.items.find((pair) => scalarString(pair.key) === 'session');
+      const deliverPair = item.items.find((pair) => scalarString(pair.key) === 'deliver');
+      const deliver = scalarString(deliverPair?.value)?.trim();
+      // Only what no enclosing step can change is checked per file. A prompt without workspace may continue the copy of
+      // the step that runs its workflow, so workflow start checks it on the whole tree.
+      const undeliverable = deliver !== 'pr' ? `${label} deliver must be pr; TeamAI opens a pull request and never merges`
+        : workspace === 'read-only' ? `${label} has deliver: pr but runs read-only; set workspace: new so it has a branch to deliver`
+          : commandPair && workspace === undefined ? `${label} has deliver: pr but runs read-only, as a command without workspace does; set workspace: new so it has a branch to deliver`
+            : undefined;
+      if (deliverPair && undeliverable) {
+        diagnostics.push({
+          ...locate(file, lineCounter, deliverPair.value ?? deliverPair.key ?? item, `${field}.deliver`, undeliverable),
+          code: 'bad_delivery',
+        });
+      }
       let session: WorkflowStep['session'];
       if (sessionPair) {
         const sessionText = scalarString(sessionPair.value)?.trim();
@@ -574,6 +588,7 @@ function parseBody(
           ...(breakSource !== undefined ? { break: breakSource } : {}),
           ...(forEach ? { forEach } : {}),
           ...(workspace ? { workspace } : {}),
+          ...(deliver === 'pr' ? { deliver } : {}),
           ...(session ? { session } : {}),
         });
       }
