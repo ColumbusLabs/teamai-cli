@@ -43,7 +43,7 @@ import { z } from 'zod';
 import { AgentAdapter, type SessionMeta, type SessionReadRef, type Subagent, type SubagentsRead } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
-import { titleFromUserText, visibleUserText } from '../title.js';
+import { typedTitle, visibleUserText } from '../title.js';
 import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { findSqlite3 } from '../sqlite.js';
 import { log } from '../../utils/logger.js';
@@ -344,10 +344,10 @@ export class CodexAdapter extends AgentAdapter {
     return name;
   }
 
-  async listConversations(projectPath?: string): Promise<SessionMeta[]> {
+  async listConversations(projectPath?: string, { archived = false }: { archived?: boolean } = {}): Promise<SessionMeta[]> {
     const metas: SessionMeta[] = [];
 
-    for (const f of this.scanJsonlFiles()) {
+    for (const f of archived ? this.scanAllRollouts() : this.scanJsonlFiles()) {
       const first = this.readFirstLine(f);
       if (!first || first.type !== 'session_meta') continue;
 
@@ -402,7 +402,7 @@ export class CodexAdapter extends AgentAdapter {
             text = (content ?? []).map((c) => String(c.text ?? '')).join(' ');
           }
           if (!text) continue;
-          const cleaned = titleFromUserText(visibleUserText(text));
+          const cleaned = typedTitle(text);
           if (cleaned) contentTitle = cleaned;
         }
       } catch {
@@ -483,7 +483,7 @@ export class CodexAdapter extends AgentAdapter {
           text = (content ?? []).map((c) => String(c.text ?? '')).join(' ');
         }
         if (!text) continue;
-        const cleaned = titleFromUserText(visibleUserText(text));
+        const cleaned = typedTitle(text);
         if (cleaned) {
           readTitle = cleaned;
           break;
@@ -614,7 +614,8 @@ export class CodexAdapter extends AgentAdapter {
           arguments_ = { input: payload.input };
         } else {
           try {
-            arguments_ = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : (argsRaw as Record<string, unknown>) ?? {};
+            const decoded: unknown = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : argsRaw ?? {};
+            arguments_ = typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded) ? { ...decoded } : { _raw: String(argsRaw) };
           } catch {
             arguments_ = { _raw: String(argsRaw) };
           }

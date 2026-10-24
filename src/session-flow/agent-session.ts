@@ -112,6 +112,8 @@ export type AgentSessionListQuery = {
   cwd?: string;
   /** ISO 8601. Sessions last updated before it are left out. */
   updatedSince?: string;
+  /** Also list the sessions a tool archived and `find` still reads, such as Codex's `archived_sessions/`. */
+  archived?: boolean;
 };
 
 export type AgentSessionList = {
@@ -127,6 +129,7 @@ export type AgentSession = {
   find(ref: AgentSessionRef, options?: AgentSessionFindOptions): Promise<AgentSessionFound>;
   transcript(session: Session): AgentSessionTranscriptEntry[];
   platformForTool(tool: string): string | undefined;
+  toolForPlatform(platform: string): string;
 };
 
 /**
@@ -341,7 +344,7 @@ async function listedFilePath(target: AgentAdapter, sessionId: string, cwd: stri
   }
 }
 
-async function listPlatform(platform: string, cwd: string | undefined, toolRoots: ToolRoots): Promise<AgentSessionList> {
+async function listPlatform(platform: string, cwd: string | undefined, toolRoots: ToolRoots, archived: boolean): Promise<AgentSessionList> {
   const adapter = adapterFor(platform, 'read', toolRoots);
   if ('code' in adapter) return { sessions: [], failures: [adapter] };
   if (!adapter.isReady()) {
@@ -350,7 +353,7 @@ async function listPlatform(platform: string, cwd: string | undefined, toolRoots
   }
   let metas: SessionMeta[];
   try {
-    metas = await adapter.listConversations(cwd);
+    metas = await (archived ? adapter.listConversations(cwd, { archived }) : adapter.listConversations(cwd));
   } catch (e) {
     const message = messageOf(e);
     if (e instanceof ToolUnavailableError) return { sessions: [], failures: [{ code: 'tool_unavailable', platform, message }] };
@@ -374,10 +377,10 @@ async function listPlatform(platform: string, cwd: string | undefined, toolRoots
  * The sessions of the tools named, or of every installed tool. Tools are listed concurrently and
  * each failure is that tool's alone.
  */
-async function list({ platforms, cwd, updatedSince }: AgentSessionListQuery = {}): Promise<AgentSessionList> {
+async function list({ platforms, cwd, updatedSince, archived = false }: AgentSessionListQuery = {}): Promise<AgentSessionList> {
   const toolRoots = await recordedToolRoots(cwd);
   const listed = await Promise.all(
-    (platforms ?? listInstalledPlatforms(toolRoots)).map((platform) => listPlatform(platform, cwd, toolRoots)),
+    (platforms ?? listInstalledPlatforms(toolRoots)).map((platform) => listPlatform(platform, cwd, toolRoots, archived)),
   );
   const since = updatedSince === undefined ? undefined : Date.parse(updatedSince);
   const sessions = listed
@@ -519,4 +522,9 @@ function platformForTool(tool: string): string | undefined {
   return Object.entries(SESSION_PLATFORM_FACTS).find(([, facts]) => facts.tool === tool)?.[0];
 }
 
-export const AgentSession = { list, copy, find, transcript, platformForTool } as const satisfies AgentSession;
+/** The tool whose sessions `platform` holds, the reverse of `platformForTool`. */
+function toolForPlatform(platform: string): string {
+  return sessionPlatformFacts(platform)?.tool ?? platform;
+}
+
+export const AgentSession = { list, copy, find, transcript, platformForTool, toolForPlatform } as const satisfies AgentSession;

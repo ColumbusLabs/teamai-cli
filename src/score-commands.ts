@@ -1,5 +1,7 @@
 import { autoDetectInit } from './config.js';
+import { scoreSession, type SessionDemand } from './session-flow/scoring.js';
 import type { LocalConfig } from './types.js';
+import { LabelStore } from './scorers/label-store.js';
 import { setStderrOnly } from './utils/logger.js';
 import { nextJudgeLease, parseJudgeRequest, parseJudgeSubmission, runJudgeLease, scoreOnDemand, submitJudgeLease, type ScoreDemand } from './workflow/scoring.js';
 import type { WorkflowEnvelope } from './workflow/types.js';
@@ -16,6 +18,9 @@ export interface ScoreOptions {
   scorer?: string[];
   queue?: boolean;
   batch?: boolean;
+  session?: string;
+  source?: string;
+  push?: boolean;
 }
 
 function writeEnvelope(envelope: WorkflowEnvelope): void {
@@ -63,6 +68,20 @@ function demandOf(options: ScoreOptions): ScoreDemand | WorkflowEnvelope {
   };
 }
 
+/** The session `--session` asks for, or the failure that says what is missing. */
+function sessionDemandOf(options: ScoreOptions): SessionDemand | WorkflowEnvelope {
+  if (options.next || options.lease !== undefined || options.json !== undefined || options.stdin) {
+    return failure('invalid_arguments', '--session takes no --next, --lease or payload: teamai score [--session <id>] [--source <platform>] --scorer <name> [--batch]');
+  }
+  const [scorer, ...scorers] = options.scorer ?? [];
+  if (scorer === undefined) return failure('invalid_arguments', 'Pass --scorer <name> to judge a session: teamai score [--session <id>] [--source <platform>] --scorer <name> [--batch]');
+  return {
+    scorers: [scorer, ...scorers],
+    ...(options.session !== undefined ? { session: options.session } : {}), ...(options.source !== undefined ? { source: options.source } : {}),
+    ...(options.batch ? { batch: true } : {}), ...(options.push ? { push: true } : {}),
+  };
+}
+
 async function localConfig(): Promise<{ ok: true; config: LocalConfig } | { ok: false; envelope: WorkflowEnvelope }> {
   try {
     return { ok: true, config: (await autoDetectInit()).localConfig };
@@ -72,14 +91,32 @@ async function localConfig(): Promise<{ ok: true; config: LocalConfig } | { ok: 
 }
 
 async function score(options: ScoreOptions): Promise<WorkflowEnvelope> {
-  if (options.run !== undefined || options.step !== undefined || options.pass !== undefined || options.scorer?.length || options.queue || options.batch) {
+  const asksForPass = options.run !== undefined || options.step !== undefined || options.pass !== undefined || options.queue;
+  const asksForSession = options.session !== undefined || options.source !== undefined || (!asksForPass && (options.scorer?.length || options.batch));
+  if (asksForPass && (options.session !== undefined || options.source !== undefined)) return failure('invalid_arguments', 'Pass --run to judge a workflow pass or --session to judge a session, not both');
+  if (options.push && (asksForPass || options.next || options.lease !== undefined)) {
+    return failure('invalid_arguments', '--push goes alone or with a session: teamai score --push, or teamai score [--session <id>] --scorer <name> --push');
+  }
+  if (asksForSession) {
+    const demand = sessionDemandOf(options);
+    if (!('scorers' in demand)) return demand;
+    const loaded = await localConfig();
+    if (!loaded.ok) return loaded.envelope;
+    return scoreSession(loaded.config, demand);
+  }
+  if (options.push) {
+    if (options.json !== undefined || options.stdin) return failure('invalid_arguments', '--push takes no payload: teamai score --push');
+    const loaded = await localConfig();
+    return loaded.ok ? LabelStore.push(loaded.config) : loaded.envelope;
+  }
+  if (asksForPass) {
     const demand = demandOf(options);
     if (!('run' in demand)) return demand;
     const loaded = await localConfig();
     return loaded.ok ? scoreOnDemand(loaded.config, demand) : loaded.envelope;
   }
   if (options.next === (options.lease !== undefined)) {
-    return failure('invalid_arguments', 'Pass --next to take judge work, --lease <ref> to judge it here, --lease <ref> --submit to settle it, or --run <id> --step <path> --scorer <name> to judge a pass on demand');
+    return failure('invalid_arguments', 'Pass --next to take judge work, --lease <ref> to judge it here, --lease <ref> --submit to settle it, --run <id> --step <path> --scorer <name> to judge a pass on demand, --scorer <name> [--session <id>] to judge a session, or --push to publish pending labels');
   }
   const payload = await payloadOf(options);
   if (!payload.ok) return payload.envelope;
