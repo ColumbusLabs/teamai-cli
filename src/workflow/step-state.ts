@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { AgentObservationSchema, UsedSchema } from '../agent-observation.js';
 import { DriverSchema } from '../driver-identity.js';
 import type { TokenUsage } from '../tool-launch/stdout.js';
-import type { StepLease, WorkflowFailure } from './types.js';
+import { UnenforcedSchema } from './requirements.js';
+import type { RunState, StepLease, WorkflowFailure } from './types.js';
 import type { WorkspaceMode } from './workspace.js';
 
 const TokenUsageSchema: z.ZodType<TokenUsage> = z.object({
@@ -10,6 +11,24 @@ const TokenUsageSchema: z.ZodType<TokenUsage> = z.object({
   output: z.number().optional(),
   cachedInput: z.number().optional(),
 });
+
+/**
+ * Where a workflow's limits count from: when its timeout starts, and the tokens already spent under it, which its budget
+ * does not count. A workflow step records it each time it starts; the run, when a retry reopens it.
+ */
+export const LimitsFromSchema = z.object({ at: z.string(), tokens: z.number() });
+export type LimitsFrom = z.infer<typeof LimitsFromSchema>;
+
+/** The tokens a released attempt spent, which a budget still counts once its step has nothing of the attempt. */
+export const ReleasedTokensSchema = z.object({ step: z.string(), attempt: z.string(), tokens: TokenUsageSchema });
+export type ReleasedTokens = z.infer<typeof ReleasedTokensSchema>;
+
+/**
+ * An attempt the engine stopped, whose driver may still report what it spent, whatever its step became since: the step,
+ * the driver that held the lease, and when the engine stopped it, so a budget that started counting later does not pay.
+ */
+export const StoppedAttemptSchema = z.object({ attempt: z.string(), step: z.string(), driver: DriverSchema, stoppedAt: z.string() });
+export type StoppedAttempt = z.infer<typeof StoppedAttemptSchema>;
 
 const FailureSchema: z.ZodType<WorkflowFailure> = z.object({ code: z.string(), message: z.string() });
 
@@ -23,6 +42,7 @@ const LeaseSessionSchema = SessionRefSchema.extend({ earlier: z.array(SessionRef
 
 const LeaseSchema: z.ZodType<StepLease> = z.object({
   attempt: z.string(), revision: z.number(), driver: DriverSchema, session: LeaseSessionSchema.optional(),
+  unenforced: z.array(UnenforcedSchema).optional(), expiresAt: z.string().optional(),
 });
 
 const ChangesSchema = z.object({
@@ -60,9 +80,11 @@ const report = {
   used: UsedSchema.optional().catch(undefined),
   /** The install whose `report` settled the attempt, so scoring knows which machine holds its session after a claim. */
   installId: z.string().optional(),
+  /** The best-effort requirements the attempt's driver could not enforce. */
+  unenforced: z.array(UnenforcedSchema).optional(),
 };
 
-export const OutcomeSchema = z.enum(['success', 'failed', 'skipped', 'cancelled']);
+export const OutcomeSchema = z.enum(['success', 'failed', 'timeout', 'skipped', 'cancelled']);
 /** The outcome an expression reads of a settled step. */
 export type VisibleOutcome = z.infer<typeof OutcomeSchema>;
 
@@ -148,13 +170,21 @@ const settledFields = {
  */
 const PendingSchema = StepBaseSchema.extend({ status: z.literal('pending') });
 const WaitingSchema = StepBaseSchema.extend({ status: z.literal('waiting') });
-const RunningSchema = StepBaseSchema.extend({ status: z.literal('running') });
+/**
+ * `expiresAt`: when the step's `timeout`, or that of the workflow file it runs, ends it. `limitsFrom`: where the budget of
+ * the workflow it runs counts from. Both are set when it starts.
+ */
+const RunningSchema = StepBaseSchema.extend({ status: z.literal('running'), expiresAt: z.string().optional(), limitsFrom: LimitsFromSchema.optional() });
 const SucceededSchema = StepBaseSchema.extend({
   status: z.literal('succeeded'), outcome: z.literal('success').default('success'), ...settledFields, loopFinal: z.boolean().optional(),
 });
-const FailedSchema = StepBaseSchema.extend({ status: z.literal('failed'), outcome: z.literal('failed').default('failed'), ...settledFields, failure: FailureSchema.optional() });
+const FailedSchema = StepBaseSchema.extend({
+  status: z.literal('failed'), outcome: z.literal('failed').default('failed'), ...settledFields, failure: FailureSchema.optional(),
+});
 const SkippedSchema = StepBaseSchema.extend({ status: z.literal('skipped'), settledAt: z.number().int().default(0) });
-const CancelledSchema = StepBaseSchema.extend({ status: z.literal('cancelled'), settledAt: z.number().int().default(0), attempt: z.string().optional(), failure: FailureSchema });
+const CancelledSchema = StepBaseSchema.extend({
+  status: z.literal('cancelled'), settledAt: z.number().int().default(0), attempt: z.string().optional(), failure: FailureSchema, unenforced: report.unenforced,
+});
 
 export const StepStateSchema = z.discriminatedUnion('status', [
   PendingSchema,
@@ -204,7 +234,12 @@ type Settlement<T extends StepState> = Omit<T, keyof StepBase | 'status' | 'outc
 
 const BASE_KEYS = Object.keys(StepBaseSchema.shape) as Array<keyof StepBase>;
 const SETTLED_KEYS = Object.keys(settledFields) as Array<keyof typeof settledFields>;
-export const VISIBLE_OUTCOMES = { succeeded: 'success', failed: 'failed', skipped: 'skipped', cancelled: 'cancelled' } as const;
+const VISIBLE_OUTCOMES = { succeeded: 'success', failed: 'failed', skipped: 'skipped', cancelled: 'cancelled' } as const;
+
+/** The outcome expressions and records read of a settled step: a failure with code `timeout` reads as `timeout`. */
+export function visibleOutcome(step: Extract<StepState, { status: keyof typeof VISIBLE_OUTCOMES }>): VisibleOutcome {
+  return step.status === 'failed' && step.failure?.code === 'timeout' ? 'timeout' : VISIBLE_OUTCOMES[step.status];
+}
 
 /**
  * Replaces a step's fields in place with `next`, keeping the fields every step has, and returns it as its new variant.
@@ -276,9 +311,12 @@ export function lease(state: StepState, held: StepLease): LeasedStep {
   return become<LeasedStep>(state, { status: 'leased', attempt: held.attempt, lease: held });
 }
 
-/** A workflow step starts; `inputs` are the values its `with` passed, when that workflow declares inputs. */
-export function start(state: StepState, inputs?: Record<string, unknown>): RunningStep {
-  const running = become<RunningStep>(state, { status: 'running' });
+/**
+ * A workflow step starts; `inputs` are the values its `with` passed, when that workflow declares inputs, and `limits`
+ * when its timeout ends it and where its workflow's budget counts from.
+ */
+export function start(state: StepState, inputs?: Record<string, unknown>, limits: Pick<RunningStep, 'expiresAt' | 'limitsFrom'> = {}): RunningStep {
+  const running = become<RunningStep>(state, { status: 'running', ...limits });
   if (inputs) running.inputs = inputs;
   return running;
 }
@@ -291,15 +329,35 @@ export function fail(state: StepState, settlement: Settlement<FailedStep>): Fail
   return become<FailedStep>(state, { status: 'failed', outcome: 'failed', ...settlement });
 }
 
-/** An open step is cancelled before it settles. A leased one keeps its invalidated attempt. */
+/** What a lease the engine stops leaves on its step: the invalidated attempt and what it did not enforce. */
+function stoppedLease(state: StepState): { attempt?: string; unenforced?: StepLease['unenforced'] } {
+  if (state.status !== 'leased') return {};
+  return { attempt: state.attempt, ...(state.lease.unenforced ? { unenforced: state.lease.unenforced } : {}) };
+}
+
+/**
+ * Stops the attempt of leased step `state` at `now`, before its step is cancelled or times out: a report of it is
+ * answered `lease_cancelled`, and its own driver's tokens are still counted once (`countLateTokens`).
+ */
+export function stopAttempt(run: RunState, state: LeasedStep, now: string): void {
+  (run.cancelledAttempts ??= []).push(state.attempt);
+  (run.stoppedAttempts ??= []).push({ attempt: state.attempt, step: state.id, driver: state.lease.driver, stoppedAt: now });
+}
+
+/** A leased or running step whose deadline passed fails with `timeout`. */
+export function timeOut(state: LeasedStep | RunningStep, failure: WorkflowFailure & { code: 'timeout' }, settledAt: number): FailedStep {
+  return become<FailedStep>(state, { status: 'failed', outcome: 'failed', settledAt, ...stoppedLease(state), message: failure.message, failure });
+}
+
+/** An open step is cancelled before it settles. */
 export function cancel(state: StepIn<'pending' | 'waiting' | 'leased' | 'running'>, failure: WorkflowFailure, settledAt: number): CancelledStep {
-  return become<CancelledStep>(state, { status: 'cancelled', settledAt, ...(state.status === 'leased' ? { attempt: state.attempt } : {}), failure });
+  return become<CancelledStep>(state, { status: 'cancelled', settledAt, ...stoppedLease(state), failure });
 }
 
 /** The current pass of a settled step, as `passes` keeps it once a loop runs the step again; undefined while it has not settled. */
 export function passOf(state: StepState): StepPass | undefined {
   if (!settled(state)) return undefined;
-  const outcome = VISIBLE_OUTCOMES[state.status];
+  const outcome = visibleOutcome(state);
   return StepPassSchema.parse({ ...state, pass: state.pass ?? 1, outcome });
 }
 
@@ -380,4 +438,40 @@ export function settled(step: StepState | undefined): step is Extract<StepState,
       return unknown;
     }
   }
+}
+
+/**
+ * Stops every open step whose path `under` matches, in sub-workflows too: a leased step is cancelled and its attempt
+ * stopped at `now` (`stopAttempt`), a running workflow step is cancelled, and a pending or waiting step is skipped. Used
+ * by an end or break, cancel and retry, each with its own failure. Returns the ids this walk changed.
+ */
+export function stopWhere(run: RunState, under: (id: string) => boolean, failure: WorkflowFailure, settledAt: number, now: string): string[] {
+  const changed: string[] = [];
+  for (const state of run.steps) {
+    if (!under(state.id)) continue;
+    if (!settled(state)) changed.push(state.id);
+    switch (state.status) {
+      case 'pending':
+      case 'waiting':
+        skip(state, settledAt);
+        break;
+      case 'running':
+        cancel(state, failure, settledAt);
+        break;
+      case 'leased':
+        stopAttempt(run, state, now);
+        cancel(state, failure, settledAt);
+        break;
+      case 'succeeded':
+      case 'failed':
+      case 'skipped':
+      case 'cancelled':
+        break;
+      default: {
+        const unknown: never = state;
+        return unknown;
+      }
+    }
+  }
+  return changed;
 }
