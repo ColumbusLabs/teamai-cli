@@ -7,7 +7,8 @@ import {
   type ResourceNamespaces,
   type RolesManifest,
 } from './roles.js';
-import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries } from './projects.js';
+import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries, type AllProjectResourceType } from './projects.js';
+import { isNestedPlaceableType, NAMESPACE_AXIS, type PlaceableType } from './push-namespaces.js';
 import { assertNoCaseAliasedNamespaces } from './manifest-schema.js';
 import { warnOnce } from './utils/warn-once.js';
 import { deliveredMembers } from './workspace-children.js';
@@ -179,8 +180,8 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
   const activePrompts = new Set(activeNamespaces.prompts ?? []);
   const inactivePromptsNamespaces = [...declaredPromptsNamespaces].filter((namespace) => !activePrompts.has(namespace));
 
-  // Scorers follow the prompts rule. Nothing reads scorers/<ns>/ on pull yet
-  // (#1085); this is the set that reader will withhold.
+  // Which scorers/<dir>/ is a namespace is `isNamespaceDir`'s rule; the scorer
+  // cache withholds this set.
   const declaredScorersNamespaces = new Set<string>([
     ...(rolesManifest?.roles ?? []).flatMap((role) => role.resources.scorers ?? []),
     ...(projectsManifest?.projects ?? []).flatMap((project) => project.resources.scorers ?? []),
@@ -196,6 +197,25 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
     inactivePromptsNamespaces,
     inactiveScorersNamespaces,
   };
+}
+
+/** What the roles and projects manifests declare, as far as `isNamespaceDir` needs it. */
+export interface NamespaceDeclarations {
+  /** True when any role or project declares `namespace` on `axis`. */
+  declares(axis: AllProjectResourceType, namespace: string): boolean;
+  /** True when there is neither a roles nor a projects manifest. */
+  readonly manifestFree: boolean;
+}
+
+/**
+ * Whether `<type>/<dir>/` is a namespace rather than shared content. Most types namespace their first directory by
+ * construction. docs, wiki and prompts nest freely, so a directory is a namespace only where a role or project declares
+ * it. Scorers are flat files and follow prompts, except that with no manifest at all every directory is a namespace.
+ */
+export function isNamespaceDir(type: PlaceableType, dir: string, declarations: NamespaceDeclarations): boolean {
+  if (type === 'scorers') return declarations.manifestFree || declarations.declares(NAMESPACE_AXIS.scorers, dir);
+  if (isNestedPlaceableType(type)) return declarations.declares(NAMESPACE_AXIS[type], dir);
+  return true;
 }
 
 /**

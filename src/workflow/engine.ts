@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { parseReportedAgent, settleObservation, type ReportedAgent } from '../agent-observation.js';
+import { DriverSchema } from '../driver-identity.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig } from '../types.js';
 import { loadCachedWorkflow, loadWorkflowTree } from './cache.js';
@@ -17,14 +18,16 @@ import {
 } from './template.js';
 import { parseStepPath } from './step-path.js';
 import {
-  DriverSchema, ReadSchema, answerHitl, cancel, fail, lease, release, settled, skip, start, stopped, succeed, waitForAnswer,
+  ReadSchema, answerHitl, cancel, fail, lease, release, settled, skip, start, stopped, succeed, waitForAnswer,
   type ItemResult, type LeasedStep, type StepRead, type StepState,
 } from './step-state.js';
 import { addItems, afterStanding, expandItems, isItem, itemsAfter, itemsOf, itemsSettled, startedItems } from './fan-out.js';
 import { decideRound, decideStepLoop, exhaustedAtStart, firstPass, loopSettled } from './loop.js';
 import { childScope, contextOf, insertChildren, localId, statesIn, stepDefinitions, topScope, type Scope } from './scope.js';
 import { planWorkspace, plannedBranch, sessionOf, type LeaseSession, type SessionRef, type WorkspaceContract, type WorkspaceMode, type WorkspacePlan } from './workspace.js';
-import { generateRunId, isRunId, updateRun } from './store.js';
+import { generateRunId, installOwner, isRunId, updateRun } from './store.js';
+import { pinScorers } from '../scorers/cache.js';
+import { isLeaseRef } from '../scorers/entry.js';
 import type {
   DriverIdentity,
   OutputSchema,
@@ -32,12 +35,12 @@ import type {
   RunStatus,
   StepLease,
   StepOutcome,
-  TokenUsage,
   WorkflowEnvelope,
   WorkflowFailure,
   WorkflowStep,
 } from './types.js';
 import { hasAction } from './types.js';
+import type { TokenUsage } from '../tool-launch/stdout.js';
 
 /**
  * Recent settled attempt ids kept for `repeated_report`.
@@ -68,7 +71,7 @@ export interface ReportInput {
 }
 
 /** A protocol rejection that retains its actionable code and message. */
-export function error(code: string, message: string): WorkflowEnvelope {
+export function error(code: string, message: string): Extract<WorkflowEnvelope, { error: unknown }> {
   return { error: { code, message } };
 }
 
@@ -756,6 +759,14 @@ function inputsMismatch(name: string, declared: Record<string, OutputSchema> | u
   return extra === undefined ? null : `inputs.${extra} is not an input workflow "${name}" declares`;
 }
 
+/** Every scorer name a step of `definitions` lists, inline workflows included. */
+function listedScorers(definitions: ReadonlyArray<{ steps: WorkflowStep[] }>): string[] {
+  return definitions.flatMap((definition) => definition.steps.flatMap((step) => [
+    ...step.scorers?.names ?? [],
+    ...(typeof step.workflow === 'object' ? listedScorers([step.workflow]) : []),
+  ]));
+}
+
 /** Creates a run. `inputs` are checked against the declared inputs before the run file exists. */
 export async function startRun(
   config: LocalConfig,
@@ -771,6 +782,7 @@ export async function startRun(
   if (mismatch) return error('invalid_inputs', mismatch);
   const tree = await loadWorkflowTree(config, cached);
   if ('failed' in tree) return error(tree.failed.code, tree.failed.message);
+  const scorers = await pinScorers(config, listedScorers([cached.definition, ...Object.values(tree.workflows)]));
   const now = new Date().toISOString();
   const run: RunState = {
     schemaVersion: 'v1alpha1',
@@ -783,6 +795,7 @@ export async function startRun(
     ...(tree.teamRevision ? { teamRevision: tree.teamRevision } : {}),
     definition: cached.definition,
     ...(Object.keys(tree.workflows).length > 0 ? { workflows: tree.workflows } : {}),
+    ...(Object.keys(scorers).length > 0 ? { scorers } : {}),
     steps: cached.definition.steps.map((step) => ({ id: step.id, status: 'pending' })),
     settledAttempts: [],
     ...(options.base ? { base: options.base } : {}),
@@ -1250,6 +1263,10 @@ function continueSession(run: RunState, report: ReportInput): void {
 }
 
 export async function reportAttempt(config: LocalConfig, runId: string, report: ReportInput): Promise<WorkflowEnvelope> {
+  if (isLeaseRef(report.attempt)) {
+    return error('judge_lease', `Attempt ${report.attempt} is a judge lease, which workflow report does not settle. Submit its answer with: teamai score --lease ${report.attempt} --submit --stdin`);
+  }
+  const install = await installOwner(config);
   return withRun(config, runId, async (run) => {
     // Settled membership wins. An old revision of a settled attempt is still repeated_report.
     if (run.settledAttempts.includes(report.attempt)) {
@@ -1314,6 +1331,7 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
       ...(report.changes ? { changes: report.changes } : {}),
       ...(report.read ? { read: report.read } : {}),
       agent: settleObservation(report, defined?.agent),
+      installId: install.id,
     };
     if (outcome !== 'released') continueSession(run, report);
     if (report.changes) {

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { canonicalJson } from '../utils/canonical-json.js';
 import { redact } from '../utils/redact.js';
 import { isRecord } from './expression.js';
 import {
@@ -54,6 +55,8 @@ const BodySchema = z.object({
   /** The run's workspaces by branch, with the commit each was last reported at. Which driver holds one stays local. */
   copies: z.record(z.object({ commit: CommitIdSchema.optional() })),
   sessionContinuations: z.array(SessionContinuationSchema).optional(),
+  /** The scorers the run pinned, by hash only: the machine that claims the run uses its own copy when the hash matches. */
+  scorers: z.record(z.object({ sourceHash: z.string() })).optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
   steps: z.array(withCommitIds(StepCheckpointSchema)),
@@ -90,17 +93,6 @@ export function snapshotPath(runId: string): string {
 /** The text a snapshot is written as: two-space JSON, one field per line, ending in a newline. */
 export function snapshotText(snapshot: RunSnapshot): string {
   return `${JSON.stringify(snapshot, null, 2)}\n`;
-}
-
-/** JSON with object keys sorted and undefined fields left out, so equal values give equal text. */
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(sorted(value));
-}
-
-function sorted(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sorted);
-  if (!isRecord(value)) return value;
-  return Object.fromEntries(Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => [key, sorted(value[key])]));
 }
 
 /** Identifies the parsed definitions a run executes, whatever file layout produced them. */
@@ -197,7 +189,7 @@ type Rewrites<T, R> = { readonly [K in keyof R as R[K] extends 'rewrite' ? K : n
 const RUN_RULES = {
   schemaVersion: 'publish', id: 'rewrite', name: 'publish', revision: 'publish', status: 'publish', driver: 'drop',
   end: 'publish', failure: 'rewrite', inputs: 'publish', sourceHash: 'publish', teamRevision: 'publish',
-  definition: 'rewrite', workflows: 'rewrite', steps: 'rewrite', settledAttempts: 'rewrite', settledCount: 'rewrite',
+  definition: 'rewrite', workflows: 'rewrite', scorers: 'rewrite', steps: 'rewrite', settledAttempts: 'rewrite', settledCount: 'rewrite',
   endRecordQueued: 'drop', cancelledAttempts: 'rewrite', archive: 'rewrite', round: 'publish', base: 'publish',
   checkout: 'drop', copies: 'rewrite', sessionContinuations: 'publish', publication: 'drop', createdAt: 'publish', updatedAt: 'publish',
 } satisfies FieldRules<RunState>;
@@ -207,16 +199,16 @@ const STEP_RULES = {
   iteration: 'publish', round: 'publish', status: 'publish', attempt: 'publish', lease: 'rewrite', outcome: 'publish',
   outputs: 'publish', end: 'publish', results: 'publish', settledAt: 'publish', exitCode: 'publish', message: 'drop',
   tool: 'publish', model: 'publish', session: 'publish', tokens: 'publish', changes: 'publish', read: 'publish',
-  agent: 'publish', loopFinal: 'publish', failure: 'rewrite',
+  agent: 'publish', installId: 'publish', loopFinal: 'publish', failure: 'rewrite',
 } satisfies FieldRules<StepState>;
 
 const PASS_RULES = {
   pass: 'publish', attempt: 'publish', outcome: 'publish', outputs: 'publish', end: 'publish', results: 'publish',
   failure: 'rewrite', exitCode: 'publish', message: 'drop', tool: 'publish', model: 'publish', session: 'publish',
-  tokens: 'publish', changes: 'publish', read: 'publish', agent: 'publish', answer: 'rewrite',
+  tokens: 'publish', changes: 'publish', read: 'publish', agent: 'publish', installId: 'publish', answer: 'rewrite',
 } satisfies FieldRules<StepPass>;
 
-const ARCHIVED_RULES = { ...PASS_RULES, step: 'publish' } satisfies FieldRules<ArchivedPass>;
+const ARCHIVED_RULES = { ...PASS_RULES, step: 'publish', within: 'publish' } satisfies FieldRules<ArchivedPass>;
 
 const ANSWER_RULES = {
   choice: 'publish', note: 'publish', at: 'publish', channel: 'publish', agent: 'publish', driver: 'drop',
@@ -255,6 +247,9 @@ const RUN_REWRITES = {
   id: () => ({}),
   definition: (run) => ({ definitionHash: definitionHash(run.definition, run.workflows) }),
   workflows: () => ({}),
+  scorers: (run) => (run.scorers
+    ? { scorers: Object.fromEntries(Object.entries(run.scorers).map(([name, pin]) => [name, { sourceHash: pin.sourceHash }])) }
+    : {}),
   failure: (run) => (run.failure ? { failure: handed(run.failure, FAILURE_RULES, FAILURE_REWRITES) } : {}),
   steps: (run) => ({ steps: run.steps.map((step) => handed(step, STEP_RULES, STEP_REWRITES)) }),
   // settledAttempts only dedups reports on this machine; the engine counts from it when settledCount is absent.

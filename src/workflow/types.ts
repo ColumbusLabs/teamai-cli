@@ -1,5 +1,6 @@
 /** Workflow types for the v1alpha1 local-driver subset. */
 
+import type { PinnedScorer } from '../scorers/pin.js';
 import type { ArchivedPass, SessionContinuation, StepState } from './step-state.js';
 import type { LeaseSession } from './workspace.js';
 
@@ -50,6 +51,8 @@ export interface WorkflowStep {
   agent?: string;
   /** The model a prompt step runs on, as written: an alias from `models/aliases.yaml` or a model name. The driver resolves it. */
   model?: string;
+  /** The scorers that judge this prompt or workflow step's succeeded passes. */
+  scorers?: StepScorers;
   output?: OutputSchema;
   /** Variables a command step receives, as written; `{{ inputs.… }}` and `{{ steps.… }}` render when the step is leased. */
   env?: Record<string, string>;
@@ -132,6 +135,14 @@ export interface InlineWorkflow {
 export interface WorkflowDefaults {
   /** The model of a prompt step whose step and definition choose none, as written. */
   model?: string;
+  /** Whether a step's scorers share one judge call when the step does not say. */
+  scorers?: { batch: boolean };
+}
+
+/** `scorers: [a, b]`, or `scorers: { names: [a, b], batch: true }`. Each name is a file in `scorers/`. */
+export interface StepScorers {
+  names: string[];
+  batch?: boolean;
 }
 
 export interface WorkflowDefinition {
@@ -188,12 +199,6 @@ export interface StepLease {
   session?: LeaseSession;
 }
 
-export interface TokenUsage {
-  input?: number;
-  output?: number;
-  cachedInput?: number;
-}
-
 export interface WorkflowFailure {
   code: string;
   message: string;
@@ -221,6 +226,8 @@ export interface RunState {
   definition: WorkflowDefinition;
   /** The sub-workflows the run uses, by name, as they were cached when it started. */
   workflows?: Record<string, WorkflowDefinition>;
+  /** The scorers its steps list, by name, as they were cached when it started. A name with no valid scorer then is absent. */
+  scorers?: Record<string, PinnedScorer>;
   /**
    * Step instances in declaration order; a sub-workflow's steps follow the step that runs it. Never changed in place:
    * adding or removing an instance assigns a new array, so an index the engine keeps per array never goes stale.
@@ -286,10 +293,10 @@ export interface CachedWorkflow {
 
 export type WorkflowEnvelope =
   | { data: Record<string, unknown> }
-  | { error: { code: string; message: string } };
+  | { error: { code: string; message: string; labels?: Array<Record<string, unknown>> } };
 
 export function isWorkflowError(
   envelope: WorkflowEnvelope,
-): envelope is { error: { code: string; message: string } } {
+): envelope is Extract<WorkflowEnvelope, { error: unknown }> {
   return 'error' in envelope;
 }

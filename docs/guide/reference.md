@@ -56,6 +56,7 @@ sharing:
         secret: my-signing-key
         timeout: 5000
         retries: 3
+
 ```
 
 ### config.yaml (local config)
@@ -74,6 +75,8 @@ gitExcludeEnabled: true
 contributeHintEnabled: false
 usageReportEnabled: false
 codexTrustEnabled: false
+scoring:
+  isolation: verified          # this scope's judges must be verified; the strictest of team, scorer and this wins
 toolRoots:
   claude: ~/.claude-work
   codex: ~/.codex-alt

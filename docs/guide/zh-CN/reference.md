@@ -56,6 +56,7 @@ sharing:
         secret: my-signing-key
         timeout: 5000
         retries: 3
+
 ```
 
 ### config.yaml（本地配置）
@@ -74,6 +75,8 @@ gitExcludeEnabled: true
 contributeHintEnabled: false
 usageReportEnabled: false
 codexTrustEnabled: false
+scoring:
+  isolation: verified          # 本作用域的评审必须是 verified；团队、评分器与此处取最严格的一项
 toolRoots:
   claude: ~/.claude-work
   codex: ~/.codex-alt

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { syncScorerDefinitions, type SyncScorerOptions, type SyncScorerResult } from '../scorers/cache.js';
 import { log } from '../utils/logger.js';
 import { pathExists, readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
@@ -19,18 +20,41 @@ import { formatDiagnostic, parseWorkflow, promptFileDiagnostics, stepField } fro
 import type { WorkflowFiles } from './parse-context.js';
 import type { CachedWorkflow, WorkflowDefinition, WorkflowDiagnostic, WorkflowStep } from './types.js';
 import { assertSafePath, assertWithinRoot } from '../utils/path-safety.js';
-import { createGit, getHeadCommit } from '../utils/git.js';
+import { createGit } from '../utils/git.js';
+import {
+  remotelyReachableRevision, revisionHoldsSources, withoutStaleTeamRevision, type ReachableRevision,
+} from '../utils/team-revision.js';
 
-export interface SyncWorkflowOptions {
-  dryRun?: boolean;
-  scopeLabel?: string;
-}
+export type SyncWorkflowOptions = SyncScorerOptions;
 
 export interface SyncWorkflowResult {
   cached: string[];
   kept: string[];
   invalid: WorkflowDiagnostic[];
   unrunnable: string[];
+  /** The scorers of the same tree, synced first. */
+  scorers: SyncScorerResult;
+  /** Scorers a step lists that `scorers` has no valid version of. The workflow still runs; the step runs without them. */
+  unknownScorers: UnknownScorer[];
+}
+
+export interface UnknownScorer {
+  file: string;
+  /** The step's path, such as `check.review`. */
+  step: string;
+  scorer: string;
+}
+
+export function formatUnknownScorer({ file, step, scorer }: UnknownScorer): string {
+  return `${file}: step "${step}" lists scorer "${scorer}", which has no valid scorers/${scorer}.md; the step runs without it`;
+}
+
+/** The scorers a definition's steps list, including inside its inline workflows, with each step's path. */
+function scorersListedBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; scorer: string }> {
+  return definition.steps.flatMap((step) => [
+    ...(step.scorers?.names ?? []).map((scorer) => ({ step: `${prefix}${step.id}`, scorer })),
+    ...(typeof step.workflow === 'object' ? scorersListedBy(step.workflow, `${prefix}${step.id}.`) : []),
+  ]);
 }
 
 /** One version of a file, as its reference checks read it: this revision, or the copy the cache keeps. */
@@ -47,13 +71,6 @@ interface Candidate extends Version {
   sourceHash: string;
   teamRevision?: string;
 }
-
-interface ReachableRevision {
-  repositoryRoot: string;
-  revision: string;
-}
-
-const TEAM_REMOTE_REFS = 'refs/remotes/origin/';
 
 /** What a file runs after this sync, and why the versions it did not pick cannot run. */
 interface Settled {
@@ -126,61 +143,8 @@ async function workflowFileNames(dir: string): Promise<string[]> {
   }
 }
 
-async function isTeamRemoteRevision(root: string, revision: string): Promise<boolean> {
-  try {
-    const refs = await createGit(root).raw([
-      'for-each-ref', `--contains=${revision}`, '--format=%(refname)', TEAM_REMOTE_REFS,
-    ]);
-    return refs.trim() !== '';
-  } catch {
-    return false;
-  }
-}
-
-/** The checked-out commit, only when the team remote can reach it. */
-async function remotelyReachableRevision(root: string): Promise<ReachableRevision | undefined> {
-  try {
-    const revision = await getHeadCommit(root);
-    if (!revision || !await isTeamRemoteRevision(root, revision)) return undefined;
-    return {
-      repositoryRoot: await fs.realpath((await createGit(root).revparse(['--show-toplevel'])).trim()),
-      revision,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-async function withoutStaleTeamRevision(root: string, cached: CachedWorkflow | null): Promise<CachedWorkflow | null> {
-  if (!cached?.teamRevision || await isTeamRemoteRevision(root, cached.teamRevision)) return cached;
-  const next = { ...cached };
-  delete next.teamRevision;
-  return next;
-}
-
-/** Whether `revision` stores every source byte exactly as the cache read it. */
-async function revisionHoldsSources(
-  knowledgeRoot: string,
-  reachable: ReachableRevision | undefined,
-  sources: Array<{ path: string; content: string }>,
-): Promise<boolean> {
-  if (!reachable) return false;
-  const git = createGit(knowledgeRoot);
-  try {
-    for (const source of sources) {
-      const absolute = path.resolve(knowledgeRoot, source.path);
-      const relative = path.relative(reachable.repositoryRoot, await fs.realpath(absolute)).split(path.sep).join('/');
-      if (relative === '..' || relative.startsWith('../')) return false;
-      if (await git.show([`${reachable.revision}:${relative}`]) !== source.content) return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Validate each `workflows/*.yaml` on its own and cache only files that pass.
+ * Validate `scorers/` first, then each `workflows/*.yaml` on its own, and cache only files that pass.
  * An invalid file keeps its last cached definition; a file that was never valid
  * stays unrunnable. The cache then holds only what this sync settled, so start
  * finds no version that was not checked against the others. Nothing here fails the caller.
@@ -189,7 +153,8 @@ export async function syncWorkflowDefinitions(
   config: LocalConfig,
   options: SyncWorkflowOptions = {},
 ): Promise<SyncWorkflowResult> {
-  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [] };
+  const scorers = await syncScorerDefinitions(config, options);
+  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [], scorers, unknownScorers: [] };
   const dir = path.join(getKnowledgeDir(config), 'workflows');
   const knowledgeRoot = getKnowledgeDir(config);
   // Asked on the first valid file: a team without workflows starts no git here.
@@ -413,6 +378,14 @@ export async function syncWorkflowDefinitions(
     wrote += 1;
   }
   if (!options.dryRun) await dropUnsettled(config, new Set([...result.cached, ...result.kept]));
+  const valid = new Set(scorers.cached);
+  for (const file of checked) {
+    const definition = settle(file.stem).definition;
+    for (const { step, scorer } of definition ? scorersListedBy(definition) : []) {
+      if (!valid.has(scorer)) result.unknownScorers.push({ file: file.relativePath, step, scorer });
+    }
+  }
+  for (const unknown of result.unknownScorers) log.warn(`[workflows] ${formatUnknownScorer(unknown)}`);
 
   const scope = options.scopeLabel ?? config.scope;
   if (options.dryRun && result.cached.length > 0) {
