@@ -157,7 +157,7 @@ profiles:
 | Claude Code | `anthropic` | `~/.claude/settings.json` |
 | Codex | `openai-responses` | `~/.codex/config.toml` |
 | OpenCode | any | `opencode.json` |
-| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` |
+| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` (CodeBuddy follows its recorded home) |
 | Pi | any | `~/.pi/agent/models.json` |
 | OMP | any | `~/.omp/agent/models.yml` |
 | Muse Code | `openai-responses` | `<Muse home>/settings.json` (recorded home, else `$XDG_CONFIG_HOME/muse` or `~/.config/muse`), and the key as `META_API_KEY` in `~/.teamai/models/env.sh`, which your shell profile loads |

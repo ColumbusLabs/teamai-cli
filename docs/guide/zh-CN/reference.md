@@ -157,7 +157,7 @@ profiles:
 | Claude Code | `anthropic` | `~/.claude/settings.json` |
 | Codex | `openai-responses` | `~/.codex/config.toml` |
 | OpenCode | 任意 | `opencode.json` |
-| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` |
+| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` (CodeBuddy 跟随记录的主目录) |
 | Pi | 任意 | `~/.pi/agent/models.json` |
 | OMP | 任意 | `~/.omp/agent/models.yml` |
 | Muse Code | `openai-responses` | `<Muse 主目录>/settings.json`（已记录目录，否则使用 `$XDG_CONFIG_HOME/muse` 或 `~/.config/muse`），密钥以 `META_API_KEY` 写入 `~/.teamai/models/env.sh`，由 shell 配置文件加载 |
