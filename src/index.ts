@@ -733,10 +733,9 @@ envCmd
   .command('list')
   .description('List team environment variables')
   .option('--reveal', 'Show env variable values in plaintext (default: masked)')
-  .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+  .action(async (_cmdOpts, command: Command) => {
     const { envList } = await import('./env-commands.js');
-    await envList({ ...globalOpts, ...cmdOpts });
+    await envList(command.optsWithGlobals() as GlobalOptions & { reveal?: boolean });
   });
 
 envCmd
