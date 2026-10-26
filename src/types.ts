@@ -1572,21 +1572,34 @@ export interface GlobalOptions {
    */
   force?: boolean;
   /**
-   * Internal (the new-worktree git hook, `pull` only): deliver what the next
-   * session reads, without network when the team clone was fetched within
+   * Internal (git hooks and checkout preparation, `pull` only): deliver what
+   * the next session reads, without network when the team clone was fetched within
    * SOURCE_PULL_TTL_MS; sources come from their cached clones. Learnings,
    * reports, usage reporting and post-pull scripts are left to a full pull.
-   * `scripts.postDeploy` still runs when `prepareCheckout` is set.
+   * `scripts.postDeploy` still runs as `prepareCheckout` says.
    */
   inline?: boolean;
   /**
-   * Internal (the new-worktree git hook, `pull` only): after this inline
-   * delivery, wait for `scripts.postDeploy` before returning. A new linked
-   * worktree does not run init, so `postInit` never runs for it. A submodule's
-   * first checkout hits the same hook when that repo already has teamai's
-   * git hooks.
+   * Internal (`pull` only): deliver as into a new checkout, which does not run
+   * init, so `postInit` never runs for it, and wait for `scripts.postDeploy`.
+   * - `always`: a workflow worktree whose agent files were just put back to a
+   *   base commit. postDeploy runs on every such pull.
+   * - `once`: a linked worktree, a submodule's first checkout when that repo
+   *   already has teamai's git hooks (and the pull that hook hands over to,
+   *   through TEAMAI_PREPARE_CHECKOUT), or a worktree an agent tool created
+   *   without git hooks. Only the pull that writes the checkout's first record
+   *   runs postDeploy; an inline one finding a record under the sync lock
+   *   delivers nothing. A pass whose checkout is removed under it stops
+   *   before its next write phase.
    */
-  prepareCheckout?: boolean;
+  prepareCheckout?: 'always' | 'once';
+  /**
+   * Internal (checkout preparation from a tool use, with `inline`): deliver
+   * from the team clone as last fetched, however long ago. A tool use then
+   * never holds the sync lock through a fetch, nor retries one on every call
+   * while the team repo is unreachable; the session's full pull fetches.
+   */
+  localOnly?: boolean;
   /**
    * Internal (post-merge/post-rewrite git hooks, with `inline`): fetch the team repo
    * whatever its fetch stamp says, and give up after this many ms; the scope
