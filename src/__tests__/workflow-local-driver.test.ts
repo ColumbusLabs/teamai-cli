@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import * as envExec from '../env-exec.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { checkoutRecordKey, type CheckoutRecord } from '../pull.js';
@@ -16,15 +16,18 @@ import { getDataHome, getReportsDir, type LocalConfig, type TeamaiConfig } from 
 import { log } from '../utils/logger.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, reportAttempt, startRun } from '../workflow/engine.js';
-import { cancelRun, respondToHitl, retryStep } from '../workflow/run-controls.js';
-import { createLocalToolAdapter, type LocalToolAdapter, type LocalToolResult, type LocalToolRun, type ToolSpawn } from '../workflow/local-tool-adapter.js';
-import { _setDriverPollMs, localDriver, runLocalDriver } from '../workflow/local-driver.js';
+import { LeaseIdSchema } from '../workflow/lease-wire.js';
+import { cancelRun, respondProvenance, respondToHitl, retryStep } from '../workflow/run-controls.js';
+import { createLocalToolAdapter, type LocalToolAdapter, type LocalToolResult, type LocalToolRun, type ToolSpawn } from '../workflow/drivers/local/local-tool-adapter.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
+import { driverIdentity } from '../driver-identity.js';
 import { pendingRecords, type WorkflowRunRecord } from '../workflow/records.js';
-import { driverLockPath, readRun } from '../workflow/store.js';
-import * as worktreeSnapshot from '../workflow/worktree-snapshot.js';
+import { attemptDir, driverLockPath, readRun, RunIdSchema } from '../workflow/store.js';
+import * as worktreeSnapshot from '../workflow/place/worktree-snapshot.js';
 import type { DriverIdentity } from '../workflow/types.js';
 import { commitFile, fakeClaude, git, recordDelivery } from './helpers/delivered-checkout.js';
 import { knownSecrets } from '../env-resolution.js';
+import { recordGroup } from '../tool-launch/process-stop.js';
 
 _setDriverPollMs(20);
 
@@ -113,6 +116,24 @@ describe('local workflow prompt driver', () => {
         outputs: { ok: true },
       }],
     });
+  });
+
+  it.each([
+    [{}, 'attended'],
+    [{ CI: '1' }, 'unattended'],
+  ])('launches the tool with the run mode of the process that drives the run: %o gives %s', async (env, mode) => {
+    for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    let input: LocalToolRun | undefined;
+    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
+      input = value;
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(input?.env?.TEAMAI_MODE).toBe(mode);
   });
 
   it('fails without a configured tool and does not invoke the adapter', async () => {
@@ -855,6 +876,32 @@ async function exitsWithin(pid: number, ms: number): Promise<boolean> {
   return true;
 }
 
+describe('local workflow driver and a lease from a newer teamai', () => {
+  it('fails a step whose place it cannot read with the wording every driver uses', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One command in a worktree of its own.
+steps:
+  - id: change
+    workspace: new
+    command: node -e "process.exit(0)"
+`);
+    const engine = await import('../workflow/engine.js');
+    const real = engine.leaseNext;
+    // The workspace of the lease takes a shape a newer teamai wrote.
+    vi.spyOn(engine, 'leaseNext').mockImplementationOnce(async (...args) => {
+      const answer = await real(...args);
+      const lease = 'data' in answer ? answer.data.lease : undefined;
+      return lease !== null && typeof lease === 'object' ? { data: { lease: { ...lease, workspace: { mode: 'teleported' } } } } : answer;
+    });
+
+    expect(await runLocalDriver(config, runId, workspace, { toolPaths })).toMatchObject({ data: { done: { outcome: 'failed' } } });
+    expect(await readRun(config, runId)).toMatchObject({
+      steps: [{ id: 'change', status: 'failed', failure: { code: 'workspace_base', message: `Run ${runId} leased a place this teamai cannot read. Update teamai.` } }],
+    });
+  });
+});
+
 describe('local workflow driver concurrency', () => {
   it('runs two command roots at the same time with max_parallel 2', async () => {
     const { config, workspace, runId } = await parallelFixture(TWO_BARRIERS, 2);
@@ -1191,7 +1238,7 @@ const timer = setInterval(() => { if (fs.existsSync('go')) clearInterval(timer);
     const run = await readRun(config, runId);
     const slow = typeof run === 'object' ? run.steps.find((step) => step.id === 'slow') : undefined;
     if (slow?.status !== 'leased') throw new Error('slow is not leased');
-    const same = localDriver(workspace);
+    const same = driverIdentity('local', workspace);
     // The other caller runs with room for a second open lease.
     const leased = await leaseNext({ ...config, workflows: { tools: {}, max_parallel: 2 } }, runId, same, { running: [slow.attempt] });
     const finish = 'data' in leased ? leased.data.lease as { attempt: string; revision: number } : undefined;
@@ -1245,7 +1292,7 @@ steps:
     command: node log.js b
 `, 1);
     fs.writeFileSync(path.join(workspace, 'log.js'), LOG);
-    const earlier = localDriver(workspace);
+    const earlier = driverIdentity('local', workspace);
     // The earlier driver ran while this machine allowed more open leases.
     const before: LocalConfig = { ...config, workflows: { tools: {}, max_parallel: 2 } };
     const a = await leaseNext(before, runId, earlier);
@@ -1256,6 +1303,30 @@ steps:
 
     expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
     expect(fs.readFileSync(path.join(workspace, '..', 'log.txt'), 'utf8')).toBe('start a\nend a\nstart b\nend b\n');
+  });
+
+  it('stops what an earlier driver left running in an attempt it gets back, before that attempt runs again', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: A step whose earlier driver was killed while its setup ran.
+steps:
+  - id: check
+    command: "true"
+`);
+    const leased = await leaseNext(config, runId, driverIdentity('local', workspace));
+    if (!('data' in leased)) throw new Error(leased.error.message);
+    const dir = attemptDir(config, RunIdSchema.parse(runId), LeaseIdSchema.parse(leased.data.lease).attempt);
+    fs.mkdirSync(dir, { recursive: true });
+    // What the killed driver's setup left: a process group of its own, recorded where its attempt keeps it.
+    const left = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    const exited = new Promise<NodeJS.Signals | null>((resolve) => left.on('exit', (_code, signal) => resolve(signal)));
+    recordGroup(left, dir);
+    try {
+      expect(await runLocalDriver(config, runId, workspace)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+      expect(await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve('still running'), 2000))])).toBe('SIGTERM');
+    } finally {
+      left.kill('SIGKILL');
+    }
   });
 
   it('runs a prompt an earlier driver leased alone, between the commands leased before and after it', async () => {
@@ -1276,7 +1347,7 @@ steps:
     command: node log.js c2
 `, 2);
     fs.writeFileSync(path.join(workspace, 'log.js'), LOG);
-    const earlier = localDriver(workspace);
+    const earlier = driverIdentity('local', workspace);
     // The earlier driver ran while this machine allowed more open leases.
     const before: LocalConfig = { ...config, workflows: { tools: {}, max_parallel: 3 } };
     const running: string[] = [];
@@ -1380,7 +1451,7 @@ fs.writeFileSync(file('first.pid'), String(process.pid));
 fs.writeFileSync(file('first.started'), '');
 setInterval(() => {}, 1000);
 `);
-      expect(await respondToHitl(config, runId, await knownSecrets(config), { step: 'plan', choice: 'small', channel: 'cli', agent: false }))
+      expect(await respondToHitl(config, runId, await knownSecrets(config), { step: 'plan', choice: 'small', provenance: respondProvenance({ kind: 'terminal', caller: { tty: true, evidence: { kind: 'none' } } }) }))
         .not.toHaveProperty('error');
       const options = { hitl: true, question: async () => 'big' };
       const driving = runLocalDriver(config, runId, workspace, options);
@@ -1824,7 +1895,7 @@ steps:
     let aborted = false;
     const question = vi.fn((_hitl, signal: AbortSignal) => new Promise<string>((_resolve, reject) => {
       signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); });
-      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'ask', choice: 'one', channel: 'cli', agent: true }));
+      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'ask', choice: 'one', provenance: respondProvenance({ kind: 'terminal', caller: { tty: false, evidence: { kind: 'none' } } }) }));
     }));
     expect(await runLocalDriver(config, runId, workspace, { hitl: true, question })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
     expect(aborted).toBe(true);
@@ -1898,6 +1969,33 @@ ${interactive ? '    interactive: true\n' : ''}`;
     expect(await unenforced(interactive)).toEqual([{ requirement: 'max_turns', asked: 3 }]);
   });
 
+  it.each([
+    ['attended', false, { choice: 'yes', channel: 'tty' }],
+    ['unattended', false, { choice: 'no', channel: 'no_hitl' }],
+    ['unattended', true, { choice: 'yes', channel: 'auto_approve' }],
+  ] as const)('on a terminal, answers an optional approval in a run that is %s, auto-approving %s, with %o', async (mode, autoApprove, answer) => {
+    for (const stream of [process.stdin, process.stderr]) {
+      const { isTTY } = stream;
+      Object.defineProperty(stream, 'isTTY', { value: true, configurable: true });
+      onTestFinished(() => { Object.defineProperty(stream, 'isTTY', { value: isTTY, configurable: true }); });
+    }
+    vi.stubEnv('TEAMAI_MODE', mode);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Ask only a person who is there.
+steps:
+  - id: ask
+    approve: Continue?
+    command: echo ok
+`);
+    const question = vi.fn(async () => 'yes');
+    expect(await runLocalDriver(config, runId, workspace, { question, autoApprove })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(question).toHaveBeenCalledTimes(answer.channel === 'tty' ? 1 : 0);
+    const run = await readRun(config, runId);
+    expect(typeof run === 'object' && run.steps[0]?.answer).toMatchObject(answer);
+  });
+
   it('auto-approves only for this driver process without HITL', async () => {
     const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
@@ -1931,7 +2029,7 @@ steps:
     }) });
     await asked;
     expect(await runLocalDriver(config, runId, workspace)).toEqual({ error: { code: 'driver_running', message: `Run ${runId} is already driven by process ${process.pid} on this machine. Stop that driver, or wait for it.` } });
-    await respondToHitl(config, runId, await knownSecrets(config), { step: 'ask', choice: 'no', channel: 'cli', agent: true });
+    await respondToHitl(config, runId, await knownSecrets(config), { step: 'ask', choice: 'no', provenance: respondProvenance({ kind: 'terminal', caller: { tty: false, evidence: { kind: 'none' } } }) });
     expect(await first).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
     expect(fs.existsSync(driverLockPath(config, runId))).toBe(false);
     expect(await runLocalDriver(config, runId, workspace)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
@@ -2169,7 +2267,7 @@ steps:
     let abortedBeforeLaunch = false;
     const question = vi.fn((_hitl, signal: AbortSignal) => new Promise<string>((_resolve, reject) => {
       signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); });
-      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'pair', choice: 'yes', channel: 'cli', agent: true }));
+      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'pair', choice: 'yes', provenance: respondProvenance({ kind: 'terminal', caller: { tty: false, evidence: { kind: 'none' } } }) }));
     }));
     const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
       abortedBeforeLaunch = aborted;
@@ -2206,7 +2304,7 @@ steps:
     prompt: Pair with me.
     interactive: true
 `);
-    await leaseNext(config, runId, localDriver(workspace), { can: { hitl: true } });
+    await leaseNext(config, runId, driverIdentity('local', workspace), { can: { hitl: true } });
     const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => ({ started: true, exitCode: 0 })) };
     expect(await runLocalDriver(config, runId, workspace, { hitl: false, adapter })).toMatchObject({
       error: { code: 'busy', message: 'step "pair" needs hitl, which this driver does not declare' },
@@ -2511,6 +2609,16 @@ ${steps}`);
     const done = await runLocalDriver(config, runId, workspace, { hitl: false });
     expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
     expect(fs.readFileSync(log, 'utf8')).toBe('ran\n');
+  });
+
+  it('gives setup and the step\'s command the run mode of the process that drives the run', async () => {
+    vi.stubEnv('CI', '1');
+    const { config, workspace, runId } = await setupFixture('  command: test "$TEAMAI_MODE" = unattended', `  - id: change
+    workspace: new
+    command: test "$TEAMAI_MODE" = unattended
+`);
+    const done = await runLocalDriver(config, runId, workspace, { hitl: false });
+    expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
   });
 
   it('runs setup again when a retried step finds the workspace of a copy a step already ran in gone', async () => {

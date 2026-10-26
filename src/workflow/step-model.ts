@@ -5,14 +5,20 @@
  * gets it on argv, and so does OpenCode with the variant: OpenCode 2 reads neither from the agent file, and OpenCode 1
  * does not start a subagent, which is how pull deploys OpenCode agents.
  */
+import path from 'node:path';
+import { installOf, locate, ownOf } from '../locate.js';
 import { isModelAlias, loadModelAliases, noModelCause, noModelReason, resolveModelValue, type NoModel } from '../models/aliases.js';
-import { toolExtrasFor, type AgentSpec } from '../resources/agent-format.js';
-import type { LocalConfig } from '../types.js';
-import { localToolFamily, type LaunchTool } from '../tool-launch/tools.js';
-import type { LocalToolRun } from './local-tool-adapter.js';
+import {
+  agentFileExtensionForTool, reverseFromClaude, reverseFromCodex, reverseFromOpencode, toolExtrasFor, type AgentSpec, type ToolName,
+} from '../resources/agent-format.js';
+import { isAgentToolId } from '../tools.js';
+import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { isLaunchTool, localToolFamily, type LaunchTool } from '../tool-launch/tools.js';
+import { readFileSafe } from '../utils/fs.js';
 import type { WorkflowFailure } from './types.js';
 
-export type StepModel = NonNullable<LocalToolRun['model']>;
+/** The model a prompt step's tool runs on, with the reasoning effort it takes. */
+export type StepModel = { name: string; effort?: string };
 
 /**
  * The model and effort the launch passes, none when it passes none, or why the step cannot run. `by` says whether the
@@ -27,7 +33,8 @@ export type StepModelChoice =
 export interface StepModelRequest {
   /** The step path the lease names, such as `check.classify`. */
   step: string;
-  tool: LaunchTool;
+  /** The tool the step runs on: a launch tool, or the coding session's own for a child it starts. */
+  tool: ToolName;
   /** The lease's `model`, as written. */
   model?: string;
   /** The lease's `defaultModel`, as written. */
@@ -67,8 +74,9 @@ export async function chooseStepModel(request: StepModelRequest): Promise<StepMo
     ? { origin: 'step', value: request.model }
     : agent?.model === undefined && request.defaultModel !== undefined ? { origin: 'defaults', value: request.defaultModel } : undefined;
   if (!chosen) {
-    const family = localToolFamily(tool);
-    if (!agent?.model || family === 'claude') return { ok: true };
+    // A tool teamai does not launch starts the agent itself, from the file it reads the model from.
+    const family = isLaunchTool(tool) ? localToolFamily(tool) : undefined;
+    if (!agent?.model || family === undefined || family === 'claude') return { ok: true };
     const variant = family === 'opencode' ? toolExtrasFor(agent, 'opencode')?.['variant'] : undefined;
     return { ok: true, by: 'definition', model: { name: agent.model, ...(variant !== undefined ? { effort: String(variant) } : {}) } };
   }
@@ -84,4 +92,34 @@ export async function chooseStepModel(request: StepModelRequest): Promise<StepMo
     model: { name: resolution.model, ...(resolution.effort !== undefined ? { effort: resolution.effort } : {}) },
     ...(isModelAlias(aliases, chosen.value) ? { alias: chosen.value } : {}),
   };
+}
+
+function reverseAgent(tool: LaunchTool, file: string, content: string) {
+  const family = localToolFamily(tool);
+  if (family === 'claude') return reverseFromClaude(file, content);
+  if (family === 'codex') return reverseFromCodex(file, content);
+  return reverseFromOpencode(file, content);
+}
+
+/**
+ * The agent `name` as `teamai pull` deployed it for `tool` in `config`'s scope, and the file it was read from, which is
+ * the key its pull recorded it under. Null when it is not deployed, cannot be read, or `tool` is one teamai does not
+ * launch, whose agent files it does not read back.
+ */
+export async function loadDeployedAgent(input: {
+  tool: string;
+  name: string;
+  config: LocalConfig;
+  toolPaths: TeamaiConfig['toolPaths'] | undefined;
+}): Promise<{ spec: AgentSpec; file: string } | null> {
+  const { tool, name, config, toolPaths } = input;
+  if (toolPaths === undefined || !isLaunchTool(tool) || !isAgentToolId(tool)) return null;
+  // The same directory `teamai pull` writes, not the step's cwd.
+  const agents = ownOf(await locate(tool, 'agents', installOf({ toolPaths }, config)))?.path;
+  if (agents === undefined) return null;
+  const file = path.join(agents, `${name}${agentFileExtensionForTool(tool)}`);
+  const content = await readFileSafe(file);
+  if (content === null) return null;
+  const reversed = reverseAgent(tool, file, content);
+  return reversed.ok ? { spec: reversed.spec, file } : null;
 }

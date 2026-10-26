@@ -1,16 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import { parseReportedAgent, parseReportedUsed, settleObservation, type ReportedAgent, type Used } from '../agent-observation.js';
-import { DriverSchema } from '../driver-identity.js';
+import { DriverSchema, sameDriver } from '../driver-identity.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig } from '../types.js';
 import { loadCachedWorkflow, loadWorkflowTree } from './cache.js';
-import { claimRun, publishRunEnd } from './handoff.js';
+import { claimRun, publishRunEnd, reconcileTakenCopies } from './handoff.js';
 import {
   evaluateExpression, expressionPaths, isRecord, isTruthy, parseExpression, resolvePath,
   type Expression, type ExpressionPath,
 } from './expression.js';
 import { outputMismatch } from './output.js';
-import type { ResponseInput } from './run-controls.js';
 import { publishRunRecords, queueRunRecord, runRecordState } from './records.js';
 import {
   parseTemplate, renderStrings, renderText, stepExpressions, templatedTexts, templatePaths,
@@ -107,10 +106,6 @@ export function ok(value: Record<string, unknown>): WorkflowEnvelope {
 export function withIgnored(envelope: WorkflowEnvelope, ignored: string[]): WorkflowEnvelope {
   if (ignored.length === 0 || 'error' in envelope) return envelope;
   return { data: { ...envelope.data, ignored } };
-}
-
-function sameDriver(left: DriverIdentity, right: DriverIdentity): boolean {
-  return left.kind === right.kind && left.machine === right.machine && left.workspace === right.workspace;
 }
 
 /**
@@ -224,35 +219,58 @@ function hitlMessage(scope: Scope, states: StepState[], state: StepState, defini
   return renderText(parsed.template, context);
 }
 
+/**
+ * The command the person runs to answer step `step` of run `run` at `pass`, with `choice` written as it should appear:
+ * a placeholder such as `<option>`. A fan-out step path such as `items[0].ask` is quoted.
+ */
+export function respondCommand(run: string, step: string, choice: string, pass: number): string {
+  const stepArgument = /^[A-Za-z0-9_.-]+$/.test(step) ? step : `'${step}'`;
+  return `teamai workflow respond ${run} ${stepArgument} ${choice} --pass ${pass}`;
+}
+
 function waitingHitl(run: RunState): Record<string, unknown> | undefined {
   const state = run.steps.find((step) => step.status === 'waiting');
   const located = state && locateStep(run, state.id);
   if (!state || !located?.step.hitl) return undefined;
-  const stepArgument = /^[A-Za-z0-9_.-]+$/.test(state.id) ? state.id : `'${state.id}'`;
   return { run: run.id, step: state.id, pass: state.pass ?? 1, ...located.step.hitl,
-    respond: `teamai workflow respond ${run.id} ${stepArgument} <option> --pass ${state.pass ?? 1}`,
+    respond: respondCommand(run.id, state.id, '<option>', state.pass ?? 1),
     message: hitlMessage(located.scope, statesIn(run, located.scope), state, located.step) };
 }
 
-function answerWithoutHitl(config: LocalConfig, run: RunState, now: string, autoApprove?: boolean): boolean {
+/** Answers each waiting optional approval `yes` and each waiting choice with a default by it, as auto-approve. */
+function answerOptionalGates(run: RunState, now: string): boolean {
   let changed = false;
   const definitionOf = stepDefinitions(run);
   for (const state of run.steps) {
     if (state.status !== 'waiting') continue;
     const hitl = definitionOf(state.id)?.hitl;
+    if (!hitl || hitl.required) continue;
+    if (hitl.kind === 'approve') {
+      log.warn(`Step "${state.id}" was approved by auto_approve.`);
+      answerHitl(state, { choice: 'yes', at: now, channel: 'auto_approve', agent: false });
+    } else if (hitl.default !== undefined) {
+      log.warn(`Step "${state.id}" chose "${hitl.default}" by auto_approve.`);
+      answerHitl(state, { choice: hitl.default, at: now, channel: 'auto_approve', agent: false });
+    } else continue;
+    changed = true;
+  }
+  return changed;
+}
+
+function answerWithoutHitl(config: LocalConfig, run: RunState, now: string, autoApprove?: boolean): boolean {
+  let changed = autoApprove ?? config.workflows?.auto_approve === true ? answerOptionalGates(run, now) : false;
+  const definitionOf = stepDefinitions(run);
+  for (const state of run.steps) {
+    if (state.status !== 'waiting') continue;
+    const hitl = definitionOf(state.id)?.hitl;
     if (!hitl) continue;
-    const auto = autoApprove ?? config.workflows?.auto_approve === true;
-    if (hitl.required || (hitl.kind === 'choose' && (!auto || hitl.default === undefined))) {
-      const failure = { code: 'hitl_required', message: `Step "${state.id}" needs a person's answer, and the driver declares no HITL (driver.can.hitl). Retry it from a terminal: teamai workflow retry ${run.id} ${state.id}; then teamai workflow resume ${run.id}` };
+    if (hitl.required || hitl.kind === 'choose') {
+      const failure = { code: 'hitl_required', message: `Step "${state.id}" needs a person's answer, and the driver declares no HITL (driver.can.hitl). Retry it, then resume the run where a person answers, from a terminal in an attended run (TEAMAI_MODE=attended, or neither TEAMAI_MODE nor CI set): teamai workflow retry ${run.id} ${state.id}; then teamai workflow resume ${run.id}` };
       log.warn(failure.message);
       failStep(state, failure, run.revision);
     } else {
-      if (hitl.kind === 'approve') {
-        log.warn(auto ? `Step "${state.id}" was approved by auto_approve.`
-          : `Step "${state.id}" was skipped: its approve HITL request needs a person, and the driver declares no HITL (driver.can.hitl). Set workflows.auto_approve, pass --auto-approve, or run the workflow from a terminal.`);
-      } else log.warn(`Step "${state.id}" chose "${hitl.default}" by auto_approve.`);
-      answerHitl(state, { choice: hitl.kind === 'approve' ? auto ? 'yes' : 'no' : hitl.default!, at: now,
-        channel: auto ? 'auto_approve' : 'no_hitl', agent: false });
+      log.warn(`Step "${state.id}" was skipped: its approve HITL request needs a person, and the driver declares no HITL (driver.can.hitl). Set workflows.auto_approve, pass --auto-approve, or run the workflow where a person answers, from a terminal in an attended run (TEAMAI_MODE=attended, or neither TEAMAI_MODE nor CI set).`);
+      answerHitl(state, { choice: 'no', at: now, channel: 'no_hitl', agent: false });
     }
     changed = true;
   }
@@ -375,7 +393,8 @@ export function runData(run: RunState): Record<string, unknown> {
 }
 
 function doneData(run: RunState): Record<string, unknown> {
-  return { done: { run: run.id, outcome: run.status, ...(run.end !== undefined ? { end: run.end } : {}), ...(run.failure ? { failure: run.failure } : {}) } };
+  const prs = (run.deliveries ?? []).map((receipt) => receipt.url);
+  return { done: { run: run.id, outcome: run.status, ...(run.end !== undefined ? { end: run.end } : {}), ...(run.failure ? { failure: run.failure } : {}), ...(prs.length > 0 ? { prs } : {}) } };
 }
 
 /** The step ids these paths read. */
@@ -939,6 +958,7 @@ function offerTerms(
 ): Negotiation {
   return negotiate({
     step: id,
+    executor: step.command !== undefined ? 'command' : 'prompt',
     requires: mergeRequirements(scope.requires, step.requires),
     interactive: step.interactive === true,
     hasContract: plan?.contract !== undefined,
@@ -952,7 +972,10 @@ function offerTerms(
 
 /** What a driver tells `next` besides who it is. */
 export interface NextOptions {
-  /** The attempts of its open leases the driver is still running. An open lease it does not list is handed back to it. */
+  /**
+   * The attempts of its open leases the driver is still running. An open lease it does not list is handed back to it.
+   * A judge lease ref answers `judge_lease`: those renew through `teamai score --next`.
+   */
   running?: string[];
   /** False to reconcile without issuing a new lease: `next` answers `done`, an unlisted lease, `hitl`, or `wait`. */
   canTakeLease?: boolean;
@@ -960,7 +983,11 @@ export interface NextOptions {
   base?: { ref?: string; commit: string };
   /** What the driver can do on this request. An omitted `workspace` means read-only, so a `new` or `continue` step waits. */
   can?: DriverCan;
-  /** Process-only override of the member's automatic HITL approval setting. */
+  /**
+   * Answer optional approvals `yes` and choices with a default by it, recorded `auto_approve`. For a driver without HITL
+   * it overrides `workflows.auto_approve`; a driver with HITL sends it when the person chose auto-approve for the run.
+   * Required approvals, and choices without a default, are never answered this way.
+   */
   autoApprove?: boolean;
   /** Take the run over from the install that published it before leasing; a run this install owns stays as it is. */
   claim?: boolean;
@@ -1051,10 +1078,17 @@ async function drainDeliveries(config: LocalConfig, runId: string, secrets: Reco
 }
 
 export async function leaseNext(config: LocalConfig, runId: string, driver: DriverIdentity, options: NextOptions = {}): Promise<WorkflowEnvelope> {
+  const judgeRef = options.running?.find(isLeaseRef);
+  if (judgeRef !== undefined) {
+    return error('judge_lease', `running lists judge lease ${judgeRef}. Renew judge leases with teamai score --next and its running list, never with teamai workflow next.`);
+  }
   driver = { kind: driver.kind, machine: driver.machine, workspace: driver.workspace };
   if (options.claim) {
     const claimed = await claimRun(config, runId, { checkout: driver.workspace });
     if (!claimed.ok) return { error: claimed.error };
+    // As a resume does, before anything is leased: the branches of a run taken back go to the commits it recorded.
+    const unreconciled = await reconcileTakenCopies(config, runId, driver.workspace);
+    if (unreconciled) return { error: unreconciled };
   }
   // Resolved once, so the env this `next` offers against and the secrets its writes, deliveries' included, mask agree.
   const env = options.env ?? await resolveWorkflowEnv(config);
@@ -1110,6 +1144,9 @@ export async function leaseNext(config: LocalConfig, runId: string, driver: Driv
       const other = run.steps.find((step): step is LeasedStep => step.status === 'leased' && !sameDriver(step.lease.driver, driver));
       if (other) return wait(other);
       run.driver = driver;
+      // A driver with HITL answers optional gates itself unless the person chose auto-approve for this run; it never
+      // follows workflows.auto_approve.
+      if (can.hitl && options.autoApprove === true && answerOptionalGates(run, now)) continue;
       if (options.canTakeLease !== false && !can.hitl && answerWithoutHitl(config, run, now, options.autoApprove)) continue;
       // An open lease the driver does not list is handed back before another lease is issued, as a restarted driver expects.
       const leased = run.steps.find((step): step is LeasedStep => step.status === 'leased' && !running.has(step.lease.attempt));
@@ -1222,7 +1259,7 @@ function driverFrom(value: unknown): DriverIdentity | undefined {
 const DRIVER_FIELDS = new Set(['kind', 'machine', 'workspace', 'can']);
 
 /** The top-level payload fields `parseNextPayload` reads. */
-const NEXT_PAYLOAD_FIELDS = new Set(['driver', 'running', 'canTakeLease', 'base', 'claim']);
+const NEXT_PAYLOAD_FIELDS = new Set(['driver', 'running', 'canTakeLease', 'base', 'claim', 'autoApprove']);
 
 /** The top-level payload fields `parseReport` reads. Keep in sync with the fields it picks. */
 const REPORT_FIELDS = new Set([
@@ -1245,9 +1282,9 @@ function unreadFields(record: Record<string, unknown>, known: ReadonlySet<string
   return ignored;
 }
 
-/** A declared driver UI answer's provenance and unread payload fields. */
+/** The driver UI a `respond --json` payload declares the person answered in, and the payload fields it did not read. */
 export interface ParsedResponsePayload {
-  response: Pick<ResponseInput, 'channel' | 'agent' | 'driver'>;
+  driver: DriverIdentity;
   ignored: string[];
 }
 
@@ -1255,7 +1292,7 @@ export function parseResponsePayload(value: unknown): ParsedResponsePayload | st
   if (!isRecord(value)) return 'respond payload must be a JSON object';
   const driver = driverFrom(value.driver);
   if (!driver) return 'driver must include kind, machine, and workspace';
-  return { response: { channel: 'driver', agent: false, driver }, ignored: unreadFields(value, new Set(['driver'])) };
+  return { driver, ignored: unreadFields(value, new Set(['driver'])) };
 }
 
 /** A parsed report and the payload fields the CLI did not read from it. */
@@ -1405,6 +1442,11 @@ export function parseNextPayload(value: unknown): ParsedNextPayload | string {
     request.can = parsed.data;
     ignored.push(...Object.keys(can).filter((key) => !CAN_KEYS.has(key)).map((key) => `driver.can.${key}`));
   }
+  // Only a driver with HITL reads it: for one without, workflows.auto_approve is the member's own setting.
+  if (record.autoApprove !== undefined && request.can?.hitl === true) {
+    if (typeof record.autoApprove !== 'boolean') return 'autoApprove must be a boolean';
+    request.autoApprove = record.autoApprove;
+  } else if (record.autoApprove !== undefined) ignored.push('autoApprove');
   return { request, ignored };
 }
 
@@ -1544,6 +1586,53 @@ function countStoppedTokens(run: RunState, report: ReportInput): boolean {
   return true;
 }
 
+/**
+ * The leased step `report` settles, or how the run refuses it once the deadlines passed at `now` apply: the checks
+ * `reportAttempt` makes before it reads the report itself. `save` says whether what they changed in `run`, the
+ * deadlines or a stopped attempt's late tokens, is saved.
+ */
+function reportedStep(run: RunState, report: ReportInput, now: string): { step: LeasedStep } | { refused: { save: boolean; envelope: WorkflowEnvelope } } {
+  // Settled membership wins. An old revision of a settled attempt is still repeated_report.
+  if (run.settledAttempts.includes(report.attempt)) {
+    return { refused: { save: false, envelope: error('repeated_report', `Attempt ${report.attempt} was already reported`) } };
+  }
+  // Before the driver check, so any driver learns that the attempt was cancelled.
+  if (run.cancelledAttempts?.includes(report.attempt)) {
+    return { refused: { save: countStoppedTokens(run, report), envelope: error('lease_cancelled', `Attempt ${report.attempt} was cancelled; its report is not recorded`) } };
+  }
+  const step = run.steps.find((item): item is LeasedStep => item.status === 'leased' && item.lease.attempt === report.attempt);
+  if (!step) {
+    if (report.revision !== run.revision) {
+      return { refused: { save: false, envelope: error('stale_revision', `Revision ${report.revision} is stale; the run is at ${run.revision}`) } };
+    }
+    return { refused: { save: false, envelope: error('wrong_attempt', `Attempt ${report.attempt} is not the leased attempt`) } };
+  }
+  const reconciled = reconcileRun(run, now);
+  if ('unreadable' in reconciled) return { refused: { save: false, envelope: error('run_unreadable', reconciled.unreadable) } };
+  if (run.cancelledAttempts?.includes(report.attempt)) {
+    countStoppedTokens(run, report);
+    return { refused: { save: true, envelope: error('lease_cancelled', `Attempt ${report.attempt} was cancelled; its report is not recorded`) } };
+  }
+
+  // A lease is checked against the revision it was handed out at, so a report of a parallel lease does not make it stale.
+  if (report.revision !== step.lease.revision) {
+    return { refused: { save: false, envelope: error('stale_revision', `Revision ${report.revision} is stale; attempt ${report.attempt} was leased at ${step.lease.revision}`) } };
+  }
+  if (!sameDriver(step.lease.driver, report.driver)) {
+    return { refused: { save: false, envelope: error('wrong_driver', 'This lease belongs to a different driver') } };
+  }
+  return { step };
+}
+
+/**
+ * Whether the run of `runId` takes `report` now, by the checks `reportAttempt` makes before it reads the report: the
+ * attempt is leased to its driver at its revision once the deadlines that passed apply. It saves nothing.
+ */
+export async function reportable(config: LocalConfig, runId: string, report: ReportInput): Promise<boolean> {
+  const run = await readRun(config, runId);
+  return typeof run === 'object' && 'step' in reportedStep(run, report, new Date().toISOString());
+}
+
 /** `secrets`: what the run file masks, when the caller already resolved them for this operation. */
 export async function reportAttempt(config: LocalConfig, runId: string, report: ReportInput, secrets?: Record<string, string>): Promise<WorkflowEnvelope> {
   if (isLeaseRef(report.attempt)) {
@@ -1553,35 +1642,9 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
   const reported = report.prUrl === undefined ? undefined : sanitizePrUrl(report.prUrl);
   const unmatched = reported?.url ? await reportedPrUnmatched(config, runId, report, reported.url) : undefined;
   return withRun(config, runId, secrets ?? await knownSecrets(config), async (run, now) => {
-    // Settled membership wins. An old revision of a settled attempt is still repeated_report.
-    if (run.settledAttempts.includes(report.attempt)) {
-      return { save: false, envelope: error('repeated_report', `Attempt ${report.attempt} was already reported`) };
-    }
-    // Before the driver check, so any driver learns that the attempt was cancelled.
-    if (run.cancelledAttempts?.includes(report.attempt)) {
-      return { save: countStoppedTokens(run, report), envelope: error('lease_cancelled', `Attempt ${report.attempt} was cancelled; its report is not recorded`) };
-    }
-    const step = run.steps.find((item): item is LeasedStep => item.status === 'leased' && item.lease.attempt === report.attempt);
-    if (!step) {
-      if (report.revision !== run.revision) {
-        return { save: false, envelope: error('stale_revision', `Revision ${report.revision} is stale; the run is at ${run.revision}`) };
-      }
-      return { save: false, envelope: error('wrong_attempt', `Attempt ${report.attempt} is not the leased attempt`) };
-    }
-    const reconciled = reconcileRun(run, now);
-    if ('unreadable' in reconciled) return { save: false, envelope: error('run_unreadable', reconciled.unreadable) };
-    if (run.cancelledAttempts?.includes(report.attempt)) {
-      countStoppedTokens(run, report);
-      return { save: true, envelope: error('lease_cancelled', `Attempt ${report.attempt} was cancelled; its report is not recorded`) };
-    }
-
-    // A lease is checked against the revision it was handed out at, so a report of a parallel lease does not make it stale.
-    if (report.revision !== step.lease.revision) {
-      return { save: false, envelope: error('stale_revision', `Revision ${report.revision} is stale; attempt ${report.attempt} was leased at ${step.lease.revision}`) };
-    }
-    if (!sameDriver(step.lease.driver, report.driver)) {
-      return { save: false, envelope: error('wrong_driver', 'This lease belongs to a different driver') };
-    }
+    const checked = reportedStep(run, report, now);
+    if ('refused' in checked) return checked.refused;
+    const { step } = checked;
 
     const located = locateStep(run, step.id);
     const defined = located?.step;
@@ -1665,7 +1728,10 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
       envelope: ok({
         accepted: true,
         revision: run.revision,
-        step: { id: settledStep.id, status: settledStep.status, outcome, ...(settlement.unenforced ? { unenforced: settlement.unenforced } : {}) },
+        step: {
+          id: settledStep.id, status: settledStep.status, outcome, ...(settledStep.status === 'failed' ? { failure: settledStep.failure } : {}),
+          ...(settlement.unenforced ? { unenforced: settlement.unenforced } : {}),
+        },
         ...(cleanup ? { cleanup: true } : {}),
         ...(dropReason ? { dropped: [{ field: 'changes.pr_url', reason: dropReason }] } : {}),
       }),

@@ -15,9 +15,9 @@ import type { LocalConfig } from '../types.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import * as engine from '../workflow/engine.js';
 import { leaseNext, parseReport, reportAttempt, startRun } from '../workflow/engine.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
-import { cancelRun, respondToHitl, retryStep } from '../workflow/run-controls.js';
-import type { LocalToolAdapter } from '../workflow/local-tool-adapter.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
+import { cancelRun, respondProvenance, respondToHitl, retryStep } from '../workflow/run-controls.js';
+import type { LocalToolAdapter } from '../workflow/drivers/local/local-tool-adapter.js';
 import { parseWorkflow } from '../workflow/parse.js';
 import { readRun, updateRun } from '../workflow/store.js';
 import type { DriverIdentity, RunState } from '../workflow/types.js';
@@ -183,6 +183,31 @@ steps:
 `);
     if (missing.ok) throw new Error('expected session.from of a step that is not a need to fail');
     expect(missing.diagnostics.map((item) => item.code)).toContain('bad_session');
+  });
+
+  it('roots worktrees at run.checkout when driven from another directory', async () => {
+    const yaml = `schemaVersion: v1alpha1
+name: build
+description: A step records the directory it ran in.
+steps:
+  - id: change
+    workspace: new
+    command: node -e "require('fs').writeFileSync('where.txt', process.cwd())"
+`;
+    const { config, workspace } = await fixture(yaml);
+    const side = path.join(path.dirname(workspace), 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], workspace);
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), checkout: workspace });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+
+    await runLocalDriver(config, runId, side);
+
+    const run = await readRun(config, runId);
+    expect(run).toMatchObject({ steps: [{ id: 'change', status: 'succeeded' }] });
+    const branch = branchName(runId, 'change', 1);
+    expect(git(['show', `${branch}:where.txt`], workspace)).toBe(path.join(fs.realpathSync(workspace), path.relative(workspace, worktreePath(workspace, branch))));
+    expect(fs.existsSync(path.join(side, '.teamai', 'workflow-worktrees'))).toBe(false);
   });
 
   it('fails a command with no workspace when it changes the checkout, and leaves the file', async () => {
@@ -1445,6 +1470,40 @@ steps:
     expect(await pushIfOrigin(repo, 'teamai/solo', [])).toBe('pushed');
   });
 
+  it.each([
+    ['copying the branch files aside', async ({ saved }: { dir: string; saved: string; apply: () => Promise<unknown> }) => {
+      fs.mkdirSync(`${saved}.partial`, { recursive: true });
+      fs.writeFileSync(path.join(`${saved}.partial`, '_conflicts'), '');
+    }],
+    ['after it took the branch files out', async ({ dir, apply }: { dir: string; saved: string; apply: () => Promise<unknown> }) => {
+      await apply();
+      fs.rmSync(path.join(dir, 'AGENTS.md'));
+    }],
+  ])('finishes the agent configuration reset a process killed while %s left', async (_when, killed) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-base-config-')));
+    dirs.push(root);
+    const repo = path.join(root, 'repo');
+    const commit = (text: string): string => {
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), text);
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo });
+      execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agents'], { cwd: repo });
+      return git(['rev-parse', 'HEAD'], repo).trim();
+    };
+    execFileSync('git', ['init', '-q', '-b', 'main', repo]);
+    const base = commit('base rules\n');
+    const head = commit('branch rules\n');
+    const opened = await ensureWorktree(repo, 'teamai/r/step/p1', head);
+    if ('error' in opened) throw new Error(opened.error);
+    const saved = path.join(root, 'attempt', 'overlay');
+    await killed({ dir: opened.dir, saved, apply: () => applyBaseConfig(opened.dir, base, hooksPath(repo), saved) });
+
+    expect(await applyBaseConfig(opened.dir, base, hooksPath(repo), saved, { resume: true })).toEqual({ ok: true, saved });
+
+    expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('base rules\n');
+    expect(fs.readFileSync(path.join(saved, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
+    expect(fs.existsSync(`${saved}.partial`)).toBe(false);
+  });
+
   it('fails the agent configuration reset to a base commit this checkout does not have, and leaves the branch agent files', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-base-config-'));
     dirs.push(root);
@@ -1461,7 +1520,7 @@ steps:
     const opened = await ensureWorktree(repo, 'teamai/r/step/p1', head);
     if ('error' in opened) throw new Error(opened.error);
 
-    const applied = await applyBaseConfig(opened.dir, elsewhere, hooksPath(repo));
+    const applied = await applyBaseConfig(opened.dir, elsewhere, hooksPath(repo), path.join(root, 'overlay'));
 
     expect(applied).toEqual({ ok: false, message: expect.stringContaining(elsewhere) });
     expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
@@ -1493,11 +1552,9 @@ steps:
     fault(repo);
     const temp = path.join(root, 'tmp');
     fs.mkdirSync(temp);
-    vi.stubEnv('TMPDIR', temp);
 
-    const applied = await applyBaseConfig(opened.dir, base, hooksPath(repo));
+    const applied = await applyBaseConfig(opened.dir, base, hooksPath(repo), path.join(temp, 'overlay'));
 
-    vi.unstubAllEnvs();
     expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
     expect(git(['status', '--porcelain'], opened.dir)).toBe('');
     expect(fs.readdirSync(temp)).toEqual([]);
@@ -2893,7 +2950,7 @@ ${steps}`, steps.startsWith('inputs:') ? { items: ['a', 'b'] } : undefined);
       if (!lease) {
         const hitl = next.data.hitl as { step: string } | undefined;
         if (!hitl) throw new Error(JSON.stringify(next));
-        await respondToHitl(config, runId, await knownSecrets(config), { step: hitl.step, choice: 'yes', channel: 'cli', agent: false });
+        await respondToHitl(config, runId, await knownSecrets(config), { step: hitl.step, choice: 'yes', provenance: respondProvenance({ kind: 'terminal', caller: { tty: true, evidence: { kind: 'none' } } }) });
         continue;
       }
       const contract = lease.workspace;

@@ -642,14 +642,14 @@ workflows:
 |---|---|
 | `hitl` | 让人回答 HITL 请求并在交互步骤中工作。 |
 | `workspace` | 接受这些工作区模式的租约：`read-only`、`new`、`continue`。 |
-| `env` | 自己解析 `lease.envScope.provide`，移除 `lease.envScope.withhold`，并且不把值交给运行步骤的程序。由智能体运行步骤的驱动不要声明它。 |
+| `env` | `true`：自己解析 `lease.envScope.provide`，移除 `lease.envScope.withhold`，并且不把值交给运行步骤的程序。`"commands"`：只对命令步骤和 setup 这样做，所以带 `requires.env` 的提示词步骤会等待。由智能体运行步骤的驱动不要声明它；如果命令由驱动自己启动，可以发送 `"commands"`。0.28.0 之前的 teamai 对 `"commands"` 返回 `invalid_json`。 |
 | `setup` | 在它创建的每个工作区以及 setup 未完成的工作区中，用 `lease.setup.envScope` 运行 `lease.setup.command`，并以上述失败码让步骤失败。工作流声明了 `setup` 时，每个带工作区的租约都携带 `setup`。 |
 | `tokens` | 报告每个成功的非交互 prompt 步骤的 token。 |
 | `max_turns` | 把 `lease.maxTurns` 传给它能限制的工具，对其他工具报告 `"unenforced":["max_turns"]`。 |
 | `network` | 能禁止步骤访问网络。 |
 | `isolation` | 以此级别运行每个步骤：`none`、`worktree` 或 `sandbox`。 |
 
-省略的键表示驱动做不到。`next` 会在 `ignored` 中列出其他键。
+省略的键表示驱动做不到。`next` 会在 `ignored` 中列出其他键。[编程会话](workflow.md#在编程会话中运行)的 skill 驱动声明 `hitl`、所有 `workspace` 模式、`env: "commands"` 和 `setup`。它从不声明 `tokens`、`max_turns` 或 `network`，其 `isolation` 为 `none`。
 
 ## HITL（人在回路中）
 
@@ -681,7 +681,7 @@ steps:
 
 后续步骤读取 `steps.decide.choice` 和 `steps.decide.note`，也可以通过 `passes[n]` 读取历史。每个新 pass 都重新询问。无动作结局步骤上的 approve 必须得到 `yes` 才会到达结局。
 
-必须由人直接回答的审批使用 `approve: { message: Publish?, required: true }`，永远不自动回答。`respond` 保存时间、渠道、选择和可选备注。使用 `--json` 时渠道为 `driver`，`agent: false`。不使用 `--json` 时，stdin 是 TTY 则渠道为 `tty`，`agent: false`；否则为 `cli`，`agent: true`。必需审批以 `agent_in_path` 拒绝 cli 回答。TTY 是渠道约定，不能防止有能力创建 PTY 的调用者。从[仪表盘](dashboard.md#工作流运行workflow-runs)回答时渠道为 `dashboard`，`agent: false`。
+必须由人直接回答的审批使用 `approve: { message: Publish?, required: true }`，永远不自动回答。`respond` 保存时间、渠道、选择和可选备注。使用 `--json` 时渠道为 `driver`。不使用 `--json` 时，stdin 是 TTY 则渠道为 `tty`；否则为 `cli`。渠道为 `cli`，或发送回答的进程运行在 agent 会话中（设置了 `CLAUDE_CODE_SESSION_ID` 这类 agent 会话变量）时，回答记录为 `agent: true`；否则为 `agent: false`。在工作流 attempt 中（设置了 `TEAMAI_WORKFLOW_ATTEMPT`），`respond` 不记录任何回答，返回 `nested_workflow`。必需审批以 `agent_in_path` 拒绝 `agent: true` 的回答，错误信息会给出用户应在自己终端里运行的命令。TTY 和这些变量只是证据，不能防止有能力创建 PTY 或取消变量的调用者。从[仪表盘](dashboard.md#工作流运行workflow-runs)回答时渠道为 `dashboard`，`agent: false`，除非 `teamai dashboard` 运行在 agent 会话中。
 
 ```sh
 teamai workflow respond <run> decide build --note "Ready" --pass 1
@@ -690,7 +690,7 @@ teamai workflow resume <run>
 
 `--pass` 拒绝已经被后续 pass 替代的 HITL 请求回答。同一个 pass 重复回答返回 `repeated_response`。
 
-非 `local` 驱动使用相同的 HITL 契约。每次 `next` 请求都发送 `driver.can.hitl`，包括忙碌时的轮询。有人可以回答 HITL 请求并参与交互步骤时，将其设为 `true`。没有可租出的工作时，`next` 返回 `hitl`，包括 `run`、`step`、`pass`、`kind`、渲染后的 `message`、`options`、可选 `default`、`required`，以及 `respond` 命令模板。向该用户展示 `hitl.message` 和 `hitl.respond`，由其将 `<option>` 替换为选择后运行 `teamai workflow respond`。模板会给 `'items[0].ask'` 这样的 fan-out 步骤路径加上引号；运行时保留这些引号。`cli` 渠道只能回答可选 HITL 请求。有自己 UI 的驱动可以用 `respond --json '{"driver":{"kind":"ide","machine":"host","workspace":"/work"}}'` 提交用户的回答，包括必需审批；这会记录渠道 `driver`、`agent: false`，并在本地保留驱动身份。驱动声明答案由用户在其 UI 中给出，绝不能提交 agent 自己选择的答案；与 TTY 约定一样，这只是声明，不是保护机制。
+非 `local` 驱动使用相同的 HITL 契约。每次 `next` 请求都发送 `driver.can.hitl`，包括忙碌时的轮询。有人可以回答 HITL 请求并参与交互步骤时，将其设为 `true`。没有可租出的工作时，`next` 返回 `hitl`，包括 `run`、`step`、`pass`、`kind`、渲染后的 `message`、`options`、可选 `default`、`required`，以及 `respond` 命令模板。向该用户展示 `hitl.message` 和 `hitl.respond`，由其将 `<option>` 替换为选择后运行 `teamai workflow respond`。模板会给 `'items[0].ask'` 这样的 fan-out 步骤路径加上引号；运行时保留这些引号。`cli` 渠道只能回答可选 HITL 请求。有自己 UI 的驱动可以用 `respond --json '{"driver":{"kind":"ide","machine":"host","workspace":"/work"}}'` 提交用户的回答，包括必需审批；这会记录渠道 `driver`、`agent: false`，并在本地保留驱动身份。从 agent 会话中发送时记录为 `agent: true`，因此必需审批会拒绝它。驱动声明答案由用户在其 UI 中给出，绝不能提交 agent 自己选择的答案；与 TTY 约定一样，这只是声明，不是保护机制。
 
 有就绪租约时优先返回租约。工具运行期间，将其 attempt id 放入 `running`，以 `canTakeLease: false` 轮询 `next`，展示返回的 HITL 请求，并停止 attempt id 出现在 `cancelled` 中的工具。只有支持 HITL 的驱动才能获取 `interactive` 租约；交互步骤会等待这样的驱动。
 
@@ -703,7 +703,7 @@ teamai workflow resume <run>
 | 有 default 的 choose | 选择 default，渠道 `auto_approve` | 失败 `hitl_required` |
 | 无 default 的 choose | 失败 `hitl_required` | 失败 `hitl_required` |
 
-每次无 HITL 决策和 hitl_required 失败都会向 stderr 写警告。在本地配置中与 `workflows.max_parallel` 一起设置 `workflows.auto_approve`，或给 `start --driver local`、`resume` 传 `--auto-approve`，仅对当前进程生效。JSON next 不能设置此覆盖。本地驱动仅在 stdin 和 stderr 都是 TTY 时声明支持 HITL，通过 stderr 提问，接受选择及其后的可选备注，并在提问期间继续轮询。其他进程回答或取消 HITL 请求会关闭问题。交互工具占用终端时，HITL 请求提问会等待。
+每次无 HITL 决策和 hitl_required 失败都会向 stderr 写警告。在本地配置中与 `workflows.max_parallel` 一起设置 `workflows.auto_approve`，或给 `start --driver local`、`resume` 传 `--auto-approve`，仅对当前进程生效。没有 HITL 的驱动不能通过 JSON next 设置此覆盖。支持 HITL 的驱动忽略 `workflows.auto_approve`：用户为这次运行选择自动批准时，它在 `next` 中发送 `autoApprove: true`，终端中的本地驱动在传入 `--auto-approve` 时也这样做。此时可选 approve 和有 default 的 choose 按 `auto_approve: true` 一列回答；必需 approve 和无 default 的 choose 仍以 `hitl` 返回。本地驱动仅在有人值守的运行（见[有人值守与无人值守的运行](workflow.md#有人值守与无人值守的运行)）中、且 stdin 和 stderr 都是 TTY 时声明支持 HITL，通过 stderr 提问，接受选择及其后的可选备注，并在提问期间继续轮询。其他进程回答或取消 HITL 请求会关闭问题。交互工具占用终端时，HITL 请求提问会等待。
 
 `interactive: true` 要求 `prompt` 或 `prompt_file`。步骤会等待支持 HITL 的驱动。没有终端时，`--driver local` 以 `busy` 停止，原因中指出 `hitl`；请在终端中运行 `resume`。本地驱动在工作目录以前台方式打开工具，继承 stdio，并把 prompt 作为第一条消息。人对仓库的修改会保留，步骤成功。设置了 `workspace: read-only` 的交互步骤和命令一样检查：改了检出目录就以 `read_only_dirty` 失败，改动留在原地。在外层步骤打开的工作区里，改动保存在 `refs/teamai/kept/<attempt>`，并从工作区移除。在自己工作区里的交互步骤仍可以改那个工作区。无头 prompt 仍然只读。终端的 Ctrl-C 和 Ctrl-\ 交给交互工具处理；SIGTERM 和 SIGHUP 会停止工具和驱动。交互工具以 0 退出且没有输出时可以不写结果文件。驱动在 prompt 运行时每两秒轮询，发现取消后停止工具。
 
@@ -779,7 +779,7 @@ teamai workflow resume <run> [--claim]
 | `run_mismatch` | 本机有一个 id 相同、但开始时间不同的运行。带 `localCreatedAt` 和 `remoteCreatedAt`。 | 两个运行都不会被改动。它们是不同的运行。 |
 | `invalid_run` | id 不是 `r` 加 8 或 16 位十六进制数字。 | 检查 id。 |
 | `unsupported_repo` | 团队仓库是 `http` 仓库，没有 `teamai-reports`。 | 在有这个运行的机器上继续。 |
-| `busy` | 另一个 teamai 进程正在写 `teamai-reports` 或该运行。 | 重试。 |
+| `busy` | 另一个 teamai 进程正在写 `teamai-reports` 或该运行，或者 `next --prepare` 要准备的位置被另一个未结束的 attempt 占用。 | 重试；位置被占用时，等那个 attempt 报告后再试。 |
 | `reports_unreachable` | 无法从团队仓库的 origin 读取 `teamai-reports`。 | 检查网络连接后重试。 |
 | `reports_failed` | 写入 `teamai-reports` 失败。 | 重试。 |
 | `records_pending` | 运行记录没有到达 `teamai-reports`：git 推送出错、另一个写入方占用，或发布期间有记录排队。 | 重试。 |
@@ -806,7 +806,7 @@ teamai workflow resume <run> [--claim]
 teamai workflow next <run> --json '{"claim":true,"driver":{"kind":"script","machine":"runner","workspace":"/work"}}'
 ```
 
-认领在 `next` 租出任何步骤之前执行，并在 `driver.workspace` 的 origin 上检查仍在运行的运行的分支。本安装实例已经拥有的运行保持原样。认领被拒绝时，作为 `next` 的错误信封返回。遇到 `state_moved` 时，再发送一次认领。非布尔值返回 `invalid_json`，消息为 `claim must be a boolean`。运行可能被其他机器继续的驱动，要在 `changes` 和 `read` 中上报完整的提交 id。`publish` 遇到其他形式的提交值时以 `snapshot_unsupported` 拒绝，并写明字段。
+认领在 `next` 租出任何步骤之前执行，并在 `driver.workspace` 的 origin 上检查仍在运行的运行的分支。随后它像 `resume` 一样，把每个本地分支移到运行记录的提交，无法移动时返回 `branch_diverged`。本安装实例已经拥有的运行保持原样。认领被拒绝时，作为 `next` 的错误信封返回。从 agent 会话发出时，认领像 `resume` 一样遵循运行的 `invoke`：payload 无法带上本人的同意，所以 `ask` 运行返回 `confirm_needed`，本人同意后，会话用 `teamai workflow resume <run> --claim --confirmed` 继续它。遇到 `state_moved` 时，再发送一次认领。非布尔值返回 `invalid_json`，消息为 `claim must be a boolean`。运行可能被其他机器继续的驱动，要在 `changes` 和 `read` 中上报完整的提交 id。`publish` 遇到其他形式的提交值时以 `snapshot_unsupported` 拒绝，并写明字段。
 
 ## 在自己的驱动里使用工作区
 
@@ -815,7 +815,7 @@ teamai workflow next <run> --json '{"claim":true,"driver":{"kind":"script","mach
 1. 从 `workspace.start` 开始一个步骤、合并 `workspace.merge` 里的一项，或从 `workspace.configCommit` 恢复 agent 文件之前，先用 `git cat-file -e <commit>^{commit}` 检查检出目录里有没有这个提交。缺少时，用 refspec `+refs/heads/teamai/<run>/*:refs/remotes/origin/teamai/<run>/*` 取回这次运行的分支，再检查一次。refspec 没有匹配到任何分支时，fetch 也会成功，所以只有第二次检查算数。仍然缺少的提交会让步骤在运行任何内容之前以 `workspace_base` 失败，消息里写明该提交和它所在的分支。
 2. 检出目录有 `origin` 时，驱动在发送报告之前推送 `changes` 里报告的提交所在的分支，步骤失败时也一样。推送失败时，这些提交仍然会被报告。成功的步骤随后以 `push_failed` 失败。本身已失败的步骤保留自己的失败，消息里再补充该分支没有推送。
 
-`src/workflow/conformance.ts` 里的 `workflowGitConformanceScenarios` 在一个 bare `origin` 上检查这两条规则。像 `src/__tests__/workflow-git-conformance.test.ts` 对 `local` 所做的那样，用它们检查你的驱动。
+`src/workflow/conformance/git.ts` 里的 `workflowGitConformanceScenarios` 在一个 bare `origin` 上检查这两条规则。像 `src/__tests__/workflow-git-conformance.test.ts` 对 `local` 所做的那样，用它们检查你的驱动。
 
 继续一个[已发布的运行](#发布和认领)的驱动同样依赖这些规则：
 
@@ -823,6 +823,16 @@ teamai workflow next <run> --json '{"claim":true,"driver":{"kind":"script","mach
 - 认领之后，驱动在继续一个本地已有的工作区之前，先把该分支向前移到运行记录的提交。本地分支领先于该提交或与它分叉、worktree 有改动或不在该分支上、或被只读步骤留下且尚未恢复时，驱动拒绝，什么都不移动。本地驱动在每次认领后、第一次租约前做一次这项检查，并以 `branch_diverged` 返回，说明该怎么做。
 - 认领带来的工作区在某个驱动租下其中的步骤之前没有所有者。该驱动成为它的所有者。
 - 另一台机器在一个自己打开工作区的步骤上持有的租约，会作为该步骤的下一个 pass 重新开始，使用新分支。旧分支和推送到它上面的内容留在 `origin` 上。该步骤会重新询问它的 HITL 问题。其他步骤上的租约被释放，并在同一个 pass 中重新运行。
+
+### 让 TeamAI 准备工作区
+
+驱动可以把工作区及其 git 操作交给 TeamAI。`next <run> --prepare --json '<payload>'` 领取一个步骤并准备它的工作区：在运行启动时所在的检出目录中创建或复用 worktree，应用基线 agent 文件和团队资源，并以 `lease.cwd` 返回该目录。再次准备会保留已有的编辑。在 `lease.cwd` 中运行步骤，不要在那里运行 git。两个 attempt 从不共用一个位置，而检出目录是同一个位置，所以在检出目录中工作的步骤即使可以并行，也会依次运行：租约的位置被另一个未结束的 attempt 占用时，返回 `busy`，attempt 仍保持租约；等那个 attempt 报告后，用 `--attempt` 准备它。TeamAI 不为这类驱动保存运行模式，setup 按调用 `next --prepare` 的进程的模式运行（见[有人值守与无人值守的运行](workflow.md#有人值守与无人值守的运行)），因此请在驱动中自行导出 `TEAMAI_MODE`，让它的各次调用保持同一模式。
+
+之后由 `report` 完成这个 attempt。它负责 commit、push，并自己填写 `changes` 或 `read`，所以已准备的 attempt 的报告如果带有 `changes` 或 `read`，会返回 `invalid_report`。TeamAI 只在接受了成功报告且回复允许 cleanup 后才删除 worktree。失败的 attempt 保留其工作，以便重试。
+
+要准备驱动已经领取的 attempt，运行 `next <run> --prepare --attempt <attempt>`。运行不再把该 attempt 租给这个驱动时，返回 `wrong_attempt`。加上 `--adopt <dir>` 时，attempt 改在宿主创建的位置运行：该仓库的一个干净 worktree，位于租约的工作区分支上，或分离在其起点，就像 `git worktree add` 创建的那样。不符合的位置返回 `adopt_mismatch`，attempt 仍保持租约。TeamAI 在那里像在自己的 worktree 中一样 commit 和 push，但从不删除该位置。
+
+TeamAI 为准备 attempt 记录的内容只保存在本机：路径和文件指纹，不含提示词、env 值或图。
 
 ## 在自己的驱动里评审
 

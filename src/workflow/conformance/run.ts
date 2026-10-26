@@ -1,5 +1,9 @@
-import { PARALLEL_ROOTS, controlsYaml, type ConformanceScenario } from './conformance-interpreter.js';
-import { limitsConformanceScenarios } from './limits-conformance.js';
+import {
+  PARALLEL_ROOTS, bothSkillProfiles, controlsYaml, type ConformanceOperation, type ConformanceScenario,
+} from '../conformance-interpreter.js';
+import { AGENT_SESSION_ENV } from '../../utils/session-id.js';
+import { ATTEMPT_ENV } from '../attempt-marker.js';
+import { limitsConformanceScenarios } from '../limits-conformance.js';
 
 const TWO_STEPS = `schemaVersion: v1alpha1
 name: build
@@ -567,6 +571,7 @@ workflowConformanceScenarios.push(
       { kind: 'next', saveAs: 'again', hitl: true, expect: { data: { lease: { step: 'pair', interactive: true } } } },
     ],
     expectState: { status: 'running', steps: [{ id: 'pair', status: 'leased' }] },
+    refusedBy: bothSkillProfiles({ at: 'held', expect: { data: { lease: { step: 'pair', interactive: true } } } }),
   },
   {
     name: 'retry after the final failure does not provisionally finish the run', workflowName: 'build', yaml: TWO_STEPS,
@@ -588,6 +593,7 @@ workflowConformanceScenarios.push(
       { kind: 'respond', step: 'work', choice: 'no', expect: { error: { code: 'repeated_response' } } },
       { kind: 'next', saveAs: 'work', hitl: true, running: ['parallel'], expect: { data: { lease: { step: 'work' } } } },
     ],
+    refusedBy: bothSkillProfiles({ at: 'busy', expect: { data: { hitl: { step: 'work' } } } }),
   },
   {
     name: 'refused approve skips and can be answered again', workflowName: 'build', yaml: APPROVE,
@@ -604,6 +610,7 @@ workflowConformanceScenarios.push(
   {
     name: 'optional approve without HITL skips', workflowName: 'build', yaml: APPROVE,
     operations: [{ kind: 'next', saveAs: 'done', expect: { data: { done: { outcome: 'succeeded' } } } }],
+    refusedBy: bothSkillProfiles({ at: 'done', expect: { data: { hitl: { step: 'work', kind: 'approve' } } } }),
   },
   {
     name: 'required approve refuses drivers without HITL and agent answers', workflowName: 'build', yaml: APPROVE.replace('approve: Build it?', 'approve: { message: Build it?, required: true }'),
@@ -613,6 +620,7 @@ workflowConformanceScenarios.push(
       { kind: 'next', saveAs: 'done', expect: { data: { done: { outcome: 'failed' } } } },
     ],
     expectState: { steps: [{ id: 'work', status: 'failed', failure: { code: 'hitl_required' } }, { id: 'later', status: 'skipped' }] },
+    refusedBy: bothSkillProfiles({ at: 'done', expect: { data: { hitl: { step: 'work', required: true } } } }),
   },
   {
     name: 'choose exposes choice and rejects stale pass', workflowName: 'build', yaml: CHOOSE,
@@ -677,6 +685,7 @@ workflowConformanceScenarios.push(
       { kind: 'next', saveAs: 'pair', as: 'session', expect: { data: { lease: { step: 'pair', interactive: true } } } },
     ],
     expectState: { status: 'running', steps: [{ id: 'pair', status: 'leased', lease: { driver: { kind: 'session' } } }] },
+    refusedBy: bothSkillProfiles({ at: 'local', expect: { data: { lease: { step: 'pair', interactive: true } } } }),
   },
   {
     name: 'a held step does not block a ready sibling', workflowName: 'build',
@@ -716,275 +725,75 @@ workflowConformanceScenarios.push({
     note: 'Person approved in the UI', driver: { kind: 'ide', machine: 'host', workspace: '/ui' } } }, { id: 'later', status: 'pending' }] },
 });
 
-workflowConformanceScenarios.push(...limitsConformanceScenarios);
+const REQUIRED_APPROVE = APPROVE.replace('approve: Build it?', 'approve: { message: Build it?, required: true }');
+const UI = { driver: { kind: 'ide', machine: 'host', workspace: '/ui' } };
 
-/** A value a scenario reads from the run once it is done: its base, or what a step reported in `changes`. */
-export type GitConformanceName = 'base.commit' | 'base.ref' | `steps.${string}.commit` | `steps.${string}.branch`;
-
-/**
- * A git-level case for any driver that takes workspace leases. The runner makes a bare `origin` whose `main` has one
- * commit and clones it twice: a checkout of another machine, and the checkout the driver under test runs in. It starts
- * the run with its base on `main`: origin's tip, or with `base: 'elsewhere'` a commit only the other machine has. A
- * driver of that machine then runs the `elsewhere` steps through `next` and `report`, the driver under test drives the
- * run from its checkout until it ends, and the runner checks the persisted run and origin. With `handoff`, the other
- * machine has an install of its own: it starts the run there and publishes it after its steps, and the driver under
- * test claims the run before it drives it.
- */
-export interface GitConformanceScenario {
-  name: string;
-  workflowName: string;
-  yaml: string;
-  base: 'origin' | 'elsewhere';
-  /**
-   * Steps the other machine runs first, in this order, each the next step `next` leases it with no merges. It commits
-   * `files` on the leased branch from `start`, pushes that branch to origin unless `push` is false, and reports success
-   * with that commit as `changes`.
-   */
-  elsewhere?: Array<{ step: string; files: Record<string, string>; push: boolean }>;
-  /** Origin refuses every push once the `elsewhere` steps ran. */
-  refusePushes?: true;
-  /** The run reaches the driver under test through a publish on the other machine and a claim on its own. */
-  handoff?: true;
-  /** Expected fields in the persisted run after the driver under test is done. */
-  expectState: Record<string, unknown>;
-  /** By step id: the step's reported `changes.to` is the tip of `changes.branch` on origin, and that tip holds these files. */
-  expectPushed?: Record<string, Record<string, string>>;
-  /** The step's `message` contains each named value as a whole word, and its `failure.code` is not `codeIsNot`. */
-  expectFailure?: { step: string; names: GitConformanceName[]; codeIsNot?: string };
-}
-
-const FAILING_WRITER = `schemaVersion: v1alpha1
-name: build
-description: A step commits a file and then fails.
-steps:
-  - id: broken
-    workspace: new
-    command: node -e "require('fs').writeFileSync('broken.txt', 'B'); process.exit(1)"
-`;
-
-const JOIN = `schemaVersion: v1alpha1
-name: build
-description: A step starts from one branch and merges another.
-steps:
-  - id: right
-    workspace: new
-    command: node -e "require('fs').writeFileSync('right.txt', 'R')"
-  - id: left
-    needs: []
-    workspace: new
-    command: node -e "require('fs').writeFileSync('left.txt', 'L')"
-  - id: join
-    needs: [left, right]
-    workspace: new
-    command: node -e "require('fs').writeFileSync('joined.txt', 'J')"
-`;
-
-const CONTINUED = `schemaVersion: v1alpha1
-name: build
-description: Two changes made one after another in one copy.
-steps:
-  - id: change
-    workspace: new
-    workflow:
-      steps:
-        - id: write
-          workspace: continue
-          command: node -e "require('fs').writeFileSync('write.txt', 'W')"
-        - id: more
-          needs: [write]
-          workspace: continue
-          command: node -e "require('fs').writeFileSync('more.txt', 'M')"
-`;
-
-/**
- * The git rules every driver keeps: it pushes the commits it reports before it reports them, failed steps included,
- * and it fetches the run's branches for a lease commit its checkout lacks, or fails `workspace_base` naming it. A run
- * it claims carries its base and its copies on those branches.
- */
-export const workflowGitConformanceScenarios: GitConformanceScenario[] = [
-  {
-    name: 'a step that fails pushes the commits it reports',
-    workflowName: 'build',
-    yaml: FAILING_WRITER,
-    base: 'origin',
-    expectState: { steps: [{ id: 'broken', status: 'failed' }] },
-    expectPushed: { broken: { 'broken.txt': 'B' } },
-  },
-  {
-    name: 'a step that fails keeps its own failure when origin refuses the push, and names the branch it could not push',
-    workflowName: 'build',
-    yaml: FAILING_WRITER,
-    base: 'origin',
-    refusePushes: true,
-    expectState: { steps: [{ id: 'broken', status: 'failed', changes: {} }] },
-    expectFailure: { step: 'broken', names: ['steps.broken.branch'], codeIsNot: 'push_failed' },
-  },
-  {
-    name: 'a step whose start, merge, and base commits are only on the run branches of origin fetches them',
-    workflowName: 'build',
-    yaml: JOIN,
-    base: 'elsewhere',
-    elsewhere: [{ step: 'right', files: { 'right.txt': 'R' }, push: true }, { step: 'left', files: { 'left.txt': 'L' }, push: true }],
-    expectState: { steps: [{ id: 'right', status: 'succeeded' }, { id: 'left', status: 'succeeded' }, { id: 'join', status: 'succeeded' }] },
-    expectPushed: { join: { 'left.txt': 'L', 'right.txt': 'R', 'joined.txt': 'J' } },
-  },
-  {
-    name: 'a step whose merge commit is on no branch of origin fails workspace_base naming the commit and its branch',
-    workflowName: 'build',
-    yaml: JOIN,
-    base: 'origin',
-    elsewhere: [{ step: 'right', files: { 'right.txt': 'R' }, push: false }],
-    expectState: { steps: [{ id: 'right', status: 'succeeded' }, { id: 'left', status: 'succeeded' }, { id: 'join', status: 'failed', failure: { code: 'workspace_base' } }] },
-    expectPushed: { left: { 'left.txt': 'L' } },
-    expectFailure: { step: 'join', names: ['steps.right.commit', 'steps.right.branch'] },
-  },
-  {
-    name: 'a step whose base commit is on no branch of origin fails workspace_base naming the commit and its branch',
-    workflowName: 'build',
-    yaml: FAILING_WRITER,
-    base: 'elsewhere',
-    expectState: { steps: [{ id: 'broken', status: 'failed', failure: { code: 'workspace_base' } }] },
-    expectFailure: { step: 'broken', names: ['base.commit', 'base.ref'] },
-  },
-  {
-    name: 'a claimed run whose base only the publishing machine had starts its copies from that base',
-    workflowName: 'build',
-    yaml: JOIN,
-    base: 'elsewhere',
-    handoff: true,
-    expectState: { status: 'succeeded', steps: [{ id: 'right', status: 'succeeded' }, { id: 'left', status: 'succeeded' }, { id: 'join', status: 'succeeded' }] },
-    expectPushed: { join: { 'elsewhere.txt': 'only on the other machine', 'left.txt': 'L', 'right.txt': 'R', 'joined.txt': 'J' } },
-  },
-  {
-    name: 'a claimed run continues a copy from the commit the publishing machine recorded',
-    workflowName: 'build',
-    yaml: CONTINUED,
-    base: 'elsewhere',
-    elsewhere: [{ step: 'change.write', files: { 'write.txt': 'W' }, push: true }],
-    handoff: true,
-    expectState: { status: 'succeeded', steps: [{ id: 'change', status: 'succeeded' }, { id: 'change.write', status: 'succeeded' }, { id: 'change.more', status: 'succeeded' }] },
-    expectPushed: { 'change.more': { 'elsewhere.txt': 'only on the other machine', 'write.txt': 'W', 'more.txt': 'M' } },
-  },
-];
-
-/** What a run holds once a delivery case ends, over every install that drove it. */
-export interface DeliveryExpectation {
-  /** Pull requests TeamAI asked the host to open. */
-  creates: number;
-  run: 'succeeded' | 'failed' | 'cancelled';
-  work: 'succeeded' | 'failed' | 'cancelled';
-  /** The pull requests the run lists in `deliveries` and its end record's `prs`. */
-  prs: number;
-  /** The failure code of `work`, whose message then names its branch. */
-  failure?: string;
-}
-
-/**
- * A delivery case for every driver that takes workspace leases, run against `deliveryConformanceWorkflow` with a fake
- * provider every case shares. The runner gives the product an `https://github.com/<owner>/<repo>` origin that git
- * rewrites to a bare repository, and a fake `gh` that records each create and answers lookups from what it recorded.
- * With `hold`, the fake waits inside that call, a create once it recorded the request, until the runner has done
- * `action`: `crash` kills the process the call came from, and the driver calls `next` again; `publish` publishes the
- * run and kills that process, and a driver of a second install with its own checkout claims the run and drives it;
- * `cancel` cancels the run; `poll` holds a delivery that another process of the machine started after `work` reported,
- * while the driver under test calls `next`. A driver whose delivery never reaches `hold` runs to the end untouched.
- * `unreachable` fails every lookup. `opened` is expected of a driver that leaves the pull request to TeamAI, `reported`
- * of one that reports its own as `changes.pr_url`. After every case, `work`'s branch is on origin at its reported commit.
- */
-export interface DeliveryConformanceScenario {
-  name: string;
-  hold?: { call: 'lookup' | 'create'; action: 'crash' | 'publish' | 'cancel' | 'poll' };
-  unreachable?: true;
-  opened: DeliveryExpectation;
-  reported: DeliveryExpectation;
-}
-
-/** `ship` copies what the host holds when it runs to `SHIP_SAW`, which the runner sets: the open requests by then. */
-export const deliveryConformanceWorkflow = `schemaVersion: v1alpha1
-name: deliver
-description: A step delivers its branch as a pull request, and the step that needs it runs once it is delivered.
-steps:
-  - id: work
-    workspace: new
-    command: node -e "require('fs').writeFileSync('work.txt', 'W')"
-    deliver: pr
-  - id: ship
-    needs: [work]
-    command: node -e "require('fs').copyFileSync(process.env.SHIP_OPEN, process.env.SHIP_SAW)"
-`;
-
-const DELIVERED: DeliveryExpectation = { creates: 1, run: 'succeeded', work: 'succeeded', prs: 1 };
-const REPORTED: DeliveryExpectation = { creates: 0, run: 'succeeded', work: 'succeeded', prs: 1 };
-
-export const workflowDeliveryConformanceScenarios: DeliveryConformanceScenario[] = [
-  {
-    name: 'a delivered branch opens one pull request into the run base, and the step that needs it runs once it is delivered',
-    opened: DELIVERED,
-    reported: REPORTED,
-  },
-  {
-    name: 'a delivery whose process stops inside the create finds the pull request on the next call and opens no other',
-    hold: { call: 'create', action: 'crash' },
-    opened: DELIVERED,
-    reported: REPORTED,
-  },
-  {
-    name: 'a run published while it delivers, and claimed by another install with its own checkout, opens one pull request',
-    hold: { call: 'create', action: 'publish' },
-    opened: DELIVERED,
-    reported: REPORTED,
-  },
-  {
-    name: 'a run cancelled while its delivery looks for an open pull request opens none',
-    hold: { call: 'lookup', action: 'cancel' },
-    opened: { creates: 0, run: 'cancelled', work: 'cancelled', prs: 0 },
-    reported: { creates: 0, run: 'cancelled', work: 'cancelled', prs: 0 },
-  },
-  {
-    name: 'a run cancelled while its delivery opens the pull request lists it, and the step stays cancelled',
-    hold: { call: 'create', action: 'cancel' },
-    opened: { creates: 1, run: 'cancelled', work: 'cancelled', prs: 1 },
-    reported: REPORTED,
-  },
-  {
-    name: 'a delivery that cannot reach the host fails naming the branch, which stays on origin',
-    unreachable: true,
-    opened: { creates: 0, run: 'failed', work: 'failed', prs: 0, failure: 'delivery_failed' },
-    reported: { creates: 0, run: 'failed', work: 'failed', prs: 0, failure: 'delivery_failed' },
-  },
-  {
-    name: 'a driver polls while another process of its machine delivers, and gets the step that needs it once delivered',
-    hold: { call: 'create', action: 'poll' },
-    opened: DELIVERED,
-    reported: REPORTED,
-  },
-];
-
-export const judgeLeaseConformanceScenario = {
-  name: 'a judge lease renews through running and settles only through score submission',
-  yaml: `schemaVersion: v1alpha1
-name: judged
-description: A pass with a quality scorer.
-steps:
-  - id: work
-    prompt: Review the change.
-    scorers: [quality]
-`,
-  scorer: `---
-labels:
-  - { value: good, score: 1, description: Did the work }
-  - { value: bad, score: 0, description: Missed the work }
-passingScore: 0.5
-samplingRate: 100
----
-Judge the work.
-`,
+workflowConformanceScenarios.push({
+  name: 'required-gate-provenance: an answer sent from inside an agent session never settles a required gate, with or without a driver, and the same answer from outside one is recorded as the person\'s',
+  workflowName: 'build',
+  yaml: REQUIRED_APPROVE,
   operations: [
-    { kind: 'take', at: '2026-10-22T12:00:00.000Z', expect: { data: { lease: { expiresAt: '2026-10-22T12:30:00.000Z' } } } },
-    { kind: 'renew', at: '2026-10-22T12:20:00.000Z', expect: { data: { idle: { open: 0, leased: 1 } } } },
-    { kind: 'take', at: '2026-10-22T12:45:00.000Z', expect: { data: { lease: { expiresAt: '2026-10-22T12:50:00.000Z', handedBack: true } } } },
-    { kind: 'report', expect: { error: { code: 'judge_lease' } } },
-    { kind: 'submit', expect: { data: { label: { label: 'good', score: 1, passed: true } } } },
-    { kind: 'idle', at: '2026-10-22T12:46:00.000Z', expect: { data: { idle: { open: 0, leased: 0 } } } },
+    { kind: 'next', saveAs: 'hitl', hitl: true, expect: { data: { hitl: { step: 'work', required: true } } } },
+    ...AGENT_SESSION_ENV.map((name): ConformanceOperation => (
+      { kind: 'respond', step: 'work', choice: 'yes', pass: 1, json: UI, env: { [name]: 'agent-1304' }, expect: { error: { code: 'agent_in_path' } } }
+    )),
+    { kind: 'respond', step: 'work', choice: 'yes', pass: 1, json: UI, env: { [ATTEMPT_ENV]: 'r0123456789abcdef/a0000000a' }, expect: { error: { code: 'nested_workflow' } } },
+    { kind: 'respond', step: 'work', choice: 'yes', pass: 1, env: { CLAUDE_CODE_SESSION_ID: 'agent-1304' }, expect: { error: { code: 'agent_in_path' } } },
+    { kind: 'respond', step: 'work', choice: 'yes', pass: 1, json: UI, expect: { data: { answered: { step: 'work', choice: 'yes', channel: 'driver', agent: false } } } },
   ],
-} as const;
+  expectState: { steps: [{ id: 'work', status: 'pending', answer: { choice: 'yes', channel: 'driver', agent: false, driver: UI.driver } }, { id: 'later', status: 'pending' }] },
+});
+
+workflowConformanceScenarios.push({
+  name: 'auto-approve-with-hitl: a driver with HITL that asks for auto-approve gets optional approvals and choices with a default answered, and still gets required approvals and choices without a default',
+  workflowName: 'build',
+  yaml: controlsYaml(`  - id: plan
+    approve: Plan it?
+    command: echo plan
+  - id: pick
+    needs: []
+    choose: { message: Pick one, options: [fast, slow], default: fast }
+  - id: ship
+    needs: [plan, pick]
+    approve: { message: Ship it?, required: true }
+    command: echo ship
+  - id: name
+    needs: [ship]
+    choose: { message: Name it, options: [one, two] }`),
+  operations: [
+    { kind: 'next', saveAs: 'plan', as: 'session', autoApprove: true, expect: { data: { lease: { step: 'plan' } } }, state: { steps: [
+      { id: 'plan', answer: { choice: 'yes', channel: 'auto_approve', agent: false } },
+      { id: 'pick', answer: { choice: 'fast', channel: 'auto_approve', agent: false } },
+      { id: 'ship', status: 'pending' }, { id: 'name', status: 'pending' }] } },
+    { kind: 'report', lease: 'plan', as: 'session', body: { outcome: 'success' }, expect: { data: { accepted: true } } },
+    { kind: 'next', saveAs: 'ship-gate', as: 'session', autoApprove: true, expect: { data: { hitl: { step: 'ship', required: true } } } },
+    { kind: 'respond', step: 'ship', choice: 'yes', pass: 1, json: UI, expect: { data: { answered: { step: 'ship', channel: 'driver' } } } },
+    { kind: 'next', saveAs: 'ship', as: 'session', autoApprove: true, expect: { data: { lease: { step: 'ship' } } } },
+    { kind: 'report', lease: 'ship', as: 'session', body: { outcome: 'success' }, expect: { data: { accepted: true } } },
+    { kind: 'next', saveAs: 'name-gate', as: 'session', autoApprove: true, expect: { data: { hitl: { step: 'name', options: ['one', 'two'] } } } },
+  ],
+  expectState: { status: 'running', steps: [{ id: 'plan', status: 'succeeded' }, { id: 'pick', status: 'succeeded' },
+    { id: 'ship', status: 'succeeded', answer: { choice: 'yes', channel: 'driver', agent: false } }, { id: 'name', status: 'waiting' }] },
+});
+
+const AGENT_SESSION = { CLAUDE_CODE_SESSION_ID: 'agent-1304' };
+
+workflowConformanceScenarios.push({
+  name: 'invoke-from-agent: an agent session cannot start a workflow without invoke with any driver, CI or not, and starts an invoke: ask one only with --confirmed and never unattended; a process without agent evidence starts both',
+  workflowName: 'build',
+  yaml: controlsYaml('  - id: work\n    command: echo work'),
+  workflows: { gated: 'schemaVersion: v1alpha1\nname: gated\ndescription: Starts after the person agrees.\ninvoke: ask\nsteps:\n  - id: work\n    command: echo work\n' },
+  operations: [
+    { kind: 'start', driver: 'local', env: AGENT_SESSION, expect: { error: { code: 'invoke_denied' } } },
+    { kind: 'start', env: AGENT_SESSION, expect: { error: { code: 'invoke_denied' } } },
+    { kind: 'start', driver: 'skill', env: AGENT_SESSION, expect: { error: { code: 'invoke_denied' } } },
+    { kind: 'start', driver: 'local', env: { ...AGENT_SESSION, CI: '1' }, expect: { error: { code: 'invoke_denied' } } },
+    { kind: 'start', workflow: 'gated', env: AGENT_SESSION, expect: { error: { code: 'confirm_needed' } } },
+    { kind: 'start', workflow: 'gated', env: { ...AGENT_SESSION, TEAMAI_MODE: 'unattended' }, confirmed: true, expect: { error: { code: 'unattended_denied' } } },
+    { kind: 'start', workflow: 'gated', env: { ...AGENT_SESSION, TEAMAI_MODE: 'attended' }, confirmed: true, expect: { data: {} } },
+    { kind: 'start', workflow: 'gated', expect: { data: {} } },
+    { kind: 'start', expect: { data: {} } },
+  ],
+});
+
+workflowConformanceScenarios.push(...limitsConformanceScenarios);

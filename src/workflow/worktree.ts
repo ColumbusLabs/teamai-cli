@@ -6,11 +6,10 @@
 import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { TeamaiConfigBaseSchema } from '../types.js';
-import { writeJsonAtomic } from '../utils/fs.js';
+import { pathExists, writeJsonAtomic } from '../utils/fs.js';
 
 /** Agent configuration a workspace step reads from the run's base rather than from its branch. */
 export const AGENT_PATHS: readonly string[] = agentConfigPaths();
@@ -158,7 +157,7 @@ export async function ensureWorktree(main: string, branch: string, start: string
     }
     const on = await offBranch(dir, branch);
     if (on) return { error: `Workspace ${dir} is ${on}, not on branch ${branch}. Check out ${branch} in ${dir}, then retry the step.` };
-    await worktreeHooks(main, dir, hooks);
+    await worktreeHooks(dir, hooks);
     return { dir, created: false };
   }
   await fs.mkdir(path.dirname(dir), { recursive: true });
@@ -168,7 +167,7 @@ export async function ensureWorktree(main: string, branch: string, start: string
     ? await git(main, [...config, 'worktree', 'add', dir, branch])
     : await git(main, [...config, 'worktree', 'add', '-b', branch, dir, start]);
   if (created.code !== 0) return { error: created.stderr.trim() || created.stdout.trim() || 'git worktree add failed' };
-  await worktreeHooks(main, dir, hooks);
+  await worktreeHooks(dir, hooks);
   return { dir, created: true };
 }
 
@@ -235,10 +234,19 @@ export async function reconcileCopy(main: string, branch: string, expected: stri
   return merged.code === 0 ? undefined : { error: `Workspace ${dir} could not be moved to ${expected}: ${merged.stderr.trim()}` };
 }
 
-/** Points this worktree's hooks at `hooks` without changing the active checkout's hooks. */
-async function worktreeHooks(main: string, dir: string, hooks: string): Promise<void> {
-  await git(main, ['config', 'extensions.worktreeConfig', 'true']);
+/**
+ * Points the hooks of worktree `dir` at `hooks`, an empty directory, so no hook of the repository runs in a step's git,
+ * without changing the hooks of any other worktree.
+ */
+export async function worktreeHooks(dir: string, hooks: string): Promise<void> {
+  // Set in the configuration every worktree of the repository shares.
+  await git(dir, ['config', 'extensions.worktreeConfig', 'true']);
   await git(dir, ['config', '--worktree', 'core.hooksPath', hooks]);
+}
+
+/** Drops what `worktreeHooks` set in worktree `dir`, so the repository's own hooks run there again. */
+export async function clearWorktreeHooks(dir: string): Promise<void> {
+  await git(dir, ['config', '--worktree', '--unset', 'core.hooksPath']);
 }
 
 /**
@@ -290,10 +298,11 @@ export async function mergeBranch(dir: string, commit: string): Promise<
 
 /**
  * Replaces agent configuration with the copy at `commit` and points hooks at an empty directory.
- * `saved` is the branch's own copy, put back for paths the step does not edit.
+ * `saved`, a directory that does not exist yet, receives the branch's own copy, put back for paths the step does not edit.
+ * With `resume`, a `saved` an interrupted run of this left is the branch's copy, and the rest is done again over it.
  */
 export async function applyBaseConfig(
-  dir: string, commit: string, hooks: string,
+  dir: string, commit: string, hooks: string, saved: string, options: { resume?: true } = {},
 ): Promise<{ ok: true; saved: string } | { ok: false; message: string }> {
   await git(dir, ['config', '--worktree', 'core.hooksPath', hooks]);
   const linked = await symlinkedParent(dir);
@@ -315,16 +324,29 @@ export async function applyBaseConfig(
   if (indexFile === undefined || index === undefined) {
     return { ok: false, message: `Agent configuration in ${dir} could not be reset to the run's base commit ${commit}, because its git index could not be read, so the step did not run. Check that git status works in ${dir}, then retry the step.` };
   }
-  const saved = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-agent-'));
-  const conflicts = (await git(dir, ['ls-files', '-u', '-z', '--', ...AGENT_PATHS])).stdout;
-  await fs.writeFile(path.join(saved, '_conflicts'), conflicts);
-  for (const relative of AGENT_PATHS) {
-    try {
-      await copyEntry(path.join(dir, relative), path.join(saved, relative));
-    } catch {
-      // The branch does not have this path.
-    }
+  await fs.mkdir(path.dirname(saved), { recursive: true });
+  // The branch's files are copied aside under another name, and renamed to `saved` once all are there, so a process
+  // killed while it copies leaves them in place in the copy, and a `saved` that exists holds every one of them.
+  const copying = `${saved}.partial`;
+  await fs.rm(copying, { recursive: true, force: true });
+  const kept = await pathExists(saved);
+  if (kept && !options.resume) {
+    return { ok: false, message: `Agent configuration in ${dir} was not reset to the run's base commit ${commit}, because ${saved} already holds the branch's agent files from an earlier attempt to prepare this step, so the step did not run. Copy the files you need from ${saved} into ${dir}, delete ${saved}, then retry the step.` };
   }
+  if (!kept) {
+    await fs.mkdir(copying);
+    await fs.writeFile(path.join(copying, '_conflicts'), (await git(dir, ['ls-files', '-u', '-z', '--', ...AGENT_PATHS])).stdout);
+    for (const relative of AGENT_PATHS) {
+      try {
+        await copyEntry(path.join(dir, relative), path.join(copying, relative));
+      } catch {
+        // The branch does not have this path.
+      }
+    }
+    await fs.rename(copying, saved);
+  }
+  // Read back, so a resumed prepare puts back the conflicts the branch had, which the base checkout cleared.
+  const conflicts = await fs.readFile(path.join(saved, '_conflicts'), 'utf8');
   for (const relative of AGENT_PATHS) await fs.rm(path.join(dir, relative), { recursive: true, force: true });
   const refused = await checkoutBaseConfig(dir, commit, present.paths);
   if (refused) {

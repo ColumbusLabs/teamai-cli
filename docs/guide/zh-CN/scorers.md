@@ -111,13 +111,15 @@ JSON
 {"data":{"label":{"scorer":"review-quality","label":"good","score":1,"passed":true,…},"published":true}}
 ```
 
+带 `run` 时，`score --next` 按运行 id 找到运行的 scope，所以 driver 可以在运行的工作树里或运行起始检出目录之外请求。
+
 | `can.judge` | 含义 |
 |---|---|
 | `isolation` | `verified` 或 `best-effort`。只租出它满足[所需级别](#隔离)的任务。 |
 | `access` | 评审者能做什么：`answer`（不用工具）、`read`（读取证据）或 `full`（任意工具，默认值）。标签会记录该值。 |
 | `tools` | 按你的偏好排序。首个能解析评分器模型的工具胜出。 |
 
-评分器未列出的标签会被拒绝，租约保持打开。`running` 列出你仍在评判的租约，从而续期；租约在领取或续期 30 分钟后过期。不要把评审租约放进 `workflow next` 的 `running`。所有字段见 `teamai score --help`。
+评分器未列出的标签会被拒绝，租约保持打开。`running` 列出你仍在评判的租约，从而续期；租约在领取或续期 30 分钟后过期。不要把评审租约放进 `workflow next` 的 `running`：它会回答 `judge_lease`，且不做任何改动。`run` 是一个运行 id，只领取该运行的工作流 pass，从不领取会话。`canTakeLease: false` 只续期 `running`，不领取任何租约。所有字段见 `teamai score --help`。
 
 你的 driver 在上报一个轮次时写明它加载过的团队技能，该轮次的标签会带上它们：
 

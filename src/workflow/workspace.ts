@@ -2,6 +2,8 @@
  * Workspace planning. The engine names the branch and lists the commits to merge.
  * A driver creates the worktree. This module does not run git.
  */
+import { z } from 'zod';
+import { sameDriver } from '../driver-identity.js';
 import { itemsAfter, itemsOf } from './fan-out.js';
 import { localId, statesIn, stepDefinitions, type Scope } from './scope.js';
 import { parseStepPath } from './step-path.js';
@@ -33,6 +35,18 @@ export type WorkspaceContract = {
   | { mode: 'new' | 'continue'; merge: Array<{ branch: string; commit: string }> }
   | { mode: 'read-only'; merge: [] }
 );
+
+const ContractFields = {
+  base: z.object({ ref: z.string().optional(), commit: z.string() }),
+  configCommit: z.string(),
+  branch: z.string(),
+  start: z.object({ commit: z.string(), branch: z.string().optional() }),
+};
+
+export const WorkspaceContractSchema = z.discriminatedUnion('mode', [
+  z.object({ ...ContractFields, mode: z.enum(['new', 'continue']), merge: z.array(z.object({ branch: z.string(), commit: z.string() })) }),
+  z.object({ ...ContractFields, mode: z.literal('read-only'), merge: z.tuple([]) }),
+]) satisfies z.ZodType<WorkspaceContract>;
 
 export interface SessionRef {
   tool: string;
@@ -80,6 +94,11 @@ export function resolveMode(step: WorkflowStep, ancestors: WorkflowStep[]): Work
     return ancestor.forEach ? 'new' : 'continue';
   }
   return 'read-only';
+}
+
+/** Whether a step runs in the member's checkout as it is: read-only, with no enclosing step that opens a copy. */
+export function runsInCheckout(step: WorkflowStep, ancestors: WorkflowStep[]): boolean {
+  return resolveMode(step, ancestors) === 'read-only' && !ancestors.some(opensCopy);
 }
 
 /**
@@ -401,10 +420,6 @@ export function sessionOf(run: RunState, scope: Scope, state: StepState, definit
   return latestContinuation(run, sessionFromPasses([...(target.passes ?? []), ...(current ? [current] : [])]));
 }
 
-function sameDriver(left: DriverIdentity, right: DriverIdentity): boolean {
-  return left.kind === right.kind && left.machine === right.machine && left.workspace === right.workspace;
-}
-
 export interface WorkspaceRequest {
   driver: DriverIdentity;
   /** Modes this driver can run. Omitted means read-only only, so a workspace step waits. */
@@ -489,7 +504,7 @@ export function planWorkspace(
 }
 
 /** Whether the steps inside `step` run in a copy it opens rather than in the one around it. */
-function opensCopy(step: WorkflowStep): boolean {
+export function opensCopy(step: WorkflowStep): boolean {
   return step.workspace === 'new' || (step.forEach !== undefined && step.workspace === 'continue');
 }
 

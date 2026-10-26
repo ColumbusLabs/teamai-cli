@@ -13,14 +13,14 @@ import { updateReports } from '../utils/reports-branch.js';
 import * as workflowCache from '../workflow/cache.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, reportAttempt, resumableSessions, startRun } from '../workflow/engine.js';
-import { claimRun, publishRun, resumeRun } from '../workflow/handoff.js';
+import { claimRun, publishRun, resumeRun, settledSteps } from '../workflow/handoff.js';
 import { pendingRecords, publishPendingRecords, queueRunRecord } from '../workflow/records.js';
-import { runLocalDriver } from '../workflow/local-driver.js';
+import { runLocalDriver } from '../workflow/drivers/local/local-driver.js';
 import { cancelRun, retryStep } from '../workflow/run-controls.js';
-import type { LocalToolAdapter } from '../workflow/local-tool-adapter.js';
+import type { LocalToolAdapter } from '../workflow/drivers/local/local-tool-adapter.js';
 import type { StepPass, StepState } from '../workflow/step-state.js';
 import { readRun, runLockPath, updateRun } from '../workflow/store.js';
-import type { DriverIdentity, RunState, WorkflowEnvelope } from '../workflow/types.js';
+import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowEnvelope } from '../workflow/types.js';
 import { ensureWorktree, fetchMissingCommits, headCommit, markReadCopy, worktreePath } from '../workflow/worktree.js';
 import { knownSecrets } from '../env-resolution.js';
 import { fakeGh } from './helpers/fake-gh.js';
@@ -2283,6 +2283,23 @@ describe('a run taken back on the machine that worked on it', () => {
     expect(originRef(acme.business, `refs/heads/${wrote.branch}`)).toBe(wrote.commit);
     expect(await readRun(alice.config, runId)).toMatchObject({ publication: { reconcileCopies: true } });
   });
+
+  it('brings a copy that next takes back with claim to the commit the other machine recorded, as a resume does', async () => {
+    const acme = team({ ship: SHIP });
+    const alice = await acme.member('alice');
+    const bob = await acme.member('bob');
+    const runId = await startIn(alice, 'ship');
+    const wrote = await work(alice, runId, 'write.txt');
+    await publishRun(alice.config, runId, { env: {}, checkout: alice.checkout });
+    await claimRun(bob.config, runId, { checkout: bob.checkout });
+    const more = await work(bob, runId, 'more.txt');
+    await publishRun(bob.config, runId, { env: {}, checkout: bob.checkout });
+
+    expect(await leaseNext(alice.config, runId, alice.driver, { claim: true, can: { workspace: [...WORKSPACES] } })).toMatchObject({ data: { lease: { step: 'change.last' } } });
+    expect(git(alice.checkout, 'rev-parse', wrote.branch)).toBe(more.commit);
+    const run = await readRun(alice.config, runId);
+    expect(typeof run === 'object' && run.publication).not.toHaveProperty('reconcileCopies');
+  });
 });
 
 describe('the session archive a claimed run restores from', () => {
@@ -2510,5 +2527,73 @@ steps:
       ['Build it.', ['Planned it.']],
       ['Check it.', ['Planned it.']],
     ]);
+  });
+});
+
+describe('settledSteps', () => {
+  const definition: WorkflowDefinition = {
+    schemaVersion: 'v1alpha1', name: 'w', description: 'w',
+    steps: [{
+      id: 'items', forEach: { items: 'inputs.list' },
+      workflow: { steps: [{ id: 'approve', command: 'true' }, { id: 'review', needs: ['approve'], workflow: { steps: [{ id: 'approve', command: 'true' }] } }] },
+    }],
+  };
+  const settled = (steps: Array<{ id: string; status: string }>) => settledSteps({ steps, definition });
+
+  it('lists a step inside for_each items by its definition path once every item settled it or settled whole', () => {
+    const items = (statuses: string[]) => [
+      { id: 'items', status: 'running' },
+      ...statuses.map((status, index) => ({ id: `items[${index}]`, status: status === 'skipped' ? 'skipped' : 'running' })),
+      ...statuses.flatMap((status, index) => (status === 'skipped' || status === 'unstarted' ? [] : [{ id: `items[${index}].approve`, status }])),
+    ];
+    expect(settled(items(['succeeded', 'succeeded']))).toContain('items.approve');
+    expect(settled(items(['succeeded', 'skipped']))).toContain('items.approve');
+    expect(settled(items(['succeeded', 'pending']))).not.toContain('items.approve');
+    expect(settled(items(['succeeded', 'unstarted']))).not.toContain('items.approve');
+    expect(settled([{ id: 'a', status: 'running' }, { id: 'a[0]', status: 'running' }, { id: 'a[0].b[0].c', status: 'succeeded' }])).not.toContain('a.b.c');
+  });
+
+  it('counts a step inside an item settled when the item settled a step that holds it', () => {
+    const steps = [
+      { id: 'items', status: 'running' },
+      { id: 'items[0]', status: 'running' },
+      { id: 'items[0].review', status: 'skipped' },
+      { id: 'items[1]', status: 'running' },
+      { id: 'items[1].review', status: 'running' },
+      { id: 'items[1].review.approve', status: 'succeeded' },
+    ];
+    expect(settled(steps)).toContain('items.review.approve');
+    expect(settled(steps)).not.toContain('items.review');
+  });
+
+  it('settles nothing while a loop could run a settled step again', () => {
+    const looping: WorkflowDefinition = { ...definition, steps: [{ id: 'review', command: 'true' }, { id: 'fix', needs: ['review'], command: 'true', loop: { backTo: 'review', maxIterations: 2 } }] };
+    expect(settledSteps({ steps: [{ id: 'review', status: 'succeeded' }], definition: looping })).toEqual([]);
+    const inline: WorkflowDefinition = { ...definition, steps: [{ id: 'sub', workflow: { loop: { maxIterations: 2 }, steps: [{ id: 'review', command: 'true' }] } }] };
+    expect(settledSteps({ steps: [{ id: 'sub.review', status: 'succeeded' }], definition: inline })).toEqual([]);
+  });
+
+  it('settles a step once no loop that reaches it can run again', () => {
+    const looping: WorkflowDefinition = {
+      ...definition,
+      steps: [
+        { id: 'sub', workflow: { loop: { maxIterations: 2 }, steps: [{ id: 'draft', command: 'true' }] } },
+        { id: 'review', needs: ['sub'], command: 'true' },
+        { id: 'fix', needs: ['review'], command: 'true', loop: { backTo: 'review', maxIterations: 2 } },
+        { id: 'gate', needs: ['fix'], command: 'true' },
+        { id: 'final', needs: ['gate'], command: 'true' },
+      ],
+    };
+    const of = (fix: { status: string; loopFinal?: boolean }) => settledSteps({
+      definition: looping,
+      steps: [
+        { id: 'sub', status: 'succeeded' }, { id: 'sub.draft', status: 'succeeded' }, { id: 'review', status: 'succeeded' },
+        { id: 'fix', ...fix }, { id: 'gate', status: 'succeeded' }, { id: 'final', status: 'running' },
+      ],
+    });
+    expect(of({ status: 'succeeded', loopFinal: true })).toEqual(expect.arrayContaining(['sub', 'sub.draft', 'review', 'fix', 'gate']));
+    expect(of({ status: 'running' })).toEqual(expect.arrayContaining(['sub', 'sub.draft', 'gate']));
+    expect(of({ status: 'running' })).not.toContain('review');
+    expect(of({ status: 'succeeded' })).not.toContain('review');
   });
 });

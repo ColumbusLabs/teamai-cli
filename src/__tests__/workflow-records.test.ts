@@ -205,8 +205,8 @@ describe('#1083 workflow run records', () => {
 
   it('publishes the failure code of every step failure teamai writes, and only codes it can name', () => {
     // Codes a module writes, as `code: '…'`, `error('…', …)` or `failure('…', …)`, that never become a run's failure: every module of src/workflow and src/scorers, and every other one that imports src/scorers or answers a WorkflowEnvelope.
-    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop', 'bad_workspace', 'workflow_namespace_conflict', 'prompt_namespace_conflict', 'bad_delivery'] satisfies Array<WorkflowDiagnostic['code']>;
-    const answers = ['invalid_json', 'driver_running', 'invalid_run', 'repeated_response', 'agent_in_path', 'stale_response', 'retried', 'end_reached', 'repeated_report', 'wrong_attempt', 'invalid_report', 'lease_cancelled', 'interrupted', 'run_unreadable', 'driver_stuck', 'busy', 'workflow_recursion', 'workflow_not_found',
+    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop', 'bad_workspace', 'workflow_namespace_conflict', 'prompt_namespace_conflict', 'bad_delivery', 'bad_invoke', 'bad_alias', 'alias_conflict'] satisfies Array<WorkflowDiagnostic['code']>;
+    const answers = ['invalid_json', 'driver_running', 'invalid_run', 'repeated_response', 'agent_in_path', 'stale_response', 'retried', 'end_reached', 'repeated_report', 'wrong_attempt', 'invalid_report', 'lease_cancelled', 'interrupted', 'run_unreadable', 'driver_stuck', 'ambiguous_run', 'busy', 'workflow_recursion', 'workflow_not_found',
       // Refusals of a run handover, answered to the command or driver that asked for it.
       'not_owner', 'unsupported_repo', 'reports_unreachable', 'reports_failed', 'run_not_found', 'run_not_published', 'run_mismatch',
       'state_conflict', 'state_moved', 'definition_mismatch', 'records_pending', 'snapshot_unsupported', 'secret_detected', 'local_path_detected', 'origin_unavailable', 'commit_missing',
@@ -221,6 +221,20 @@ describe('#1083 workflow run records', () => {
       'invalid_arguments', 'invalid_pass', 'not_initialized', 'unsupported_driver', 'invalid_tools',
       // Refusals of teamai workflow start for a run whose pull requests would have no branch to target.
       'no_base_branch',
+      // Refusals of a start from an agent session that the workflow's invoke does not let start it.
+      'invoke_denied',
+      // Refusals of an agent's start of an invoke: ask workflow in an unattended run, where no person can agree.
+      'unattended_denied',
+      // Refusals of a workflow command from inside a workflow attempt, or of a start from a workflow's place.
+      'nested_workflow',
+      // A place the host made that a prepare cannot adopt; the attempt stays leased.
+      'adopt_mismatch',
+      // Refusals of a --driver skill call, answered to the agent with the command it can run instead.
+      'confirm_needed', 'needs_local_driver', 'not_skill_run', 'orchestrator_active', 'choice_pending', 'unknown_choice', 'unknown_offer', 'unknown_attempt', 'not_dispatched',
+      // An error thrown inside a --driver skill call, answered to the agent as one envelope with its message.
+      'skill_call_failed',
+      // Why the skill driver stopped judging a run, told to the agent in a judging-off event.
+      'judge_runner_gone',
       // Refusals of teamai score --run, answered to the member who asked for a pass to be judged.
       'scoring_unavailable', 'pass_not_found', 'scorer_not_found', 'entry_leased',
       // Refusals of teamai score --session, answered to the member who asked for a session to be judged.

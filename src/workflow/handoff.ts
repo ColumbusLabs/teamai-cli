@@ -6,10 +6,12 @@ import { pinScorers } from '../scorers/cache.js';
 import { AgentSession } from '../session-flow/agent-session.js';
 import { archiveSessions, type ArchiveSessionRef } from '../session-flow/archive.js';
 import { usesBranchWorktree, type LocalConfig } from '../types.js';
+import { gitRoot } from '../utils/branch-worktree.js';
 import { canonicalJson } from '../utils/canonical-json.js';
 import { sanitizeGitUrl } from '../utils/redact.js';
 import { fetchReportsOriginFile, updateReports, type ReportsChange } from '../utils/reports-branch.js';
 import { loadWorkflowBundle, loadWorkflowBundleAt, type WorkflowBundle } from './cache.js';
+import { stepLoops } from './loop.js';
 import { pendingRecords, publishPendingRecords, type RecordDelivery } from './records.js';
 import {
   definitionHash, parseSnapshot, projectRun, snapshotBody, snapshotPath, snapshotText,
@@ -17,9 +19,9 @@ import {
 } from './snapshot.js';
 import { takeOver, type UnleasedStep } from './step-state.js';
 import { installOwner, isRunId, readRun, updateRun } from './store.js';
-import type { RunState, WorkflowDefinition } from './types.js';
+import type { RunState, WorkflowDefinition, WorkflowFailure, WorkflowStep } from './types.js';
 import { branchName, stepMode, type LeaseSession, type SessionRef } from './workspace.js';
-import { git } from './worktree.js';
+import { fetchMissingCommits, git, reconcileCopy } from './worktree.js';
 
 /**
  * Hands a run from one teamai install to another through `teamai-reports`. The install that owns a run is the only one
@@ -560,11 +562,135 @@ export async function resumeRun(config: LocalConfig, runId: string, options: { c
   return acquire(config, runId, origin, { transfer: false, checkout: options.checkout });
 }
 
-/** The snapshot of run `runId` origin holds, for a claim or a resume. */
-async function publishedRun(config: LocalConfig, runId: string): Promise<OriginSnapshot> {
+/**
+ * The steps of `run` settled for good, so no person is needed for them again, each listed by its definition's path. A
+ * step is settled for good once it, or a step that holds it, succeeded or was skipped, and no loop that can still run
+ * reaches it again. A step inside the items of a `for_each` step, such as `items.approve`, is listed once every item
+ * settled it that way.
+ */
+export function settledSteps({ steps, definition, workflows = {} }: { steps: ReadonlyArray<{ id: string; status: string; loopFinal?: boolean }>; definition: WorkflowDefinition; workflows?: Record<string, WorkflowDefinition> }): string[] {
+  const byId = new Map(steps.map((step) => [step.id, step]));
+  const forGood = settledForGood({ definition, workflows }, byId);
+  const settled = new Set(steps.filter((step) => forGood(step.id)).map((step) => step.id));
+  const items = (container: string) => steps.filter((step) => step.id.startsWith(`${container}[`) && /^\[\d+\]$/.test(step.id.slice(container.length)));
+  const covered = (at: string, rest: string[]): boolean => {
+    if (settled.has(at)) return true;
+    const [segment, ...after] = rest;
+    if (segment === undefined) return false;
+    const next = at === '' ? segment : `${at}.${segment}`;
+    const instances = items(next);
+    return settled.has(next) || (instances.length > 0 ? instances.every((item) => covered(item.id, after)) : covered(next, after));
+  };
+  const paths = new Set(steps.flatMap((step) => {
+    const segments = step.id.replace(/\[\d+\]/g, '').split('.');
+    return segments.map((_, at) => segments.slice(0, at + 1).join('.'));
+  }));
+  return [...paths].filter((path) => covered('', path.split('.')));
+}
+
+/**
+ * Whether a step instance of the run settled for good: it, or a step that holds it, succeeded or was skipped, and no
+ * loop can run that step again. A step loop can while its owner has not ended it (`loopFinal`) or been skipped, or
+ * while a loop can run that owner again; a workflow loop can while the step that runs the workflow has not settled
+ * for good, and always at the top of the run. A step whose place in the definitions is not found counts as one a loop
+ * can run again.
+ */
+function settledForGood({ definition, workflows }: Definitions, byId: ReadonlyMap<string, { status: string; loopFinal?: boolean }>) {
+  const workflowOf = (step: WorkflowStep) => (typeof step.workflow === 'object' ? step.workflow : step.workflow === undefined ? undefined : workflows[step.workflow]);
+  const prefixes = (id: string) => id.split('.').map((_, at, segments) => segments.slice(0, at + 1).join('.'));
+  /** Each workflow on the way to instance `id`: its definition, the instance that runs it ('' at the top), and the step of it `id` is in. */
+  const levels = (id: string) => {
+    const found: Array<{ scope: Pick<WorkflowDefinition, 'steps' | 'loop'>; at: string; step: string }> = [];
+    let scope: Pick<WorkflowDefinition, 'steps' | 'loop'> | undefined = definition;
+    for (const prefix of prefixes(id)) {
+      if (scope === undefined) return undefined;
+      const segment = prefix.slice(prefix.lastIndexOf('.') + 1);
+      const name = segment.replace(/\[\d+\]$/, '');
+      found.push({ scope, at: prefix.slice(0, Math.max(prefix.lastIndexOf('.'), 0)), step: name });
+      const step: WorkflowStep | undefined = scope.steps.find((candidate) => candidate.id === name);
+      scope = step === undefined || (step.forEach !== undefined && name === segment) ? undefined : workflowOf(step);
+    }
+    return found;
+  };
+  const reopens = (id: string, skip: ReadonlySet<string>): boolean => {
+    const found = levels(id);
+    if (found === undefined) return true;
+    return found.some(({ scope, at, step }) => {
+      if (scope.loop !== undefined && (at === '' || !done(at, skip))) return true;
+      return [...stepLoops(scope.steps).ranges].some(([owner, range]) => {
+        const instance = at === '' ? owner : `${at}.${owner}`;
+        if (!range.has(step) || skip.has(instance)) return false;
+        const state = byId.get(instance);
+        const ended = state?.status === 'skipped' || (state?.status === 'succeeded' && state.loopFinal === true);
+        return !ended || reopens(instance, new Set([...skip, instance]));
+      });
+    });
+  };
+  const done = (id: string, skip: ReadonlySet<string> = new Set()): boolean => prefixes(id).some((prefix) => {
+    const status = byId.get(prefix)?.status;
+    return (status === 'succeeded' || status === 'skipped') && !reopens(prefix, skip);
+  });
+  return (id: string): boolean => done(id);
+}
+
+/** What a run carries: its definitions, and the steps it settled for good. */
+export interface CarriedRun extends Definitions {
+  settled: string[];
+}
+
+/**
+ * What run `runId` carries, before `resumeRun` changes anything: this machine's copy of the run, else, when
+ * `published`, the run teamai-reports holds, as a claim would install it. With `claim`, the published run comes first,
+ * since a claim installs it over this machine's copy. Undefined when neither holds the run, which the resume then answers.
+ */
+export async function carriedRun(config: LocalConfig, runId: string, { published, claim = false }: { published: boolean; claim?: boolean }): Promise<Result<CarriedRun | undefined>> {
+  const stored = await readRun(config, runId);
+  if (stored === 'corrupt') return refused(runUnreadable(runId));
+  const local = stored === 'missing' ? undefined : { definition: stored.definition, workflows: stored.workflows ?? {}, settled: settledSteps(stored) };
+  if (local && !claim) return ok(local);
+  if (!published) return ok(local);
+  // Read from the team repository rather than the reports checkout, which a refused resume would otherwise leave synced.
+  const origin = await publishedRun(config, runId, { checkout: false });
+  if (!origin.ok || origin.value === 'absent') return origin.ok || local ? ok(local) : origin;
+  const definitions = await definitionsOf(config, origin.value);
+  return definitions.ok ? ok({ ...definitions.value, settled: settledSteps({ ...definitions.value, steps: origin.value.steps }) }) : definitions;
+}
+
+/**
+ * Once after this machine took run `runId` over, before its first lease: brings the local branch of each copy the run
+ * recorded a commit for to that commit, fetched the way a lease fetches what it lacks. A settled run waits for a retry
+ * to reopen it, since it leases nothing before that.
+ */
+export async function reconcileTakenCopies(config: LocalConfig, runId: string, active: string): Promise<WorkflowFailure | undefined> {
+  const run = await readRun(config, runId);
+  if (typeof run !== 'object' || !run.publication?.reconcileCopies || run.status !== 'running') return undefined;
+  const recorded = Object.entries(run.copies ?? {}).flatMap(([branch, copy]) => (copy.commit === undefined ? [] : [{ branch, commit: copy.commit }]));
+  const fetched = await fetchMissingCommits(active, { run: runId, commits: recorded.map((copy) => copy.commit) });
+  if (fetched.missing.length > 0) {
+    const named = recorded.filter((copy) => fetched.missing.includes(copy.commit)).map((copy) => `commit ${copy.commit} from branch ${copy.branch}`);
+    const said = fetched.fetchError ? ` Git said: ${fetched.fetchError}.` : '';
+    return { code: 'workspace_base', message: `Run ${runId} records ${named.join(', ')}, which this checkout does not have, even after fetching the run's branches from origin.${said} Push each branch to origin from the machine that has its commit, then resume the run.` };
+  }
+  for (const { branch, commit } of recorded) {
+    const refused = await reconcileCopy(active, branch, commit);
+    if (refused) return { code: 'branch_diverged', message: refused.error };
+  }
+  await updateRun(config, runId, await knownSecrets(config), async (local) => {
+    if (local === 'missing' || !local.publication?.reconcileCopies) return { value: undefined };
+    const { reconcileCopies: _done, ...publication } = local.publication;
+    return { value: undefined, write: { ...local, publication } };
+  });
+  return undefined;
+}
+
+/**
+ * The snapshot of run `runId` origin holds, for a claim or a resume, read through the reports checkout, or with
+ * `checkout: false` from the team repository, which leaves that checkout as it is.
+ */
+async function publishedRun(config: LocalConfig, runId: string, { checkout = true }: { checkout?: boolean } = {}): Promise<OriginSnapshot> {
   if (!isRunId(runId)) return refused(INVALID_RUN);
   if (!usesBranchWorktree(config)) return refused(UNSUPPORTED_REPO);
-  return readPublished(config, runId);
+  return checkout ? readPublished(config, runId) : readOrigin(gitRoot(config), runId);
 }
 
 async function acquire(

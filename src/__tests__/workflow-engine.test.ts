@@ -8,9 +8,10 @@ import { acquireLock, releaseLock } from '../update.js';
 import { log } from '../utils/logger.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, parseNextPayload, parseReport, reportAttempt, resumableSessions, SETTLED_ATTEMPTS_LIMIT, startRun, type ReportInput } from '../workflow/engine.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
 import { getCurrentVersion } from '../package-info.js';
 import { outputMismatch } from '../workflow/output.js';
+import { CAN_KEYS } from '../workflow/requirements.js';
 import { pendingRecords, type WorkflowRunRecord } from '../workflow/records.js';
 import { cancelRun, retryStep } from '../workflow/run-controls.js';
 import { getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
@@ -152,6 +153,15 @@ describe('workflow engine', () => {
     const nextKnown = parseNextPayload({ driver: driverA, running: ['a00000000'], canTakeLease: true });
     if (typeof nextKnown === 'string') throw new Error(nextKnown);
     expect(nextKnown.ignored).toEqual([]);
+  });
+
+  it('says what a driver.can key takes when a next payload gives it a value it does not', () => {
+    for (const key of CAN_KEYS) {
+      const answer = parseNextPayload({ driver: { ...driverA, can: { [key]: 42 } } });
+      expect(answer, key).toEqual(expect.stringMatching(new RegExp(`^driver\\.can\\.${key}: `)));
+      // Zod answers a union without its own message with only this, which names no value the key takes.
+      expect(answer, key).not.toMatch(/: Invalid input$/);
+    }
   });
 
   it('leases steps in order and stores the outcome', async () => {
@@ -2687,6 +2697,28 @@ describe('held-back steps', () => {
     });
     const taken = await leaseNext(config, runId, driverB, { can: { workspace: [...allModes], env: true }, base });
     expect(taken).toMatchObject({ data: { lease: { step: 'a', workspace: { branch: expect.stringMatching(/a/) } } } });
+  });
+
+  it('holds a requires.env prompt step and leases a requires.env command step for can.env commands', async () => {
+    vi.stubEnv('DEPLOY_TOKEN', 'deploy-value');
+    const { config, runId } = await startBuild(graph(`  - id: notify
+    requires: { env: [DEPLOY_TOKEN] }
+    prompt: Tell the channel
+  - id: publish
+    needs: []
+    requires: { env: [DEPLOY_TOKEN] }
+    command: node publish.js
+`));
+    const can = { workspace: ['read-only' as const], env: 'commands' as const };
+
+    const publish = await leaseNext(config, runId, driverA, { can });
+
+    expect(publish).toMatchObject({ data: { lease: { step: 'publish', envScope: { provide: ['DEPLOY_TOKEN'], withhold: [] } } } });
+    expect(publish).not.toHaveProperty('data.lease.unenforced.0');
+    const reason = 'step "notify" needs env, which this driver does not declare';
+    expect(await leaseNext(config, runId, driverA, { can, running: [leaseIn(publish).attempt] })).toEqual({ data: {
+      wait: { reason, held: [{ step: 'notify', reason, missing: ['env'] }] }, cancelled: [],
+    } });
   });
 
   it('asks for setup on every lease with a workspace in a workflow that declares it, also one that continues a copy another lease opened', async () => {

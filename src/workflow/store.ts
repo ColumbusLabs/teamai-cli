@@ -24,6 +24,12 @@ export function isRunId(runId: string): boolean {
   return RUN_ID.test(runId);
 }
 
+export const RunIdSchema = z.string().regex(RUN_ID, 'Run id must look like r followed by 8 or 16 hex digits').brand<'RunId'>();
+export type RunId = z.infer<typeof RunIdSchema>;
+/** The attempt id the engine gives a lease: `a` + 8 hex digits. */
+export const AttemptIdSchema = z.string().regex(/^a[0-9a-f]{8}$/, 'Attempt id must look like a followed by 8 hex digits').brand<'AttemptId'>();
+export type AttemptId = z.infer<typeof AttemptIdSchema>;
+
 /** A fresh run id: 16 hex digits (see RUN_ID for why not 8). */
 export function generateRunId(): string {
   return `r${randomBytes(8).toString('hex')}`;
@@ -49,6 +55,105 @@ export function deliveryLockPath(config: LocalConfig, runId: string): string {
 
 export function driverLockPath(config: LocalConfig, runId: string): string {
   return path.join(runsDir(config), runId, 'driver.lock');
+}
+
+/** `runs/<run>/attempts/`: a directory for each attempt of the run. */
+export function attemptsDir(config: LocalConfig, run: RunId): string {
+  return path.join(runsDir(config), run, 'attempts');
+}
+
+/** `runs/<run>/attempts/<attempt>/`: what a driver keeps for one attempt. */
+export function attemptDir(config: LocalConfig, run: RunId, attempt: AttemptId): string {
+  return path.join(attemptsDir(config, run), attempt);
+}
+
+/** `runs/<run>/skill.json`: the skill driver's state of a run. */
+export function skillStatePath(config: LocalConfig, run: RunId): string {
+  return path.join(runsDir(config), run, 'skill.json');
+}
+
+/** `attempts/<attempt>/place.json`: where an attempt runs, from its prepare to its finish. */
+export function placeRecordPath(config: LocalConfig, run: RunId, attempt: AttemptId): string {
+  return path.join(attemptDir(config, run, attempt), 'place.json');
+}
+
+/** `attempts/<a>/result.json`: what a prompt step's tool or child agent, or a command step's driver, wrote the step produced. */
+export function attemptResultPath(config: LocalConfig, run: RunId, attempt: AttemptId): string {
+  return path.join(attemptDir(config, run, attempt), 'result.json');
+}
+
+function parsedJson(text: string | null): unknown {
+  try {
+    return text === null ? undefined : JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+const RunLockSchema = z.object({ run: RunIdSchema }).brand<'RunLock'>();
+/** Proof that the caller holds this machine's driver lock of `run`. Only `takeRunLock` makes one. */
+export type RunLock = z.infer<typeof RunLockSchema>;
+
+const LockOwnerSchema = z.object({ pid: z.number().int() });
+
+/** What `takeRunLock` did: ran its body, which answered `value`, or found the lock `busy` and ran nothing. */
+export type LockTaken<T> = { kind: 'held'; value: T } | { kind: 'busy'; error: { code: 'driver_running'; message: string } };
+
+/**
+ * Runs `body` holding `runs/<run>/driver.lock`, the one lock every driver of `run` on this machine takes, or answers
+ * `busy` when another live process still holds it after `waitMs`. `waitMs: 0` tries once.
+ */
+export async function takeRunLock<T>(config: LocalConfig, run: RunId, body: (lock: RunLock) => Promise<T>, { waitMs }: { waitMs: number }): Promise<LockTaken<T>> {
+  const lock = driverLockPath(config, run);
+  const until = Date.now() + waitMs;
+  while (!await acquireLock(lock)) {
+    if (Date.now() >= until) {
+      const owner = LockOwnerSchema.safeParse(parsedJson(await readFileSafe(lock)));
+      return { kind: 'busy', error: { code: 'driver_running', message: owner.success
+        ? `Run ${run} is already driven by process ${owner.data.pid} on this machine. Stop that driver, or wait for it.`
+        : `Run ${run} has a local driver lock whose process id is unknown. Stop that driver, or inspect its driver.lock file.` } };
+    }
+    await delay(LOCK_WAIT_MS);
+  }
+  try {
+    return { kind: 'held', value: await body(RunLockSchema.parse({ run })) };
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
+/** `takeRunLock` for a caller whose body answers an envelope: a busy lock answers as the `driver_running` error. */
+export async function withRunLock<T>(
+  config: LocalConfig,
+  run: RunId,
+  body: (lock: RunLock) => Promise<T>,
+  options: { waitMs: number },
+): Promise<T | { error: { code: 'driver_running'; message: string } }> {
+  const taken = await takeRunLock(config, run, body, options);
+  return taken.kind === 'held' ? taken.value : { error: taken.error };
+}
+
+function runnerLockPath(config: LocalConfig, run: RunId, attempt: AttemptId): string {
+  return path.join(attemptDir(config, run, attempt), 'runner.lock');
+}
+
+/**
+ * Runs `body` holding `attempts/<attempt>/runner.lock`, which the skill driver's runner of the attempt holds for its
+ * whole life, or answers `held` when a live process holds it.
+ */
+export async function withRunnerLock<T>(config: LocalConfig, run: RunId, attempt: AttemptId, body: () => Promise<T>): Promise<T | 'held'> {
+  const lock = runnerLockPath(config, run, attempt);
+  if (!await acquireLock(lock)) return 'held';
+  try {
+    return await body();
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
+/** Whether a live process holds the runner lock of `attempt`. */
+export async function runnerAlive(config: LocalConfig, run: RunId, attempt: AttemptId): Promise<boolean> {
+  return !await acquireLock(runnerLockPath(config, run, attempt), { dryRun: true });
 }
 
 function isDefinition(value: unknown): value is WorkflowDefinition {
