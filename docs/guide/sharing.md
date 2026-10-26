@@ -73,6 +73,8 @@ teamai remove agents code-reviewer
 
 `pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest.
 
+In single-repo mode, your root copy of an agent placed in a namespace is pushed to the placed file. Changing it from `.md` to `.yaml` retires the original file, even while your checkout is behind its own merged PR. Either way, TeamAI compares the placed file with the blob your last merged push delivered there. If the team edited it since, the push stops and prints a `teamai push --carried <path>@<blob>` command. Carry that edit into your root copy, then run it. The option accepts only that version, so a plain retry or a later team edit stops the push again. An agent deleted by the team is not re-added from your root copy. An older placement record without a blob catches a team edit only while your checkout is behind it, until your first edit through it merges and records its blob.
+
 ### Model aliases
 
 A name such as `model: strong` is mapped per tool in `models/aliases.yaml`:
@@ -302,3 +304,5 @@ projects:
 ```
 
 In self mode, pushing an edited skill from a checkout behind the default branch stops with exit 2 if it would overwrite an upstream file. The check covers the whole skill directory, including references and deletions, even when your edit is in another file. Merge the default branch, reconcile the skill, and retry; a copy that already contains the upstream changes can be pushed.
+
+If the team recreates a retired agent at its old namespace, edit that namespace source directly; the old flattened copy remains a backup. Deleting the retired root copy does not make its remaining tool copies new agents. Editing or converting a placed agent also checks the last delivered blob after the checkout has caught up with the default branch.

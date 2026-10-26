@@ -465,3 +465,9 @@ When a file occupies a tool skills directory, doctor fails the directory check e
 ## Kiro default-agent synchronization
 
 Kiro CLI V3 uses the generated user hook `~/.kiro/hooks/teamai.json`, independently of custom agents. Missing or edited hooks appear in doctor; reinject after moving aside a same-named personal file. User uninstall removes the managed file, project uninstall keeps it, and personal hook files remain. Upgrade Kiro 2.x to V3 for this lifecycle integration.
+
+## Placed agent edits and format changes behind the default branch
+
+An edit of the root copy overwrites the agent this machine placed, and a `.md`/`.yaml` conversion may retire it after its merge is proven. If the team changed the placed file since this machine's last merged push, the push stops and prints a `teamai push --carried <path>@<blob>` command: update the checkout, carry its changes into the root copy, then run it. The option accepts only that version, so a plain retry or a later team change stops again. If the team deleted it, the remaining root copy is not a new agent to publish. Older records without a delivered blob catch a team change only while the checkout is behind it, until the first edit pushed through them merges and records its blob. Until then, compare with the team file before editing or converting.
+
+A recreated namespace source can be edited directly; the retired flattened copy is kept as a backup. Retired tool copies do not become new agents when the root copy is removed. The retirement warning names the former source so the member can restore it before pushing edits.
