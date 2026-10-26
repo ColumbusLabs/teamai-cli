@@ -1,5 +1,5 @@
-import { afterEach, describe, it, expect, vi } from 'vitest';
-import { parseMrUrl, formatComment, postOrUpdateMrComment } from '../ci/mr-comment.js';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { parseMrUrl, formatComment, postOrUpdateMrComment, postCodebaseGraphComment } from '../ci/mr-comment.js';
 import type { LearningDraft, CodebaseSuggestion } from '../types.js';
 
 describe('parseMrUrl', () => {
@@ -18,8 +18,18 @@ describe('parseMrUrl', () => {
     expect(result).toEqual({ provider: 'tgit', owner: 'group/sub', repo: 'project', number: '123' });
   });
 
+  it('解析 GitLab MR URL（自建实例 + 多级 group）', () => {
+    const result = parseMrUrl('https://git.guazi-corp.com/znkf/order-service/-/merge_requests/88');
+    expect(result).toEqual({ provider: 'gitlab', owner: 'znkf', repo: 'order-service', number: '88' });
+  });
+
+  it('解析 GitLab MR URL（嵌套 subgroup）', () => {
+    const result = parseMrUrl('https://gitlab.com/group/sub/proj/-/merge_requests/5');
+    expect(result).toEqual({ provider: 'gitlab', owner: 'group/sub', repo: 'proj', number: '5' });
+  });
+
   it('不支持的 URL 抛出错误', () => {
-    expect(() => parseMrUrl('https://gitlab.com/org/repo/-/merge_requests/1')).toThrow('无法解析 MR URL');
+    expect(() => parseMrUrl('https://example.com/org/repo/pull/1')).toThrow('仅支持 GitHub、TGit 和 GitLab');
   });
 });
 
@@ -64,6 +74,10 @@ describe('formatComment', () => {
 });
 
 describe('postOrUpdateMrComment API failures', () => {
+  beforeEach(() => {
+    // Pin the instance host so the developer's local GITLAB_URL never leaks in.
+    vi.stubEnv('GITLAB_URL', 'https://gitlab.com');
+  });
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
@@ -94,6 +108,148 @@ describe('postOrUpdateMrComment API failures', () => {
     )).rejects.toThrow('TGit note list request failed (503)');
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it('fails without creating a duplicate GitLab note when listing notes fails', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(postOrUpdateMrComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7', undefined, undefined,
+    )).rejects.toThrow('GitLab note list request failed (503)');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1]?.method).toBe('GET');
+  });
+
+  it('never follows redirects when calling the GitLab notes API (token must not leak)', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(null, { status: 302, headers: { location: 'https://evil.example/x' } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(postOrUpdateMrComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7', undefined, undefined,
+    )).rejects.toThrow(/redirect/i);
+
+    // Every request must opt out of redirect following.
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init?.redirect).toBe('manual');
+    }
+  });
+
+  it('finds a marker note on a later page and updates it in place', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const marker = '<!-- teamai:ci-extract -->';
+    const page1 = JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 200 + i, body: `chat ${i}` })));
+    const page2 = JSON.stringify([{ id: 9, body: `${marker}\nlearning body` }]);
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url.includes('&page=1')) {
+        return new Response(page1, { status: 200, headers: { 'x-next-page': '2' } });
+      }
+      if (url.includes('&page=2')) return new Response(page2, { status: 200 });
+      if (url.includes('/notes/9')) {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await postOrUpdateMrComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7',
+      { learning: { title: 'T', content: 'C' } } as never,
+      undefined,
+    );
+
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT');
+    expect(put?.[0]).toContain('/notes/9');
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it('ignores a human note that only quotes the marker', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const marker = '<!-- teamai:ci-extract -->';
+    const notes = JSON.stringify([
+      { id: 5, body: `I think ${marker} is wrong` },
+    ]);
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url.includes('/notes?')) return new Response(notes, { status: 200 });
+      if (url.includes('/notes/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (url.endsWith('/notes')) return new Response(JSON.stringify({ id: 42 }), { status: 201 });
+      throw new Error(`unexpected ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await postOrUpdateMrComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7',
+      { learning: { title: 'T', content: 'C' } } as never,
+      undefined,
+    );
+
+    // The quoted mention must not be treated as our own comment: post a new one.
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(true);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  });
+
+  it('refuses a GitLab MR URL whose host is not the configured instance', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(postOrUpdateMrComment(
+      'https://evil.example/acme/app/-/merge_requests/7', undefined, undefined,
+    )).rejects.toThrow('Refusing to fetch GitLab MR');
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('posts a new GitLab codebase-graph comment when none exists', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.includes('/notes?')) return new Response('[]', { status: 200 });
+      if (url.endsWith('/notes') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ id: 42 }), { status: 201 });
+      }
+      throw new Error(`unexpected ${url} ${init?.method}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await postCodebaseGraphComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7',
+      { added: ['a.ts'], removed: [] },
+    );
+
+    const post = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST');
+    expect(post).toBeDefined();
+    expect(String(post?.[1]?.body)).toContain('teamai:ci-extract:codebase-graph');
+  });
+
+  it('updates an existing GitLab codebase-graph comment whose marker is on the LAST line', async () => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    const marker = '<!-- teamai:ci-extract:codebase-graph -->';
+    // The graph formatter puts the marker at the END of the body, not the start.
+    const existing = JSON.stringify([
+      { id: 9, body: `## 📊 Codebase 知识图谱变更\n\nold\n---\n> 👎 ...\n${marker}` },
+    ]);
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.includes('/notes?')) return new Response(existing, { status: 200 });
+      if (url.includes('/notes/9') && init?.method === 'PUT') {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      throw new Error(`unexpected ${url} ${init?.method}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await postCodebaseGraphComment(
+      'https://gitlab.com/acme/app/-/merge_requests/7',
+      { added: ['a.ts'], removed: [] },
+    );
+
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT');
+    expect(put?.[0]).toContain('/notes/9');
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
   });
 });
