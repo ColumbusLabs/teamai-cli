@@ -6,11 +6,12 @@ import { readUsageEvents, truncateUsageAfterReport } from './usage-tracker.js';
 import { aggregateUsage } from './stats.js';
 import { collectTeamRepoSkills } from './agent-skills.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import { readEvents, aggregateSessionMetrics, dataHomeKey } from './dashboard-collector.js';
+import { readEvents, aggregateSessionMetrics, dataHomeKey, memberEvents, sessionRuns } from './dashboard-collector.js';
+import { RUN_MODES, type RunMode, type SessionRun } from './launch-context.js';
 import { writeFile, readFileSafe, ensureDir, pathExists, readJson, writeJson } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type {
-  UserStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2,
+  UserStats, UserModeStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2,
 } from './types.js';
 import { getVotesDir, getDataHome, getReportsDir, emptyTokenUsage, addTokenUsage, usesBranchWorktree } from './types.js';
 import { filterEventsByScope, runsOfLog } from './dashboard-scope.js';
@@ -913,6 +914,46 @@ export function adoptBareKeys<T>(
   return adopted;
 }
 
+/** What one report adds to a member's counters, in total or in one run mode. */
+type UsageDelta = {
+  interventions: UserInterventionStats;
+  promptTokens: PromptTokenDelta;
+  daily: ReturnType<typeof computeDailyStatsDelta>['delta'];
+};
+
+/**
+ * The deltas of the sessions whose run mode is `mode`, against the same per-session baselines the top-level counters
+ * use: a session's change counts in the mode its latest event recorded, so no turn is reported twice, and a session
+ * with no recorded mode adds to neither.
+ */
+function modeDelta(
+  mode: RunMode,
+  runs: Map<string, SessionRun>,
+  current: { interventions: Map<string, ReportedInterventions[string]>; metrics: Map<string, SessionMetrics>; daily: Map<string, DailySessionSnapshot> },
+  reported: { interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions },
+  dropped: Map<string, DroppedRollout[]>,
+): UsageDelta {
+  const inMode = <T>(sessions: Map<string, T>) => new Map([...sessions].filter(([sid]) => runs.get(sid)?.runMode === mode));
+  return {
+    interventions: computeInterventionDelta(inMode(current.interventions), reported.interventions).delta,
+    promptTokens: computePromptTokenDelta(inMode(current.metrics), reported.promptTokens, dropped).delta,
+    daily: computeDailyStatsDelta(inMode(current.daily), reported.daily).delta,
+  };
+}
+
+/** The counters `delta` changes, each as `existing` holds it with `delta` added. A counter it leaves alone is absent. */
+function changedCounters(existing: UserModeStats | undefined, delta: UsageDelta): UserModeStats {
+  const changed: UserModeStats = {};
+  if (hasInterventionDelta(delta.interventions)) changed.interventions = mergeInterventionStats(existing?.interventions, delta.interventions);
+  if (hasPromptTokenDelta(delta.promptTokens)) {
+    const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, delta.promptTokens);
+    changed.prompts = pt.prompts;
+    changed.tokens = pt.tokens;
+  }
+  if (hasDailyDelta(delta.daily)) changed.daily = mergeDailyStats(existing?.daily, delta.daily);
+  return changed;
+}
+
 /**
  * Auto-report usage data to team repo during pull.
  * Merges new events with existing stats to preserve historical data.
@@ -946,8 +987,8 @@ export async function reportUsageToTeam(
 
     // Fold the local dashboard event log into per-session metrics once, then derive
     // both the intervention delta and the prompt-count/token delta from it.
-    // Only the sessions recorded in this scope (#785).
-    const dashboardEvents = await filterEventsByScope(await readEvents(), reportsConfig);
+    // Only the member's own sessions recorded in this scope (#785).
+    const dashboardEvents = memberEvents(await filterEventsByScope(await readEvents(), reportsConfig));
     const metrics = aggregateSessionMetrics(dashboardEvents);
 
     const currentInterventions = interventionCounts(metrics);
@@ -973,6 +1014,11 @@ export async function reportUsageToTeam(
       effective.daily,
       reportedDailySessions,
     );
+    const runs = sessionRuns(dashboardEvents);
+    const modeDeltas = RUN_MODES.map((mode) => [mode, modeDelta(
+      mode, runs, { interventions: effective.interventions, metrics, daily: effective.daily },
+      { interventions: reportedInterventions, promptTokens: reportedPromptTokens, daily: reportedDailySessions }, dropped,
+    )] as const);
     // This scope's sessions, and those of its snapshots no owner claims yet
     // (a project whose data home is in its workspace, which the seed may miss).
     await recordSessionOwners([
@@ -1021,16 +1067,10 @@ export async function reportUsageToTeam(
         // default-branch repo path, never from writeRoot (the reports branch
         // is an orphan without skills/).
         const merged = mergeStatsWithinTeamSkills(existing, username, newStats, teamSkillNames);
-        if (hasInterventions) {
-          merged.interventions = mergeInterventionStats(existing?.interventions, interventionDelta);
-        }
-        if (hasPromptTokens) {
-          const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, promptTokenDelta);
-          merged.prompts = pt.prompts;
-          merged.tokens = pt.tokens;
-        }
-        if (hasDaily) {
-          merged.daily = mergeDailyStats(existing?.daily, dailyDelta);
+        Object.assign(merged, changedCounters(existing ?? undefined, { interventions: interventionDelta, promptTokens: promptTokenDelta, daily: dailyDelta }));
+        for (const [mode, delta] of modeDeltas) {
+          const counters = { ...existing?.[mode], ...changedCounters(existing?.[mode], delta) };
+          if (Object.keys(counters).length > 0) merged[mode] = counters;
         }
 
         await writeFile(statsPath, YAML.stringify(merged));

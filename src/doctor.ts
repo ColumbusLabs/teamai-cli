@@ -2,6 +2,7 @@ import { hookSettingsPath, hookToolPathsForConfig } from './types.js';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
+import { explainRunMode, type ExplainedRunMode } from './launch-context.js';
 import { readWorkspaceChildren } from './workspace-children.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
 import { getUserHome } from './utils/home.js';
@@ -153,6 +154,8 @@ export interface DoctorReport {
   ok: boolean;
   /** null before initialization, when there is no config to scope. */
   scope: string | null;
+  /** The run mode this process resolves, and its source. */
+  runMode: ExplainedRunMode;
   checks: CheckResult[];
   /** Present only when the team repo declares packages. Human text, not checks. */
   packages?: { ok: boolean; lines: string[] };
@@ -887,6 +890,14 @@ export function formatCheckResult({ name, ok, fix }: CheckResult): string[] {
   return fix ? [`  ✖ ${name}`, `    → ${fix}`] : [`  ✖ ${name}`];
 }
 
+/** The run mode row: the mode and its source, with a warning when TEAMAI_MODE held a value it ignored. */
+function formatRunMode(runMode: ExplainedRunMode): string {
+  const { mode, source } = runMode;
+  return 'ignored' in runMode && runMode.ignored !== undefined
+    ? `  ⚠ Run mode: ${mode} (${source}). TEAMAI_MODE="${runMode.ignored}" is not attended or unattended, so it is ignored.`
+    : `  ✔ Run mode: ${mode} (${source})`;
+}
+
 function renderResult(result: CheckResult): void {
   for (const line of formatCheckResult(result)) console.log(line);
 }
@@ -898,6 +909,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   if (jsonMode) setStderrOnly(true);
 
   log.info('Running diagnostics...\n');
+  // Information, not a check: an unknown TEAMAI_MODE fails nothing.
+  const runMode = explainRunMode(process.env);
   const ctx = await resolveDoctorContext();
   if (!ctx) {
     const notInitialized: CheckResult = {
@@ -906,9 +919,10 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
       fix: 'Run `teamai init <repo-url>` in a project, or add `--scope user` for all projects',
     };
     if (jsonMode) {
-      emitReport({ ok: false, scope: null, checks: [notInitialized] });
+      emitReport({ ok: false, scope: null, runMode, checks: [notInitialized] });
     } else {
       console.log('  Scope: not initialized\n');
+      console.log(formatRunMode(runMode));
       renderResult(notInitialized);
       console.log('');
     }
@@ -921,6 +935,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   if (!jsonMode) {
     const scopeLabel = `${installScopeName(scope)}${scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`;
     console.log(`  Scope: ${scopeLabel}\n`);
+    console.log(formatRunMode(runMode));
   }
 
   // --fix runs before the checks, so the report reflects the post-cleanup state.
@@ -984,6 +999,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     emitReport({
       ok: allPassed,
       scope,
+      runMode,
       checks: results,
       // pkgDoctorReport renders its own lines; they are human text, not checks.
       ...(packageReport ? { packages: { ok: packageReport.allPassed, lines: packageReport.lines } } : {}),
