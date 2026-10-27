@@ -118,7 +118,7 @@ import {
 } from './git-exclude-notices.js';
 import { blockingEntries, contentHash, deliveredSkillFiles, describeMembersDirLeft, isLink, keepsTrackedCopy, ownsSkillDir } from './resources/delivered-copies.js';
 import { skillOrigin, withSkillFrontmatter } from './resources/skills.js';
-import { installOf, locate, ownOf, writable, type FilePlace } from './locate.js';
+import { hookSettingsFile, installOf, locate, ownOf, writable, type FilePlace } from './locate.js';
 import { acquireLock, releaseLock } from './update.js';
 
 const execFileAsync = promisify(execFile);
@@ -559,9 +559,10 @@ async function claudeUserRoot(): Promise<string> {
 
 /**
  * The settings files an agent hook for `tool` can sit in, absolute: first the
- * user-scope file `teamai pull` writes and the tool reads, then the
- * project-scope path that versions before #1220 wrote under $HOME, when it
- * differs. Installs write the first; removals clear them all.
+ * user-scope file `teamai pull` writes and the tool reads, in its home a
+ * recorded or env move relocates, then the project-scope path that versions
+ * before #1220 wrote under $HOME, and the default home's file, when they
+ * differ. Installs write the first; removals clear them all.
  */
 async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: string): Promise<string[]> {
   // Hook cleanup also runs after the source configuration has been cleared.
@@ -572,7 +573,8 @@ async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: str
     throw new Error(`unsupported tool: ${tool} (no settings path)`);
   }
   const legacy = applyToolRoots(teamConfig.toolPaths, toolRoots)[tool]?.settings;
-  return [...new Set([settings, legacy ?? settings])].map((rel) => path.join(getUserHome(), rel));
+  const home = getUserHome();
+  return [...new Set([hookSettingsFile(tool, home, settings), ...[settings, legacy ?? settings].map((rel) => path.join(home, rel))])];
 }
 
 async function memberCodexTrust(): Promise<CodexTrustPolicy> {
@@ -3717,9 +3719,6 @@ async function runHookRuleCommand(
   if (!tool) {
     throw new Error('install_hook_rule: missing current tool in context');
   }
-  if (!isAgentHookSupportedTool(tool)) {
-    throw new Error(`unsupported tool: ${tool}`);
-  }
   const slug = command.slug;
   if (!slug) {
     throw new Error(`${command.type}: missing slug`);
@@ -3750,7 +3749,10 @@ async function runHookRuleCommand(
     return undefined;
   }
 
-  // install_hook_rule
+  // install_hook_rule. Removal above acts on the tool the hook was installed for, whatever runs now.
+  if (!isAgentHookSupportedTool(tool)) {
+    throw new Error(`unsupported tool: ${tool}`);
+  }
   const event = command.event;
   const cmd = command.cmd;
   if (!event || !cmd) {
@@ -3799,7 +3801,7 @@ async function runHookRuleCommand(
     const { applyOpenClawAgentHook } = await import('./openclaw-hooks.js');
     await applyOpenClawAgentHook({ slug, event, command: cmd, tool, matcher, timeout });
   } else if (tool === 'opencode') {
-    // OpenCode loads plugins from ~/.config/opencode/plugin (user scope).
+    // OpenCode loads user plugins from the plugin directory of its config home.
     const { applyOpencodeAgentHook } = await import('./opencode-hooks.js');
     await applyOpencodeAgentHook({ slug, event, command: cmd, baseDir: getUserHome(), scope: 'user', matcher });
   } else if (tool === 'pi') {

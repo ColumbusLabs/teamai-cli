@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { channelReadiness } from '../instruction-targets.js';
-import { buildPiExtensionSource, resolvePiExtensionsDir, PI_HOOK_FILE } from '../pi-hooks.js';
+import { buildPiExtensionSource, PI_HOOK_FILE } from '../pi-hooks.js';
+import { hookAdapterDir } from '../locate.js';
 import { buildPluginSource, opencodeContextPlugin, resolveOpencodePluginDir, OPENCODE_HOOK_FILE } from '../opencode-hooks.js';
 
 let home: string;
@@ -17,7 +18,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); fs.rmSync(home, { recursive: true, force: true }); });
 it('accepts a Pi extension installed by another live CLI entry, but not a missing entry or altered handler', async () => {
-  const file = path.join(resolvePiExtensionsDir(), PI_HOOK_FILE);
+  const file = path.join(hookAdapterDir('pi-extension'), PI_HOOK_FILE);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const source = buildPiExtensionSource(entry);
   fs.writeFileSync(file, source);

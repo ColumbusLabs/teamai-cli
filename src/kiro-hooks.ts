@@ -2,10 +2,11 @@ import path from 'node:path';
 import { getDispatchCommand } from './builtin-hooks.js';
 import { listDirs, listFiles, pathExists, readFileSafe, readJsonObject, remove, writeFile } from './utils/fs.js';
 import { getUserHome } from './utils/home.js';
+import { hookAdapterDir } from './locate.js';
 
 /** Kiro CLI V3 loads user hook files independently of the selected agent. */
 export function kiroHookFile(): string {
-  return path.join(getUserHome(), '.kiro', 'hooks', 'teamai.json');
+  return path.join(hookAdapterDir('kiro-hooks'), 'teamai.json');
 }
 
 export function buildKiroHooks(): string {

@@ -341,7 +341,7 @@ where 5.7 reads hooks, so it writes none, and `teamai doctor` names them under
 
 ### Muse Code
 
-Hooks go in the `hooks` block of `~/.config/muse/settings.json`, which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
+Hooks go in the `hooks` block of `~/.config/muse/settings.json` (`$XDG_CONFIG_HOME/muse/settings.json` when that is set), which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
 
 ### Tools without a writable hook surface
 

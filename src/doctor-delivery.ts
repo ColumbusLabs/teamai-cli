@@ -26,9 +26,8 @@ import { getUserHome } from './utils/home.js';
 import { loadStateForScope } from './config.js';
 import { installOf, locate, ownOf, unreadWrites, writable, writesOf, type DirPlace, type FilesChannel, type Location, type Unread } from './locate.js';
 import { codexProjectTrust, codexTrustFix } from './codex-project-trust.js';
-import { amongPlaces, placesRecordOf, samePlace, samePlaces } from './resources/places.js';
-import { defaultToolHome, realHost, toolHome } from './tool-home.js';
-import { isToolId, settingsAtDefault } from './tools.js';
+import { amongPlaces, placesRecordOf, samePlaces } from './resources/places.js';
+import { realHost } from './tool-home.js';
 import { getsRulesFromExtension, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { declaredSecretKeys } from './resources/secrets.js';
 import { isReservedTeamEnvKey } from './env-reserved.js';
@@ -486,12 +485,7 @@ async function moveHolds(
 /** Skills a tool reads only from a session started in one place (#1221). */
 export async function skillReadNotes(ctx: DoctorContext): Promise<string[]> {
   const notes: string[] = [];
-  const host = realHost();
-  for (const { tool, own, where } of await writableSkillLocations(ctx)) {
-    if (ctx.localConfig.scope === 'user' && isToolId(tool) && settingsAtDefault(tool)) {
-      const defaultHome = defaultToolHome(tool, host);
-      if (!await samePlace(toolHome(tool, host), defaultHome)) notes.push(`${tool} takes skills from ${own}, but teamai still writes some of its other files under ${defaultHome}.`);
-    }
+  for (const { tool, where } of await writableSkillLocations(ctx)) {
     for (const unread of unreadWrites(where)) {
       switch (unread.reason) {
         case 'not-read':
@@ -588,18 +582,11 @@ export async function buildRecordedPlaceChecks(ctx: DoctorContext, resource: 'ru
   return checks;
 }
 
-/** A session-limited read, and a home that moved while teamai still writes other files under the default one (#1221). */
+/** A session-limited read of `resource` (#1221). */
 export async function recordedPlaceNotes(ctx: DoctorContext, resource: 'rules' | 'blocks'): Promise<string[]> {
   const notes: string[] = [];
   const words = RECORDED_WORDS[resource];
-  const host = realHost();
-  for (const { tool, own, unread } of await writtenPlaces(ctx, resource)) {
-    if (ctx.localConfig.scope === 'user' && isToolId(tool) && settingsAtDefault(tool)) {
-      const defaultHome = defaultToolHome(tool, host);
-      if (!await samePlace(toolHome(tool, host), defaultHome)) {
-        notes.push(`${tool} takes ${words.noun} from ${own}, but teamai still writes some of its other files under ${defaultHome}.`);
-      }
-    }
+  for (const { tool, unread } of await writtenPlaces(ctx, resource)) {
     if (unread === 'unknown') continue;
     for (const entry of unread) {
       switch (entry.reason) {
@@ -1375,19 +1362,6 @@ export async function buildAgentPlaceChecks(ctx: DoctorContext): Promise<Check[]
   return checks;
 }
 
-/** A tool whose agents follow its moved home while teamai writes its other files under the default one (#1221). */
-export async function agentReadNotes(ctx: DoctorContext): Promise<string[]> {
-  if (ctx.localConfig.scope !== 'user') return [];
-  const notes: string[] = [];
-  const host = realHost();
-  for (const { tool, own } of await writableAgentLocations(ctx)) {
-    if (!isToolId(tool) || !settingsAtDefault(tool)) continue;
-    const defaultHome = defaultToolHome(tool, host);
-    if (!await samePlace(toolHome(tool, host), defaultHome)) notes.push(`${tool} takes agents from ${own}, but teamai still writes some of its other files under ${defaultHome}.`);
-  }
-  return notes;
-}
-
 const UNRESOLVED_VARS_RE = /^unresolved variable\(s\): (.+)$/;
 
 /**
@@ -1498,10 +1472,6 @@ export async function mcpTransportNotes(ctx: DoctorContext): Promise<string[]> {
     }
     const own = writable(where);
     if (where.channel !== 'files' || own === null) continue;
-    if (install.scope === 'user' && isToolId(tool) && settingsAtDefault(tool)
-      && !await samePlace(toolHome(tool, host), defaultToolHome(tool, host))) {
-      notes.push(`${tool} takes MCP servers from ${own.path}, but teamai still writes some of its other files under ${defaultToolHome(tool, host)}.`);
-    }
     for (const unread of unreadWrites(where, host)) {
       if (unread.reason === 'cwd-only') notes.push(`${tool} reads project MCP servers only from a session started in ${unread.readFrom}.`);
     }

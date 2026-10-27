@@ -11,16 +11,17 @@ import { isDeepStrictEqual } from 'node:util';
 import { MCP_SERVER_KEY } from './resources/mcp-format.js';
 import { SESSION_PLATFORM_FACTS, type SessionPlatform, type StoredSessionPlatform } from './session-flow/adapters/platform-facts.js';
 import {
-  channelsOf, installGateOf, isToolId, TOOLS,
-  type Activation, type BlocksFile, type BlocksHeader, type ChannelProbe, type FirstExistingRead, type HomeRead, type McpProject,
-  type McpUser, type ProjectRead, type ReadGateKind, type RunTime, type RunTimeVia,
+  channelsOf, installGateOf, isToolId, hasDefaultHomeLeftovers, TOOLS,
+  type Activation, type BlocksFile, type BlocksHeader, type ChannelProbe, type FirstExistingRead, type HomeRead, type HookAdapter,
+  type HookAdapterId, type HookFormat, type HookSettings, type McpProject, type McpUser, type ProjectRead, type ReadGateKind, type RunTime,
+  type RunTimeVia,
 } from './tools.js';
 import {
   DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, recordedToolRootDir, resolveBaseDir, scopedToolPaths, toolGateRoot,
   WORKBUDDY_NEW_GENERATION_ROOT, WORKBUDDY_TOOL_ID, WORKBUDDY_TOOL_ROOT,
   type HomePaths, type LocalConfig, type Scope, type TeamaiConfig, type ToolId,
 } from './types.js';
-import { homeRoot, movedToolHome, realHost, toolHome, type Host } from './tool-home.js';
+import { defaultToolHome, homeRoot, movedToolHome, realHost, toolHome, type Host } from './tool-home.js';
 import { resolveOpenclawConfigPath, resolveOpenclawWorkspace, type OpenclawWorkspace } from './openclaw-home.js';
 import { hasWorkspaceChildren } from './workspace-children.js';
 
@@ -76,7 +77,7 @@ export function installOf(
 }
 
 /** Resources `locate` answers for. */
-export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp' | 'sessions';
+export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp' | 'hooks' | 'sessions';
 
 /** A directory teamai writes one file or folder per item into: skills, agents, rule files. */
 export type DirPlace = { readonly kind: 'dir'; readonly path: string };
@@ -104,6 +105,7 @@ export type PlaceOf = {
   readonly blocks: FilePlace;
   readonly agents: DirPlace;
   readonly mcp: EntryPlace;
+  readonly hooks: EntryPlace | DirPlace;
   readonly sessions: DirPlace;
 };
 
@@ -215,6 +217,17 @@ type LocationOf = {
     readonly lookup: McpLookup | null;
   }) | SilentChannel<EntryPlace>;
   /**
+   * `own`: the hook list of the tool's hook file, in `format`, or the
+   * directory its `adapter` writes teamai's file into. A workspace takes the
+   * user hooks, and self mode the project's unless the tool takes its user
+   * hooks there too (`HooksChannels.self`). `retired`: the default home's,
+   * where earlier releases wrote before the home moved.
+   */
+  readonly hooks:
+    | (FilesChannel<EntryPlace> & { readonly format: HookFormat })
+    | (FilesChannel<DirPlace> & { readonly adapter: HookAdapterId })
+    | SilentChannel<EntryPlace | DirPlace>;
+  /**
    * `own`: the store of the first of the tool's `sessions`, `platform`, where its launched sessions
    * go and a copy to it is written. `none` and `unknown` as the tool's `sessions` say.
    */
@@ -238,6 +251,7 @@ const LOCATORS: { readonly [R in Resource]: Locator<R> } = {
   blocks: locateBlocks,
   agents: locateAgents,
   mcp: locateMcp,
+  hooks: locateHooks,
   sessions: locateSessions,
 };
 
@@ -338,7 +352,7 @@ function isAtOrUnder(p: path.PlatformPath, dir: string, root: string): boolean {
 
 type ToolPaths = TeamaiConfig['toolPaths'][string];
 
-type PathField = 'skills' | 'rules' | 'agents' | 'claudemd' | 'mcp' | 'mcpProject';
+type PathField = 'skills' | 'rules' | 'agents' | 'claudemd' | 'mcp' | 'mcpProject' | 'settings' | 'hooks';
 
 /**
  * Where a configured or declared path of one tool becomes absolute. Two
@@ -357,6 +371,16 @@ type Roots = {
   readonly underHome: (relative: string) => string;
 };
 
+/** `relative`, a `$HOME`-relative path, re-rooted in `tool`'s home where it falls under the home's root, which a recorded or env move relocates. */
+function underToolHome(tool: string, relative: string, host: Host): string {
+  const p = host.path;
+  if (isToolId(tool)) {
+    const root = homeRoot(tool);
+    if (relative === root || relative.startsWith(`${root}/`)) return p.join(toolHome(tool, host), ...relative.slice(root.length + 1).split('/'));
+  }
+  return p.join(host.home, ...relative.split('/'));
+}
+
 function rootsOf(tool: string, install: Install, host: Host): Roots {
   const p = host.path;
   const at: HomePaths = { home: host.home, path: p };
@@ -367,10 +391,7 @@ function rootsOf(tool: string, install: Install, host: Host): Roots {
     : install.toolPaths[tool];
   const join = (root: string, relative: string): string => p.join(root, ...relative.split('/'));
   const home = known === undefined ? undefined : { root: homeRoot(known), dir: toolHome(known, host) };
-  const underHome = (relative: string): string => {
-    if (home && (relative === home.root || relative.startsWith(`${home.root}/`))) return join(home.dir, relative.slice(home.root.length + 1));
-    return join(host.home, relative);
-  };
+  const underHome = (relative: string): string => underToolHome(tool, relative, host);
   const relocated = (relative: string): string =>
     scopedToolPaths({ toolPaths: { [tool]: { skills: relative } } }, { scope: 'user', toolRoots: install.toolRoots }, at)[tool]?.skills ?? relative;
   return {
@@ -926,6 +947,129 @@ async function mcpFilesOf(
       ...(lookup?.files ?? []).filter((other) => other !== file).map((other): Retired<EntryPlace> => ({ place: entry(other), was: 'lookup' })),
     ],
     reads: await readsOf(channel.reads, roots, host, key),
+  };
+}
+
+/** The map each hook format keeps its hook list under. */
+const HOOK_LIST_KEY = ['hooks'] as const;
+
+/**
+ * The hook file a hook pass at `baseDir` (`resolveHookScope`) edits for
+ * `tool`: `relative` under `baseDir` for a project's own hooks, else in the
+ * tool's user scope, in its home where `relative` falls under the home's root,
+ * which a recorded or env move relocates. A tool that takes its user hooks in
+ * self mode too (ZCode's CLI) gets them there whatever `baseDir` says.
+ */
+export function hookSettingsFile(tool: string, baseDir: string, relative: string, host: Host = realHost()): string {
+  const p = host.path;
+  if (channelsOf(tool).hooks.self !== 'user' && !samePathOn(p, baseDir, host.home)) return p.join(baseDir, ...relative.split('/'));
+  return underToolHome(tool, relative, host);
+}
+
+/** The directory `adapter` writes teamai's hook file into: in its tool's home, which a recorded or env move relocates, on `host`. */
+export function hookAdapterDir(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, host: Host = realHost()): string {
+  return adapterDirIn(adapter, (tool) => toolHome(tool, host), host);
+}
+
+/**
+ * Where earlier releases wrote `adapter`'s hook file, under its tool's default home, when the home
+ * has moved since; else null. A default home linked to the moved one is the same directory.
+ */
+export async function earlierHookAdapterDir(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, host: Host = realHost()): Promise<string | null> {
+  const dir = adapterDirIn(adapter, (tool) => defaultToolHome(tool, host), host);
+  const current = hookAdapterDir(adapter, host);
+  if (samePathOn(host.path, dir, current)) return null;
+  return samePathOn(host.path, await host.realpath(dir), await host.realpath(current)) ? null : dir;
+}
+
+function adapterDirIn(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, homeOf: (tool: ToolId) => string, host: Host): string {
+  const p = host.path;
+  switch (adapter) {
+    case 'opencode-plugin':
+      return p.join(homeOf('opencode'), 'plugin');
+    case 'pi-extension':
+      return p.join(homeOf('pi'), 'extensions');
+    case 'omp-extension':
+      return p.join(homeOf('omp'), 'agent', 'extensions');
+    case 'hermes-plugin':
+      return p.join(homeOf('hermes'), 'hooks');
+    case 'kiro-hooks':
+      return p.join(homeOf('kiro'), 'hooks');
+    // The bridge config lives with teamai; dsh loads it through the row teamai keeps in `$DSH_HOME/cordis.patch.yml`.
+    case 'dsh-hooks':
+      return p.join(host.home, '.teamai', 'dsh');
+    default: {
+      const unhandled: never = adapter;
+      return unhandled;
+    }
+  }
+}
+
+async function locateHooks(tool: string, install: Install, host: Host): Promise<Location<'hooks'>> {
+  const { hooks } = channelsOf(tool);
+  if (install.scope === 'project' && install.repo === 'self' && hooks.self !== 'user') return settingsHooksOf(tool, hooks.self, install, host);
+  const user = await userViewOf(install, host);
+  const channel = hooks.user;
+  if (channel === 'none' || channel === 'unknown' || channel.channel === 'settings') return settingsHooksOf(tool, channel, user, host);
+  return adapterHooksOf(tool, channel, user, host);
+}
+
+/** Whether `tool`'s home moved, while every release before #1221 wrote its hooks under the default one (`Home.moves.defaultHomeLeftovers`). */
+function leftDefaultHome(tool: string, host: Host): boolean {
+  return isToolId(tool) && hasDefaultHomeLeftovers(tool) && movedToolHome(tool, host) !== null;
+}
+
+async function settingsHooksOf(
+  tool: string,
+  channel: HookSettings<HomeRead | ProjectRead> | 'none' | 'unknown',
+  install: Install,
+  host: Host,
+): Promise<Location<'hooks'>> {
+  const roots = rootsOf(tool, install, host);
+  const gates = await gatesOf(tool, install, host, roots);
+  if (channel === 'none' || channel === 'unknown') return { channel, retired: [], gates };
+  const field = roots.paths?.hooks === undefined ? 'settings' : 'hooks';
+  const file = roots.configured(field);
+  const own: EntryPlace | null = file === null ? null : { kind: 'entry', path: file, key: HOOK_LIST_KEY };
+  const relative = roots.paths?.[field];
+  const unmoved: Retired<EntryPlace> | null = install.scope === 'user' && relative !== undefined && leftDefaultHome(tool, host)
+    ? { place: { kind: 'entry', path: roots.join(host.home, relative), key: HOOK_LIST_KEY }, was: 'default' }
+    : null;
+  return {
+    channel: 'files',
+    own,
+    format: channel.format,
+    reads: await readsOf(channel.reads, roots, host, HOOK_LIST_KEY),
+    readGates: [],
+    retired: settled(own, [unmoved], host.path),
+    gates,
+  };
+}
+
+async function adapterHooksOf(tool: string, channel: HookAdapter, install: Install, host: Host): Promise<Location<'hooks'>> {
+  const roots = rootsOf(tool, install, host);
+  const gates = await gatesOf(tool, install, host, roots);
+  const { adapter } = channel;
+  let dir: string | null;
+  if (adapter === 'openclaw-hook') {
+    const workspace = await openclawWorkspaceOf(roots, host);
+    const found = workspace.kind === 'found' ? workspace.dir : workspace.kind === 'unreadable-config' ? workspace.fallback : null;
+    dir = found === null ? null : host.path.join(found, 'hooks');
+  } else {
+    dir = adapterDirIn(adapter, (id) => toolHome(id, host), host);
+  }
+  const own: DirPlace | null = dir === null ? null : { kind: 'dir', path: dir };
+  const unmoved: Retired<DirPlace> | null = adapter !== 'openclaw-hook' && leftDefaultHome(tool, host)
+    ? { place: { kind: 'dir', path: adapterDirIn(adapter, (id) => defaultToolHome(id, host), host) }, was: 'default' }
+    : null;
+  return {
+    channel: 'files',
+    own,
+    adapter,
+    reads: own === null ? [] : [{ path: own.path, when: 'always' }],
+    readGates: [],
+    retired: settled(own, [unmoved], host.path),
+    gates,
   };
 }
 

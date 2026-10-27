@@ -795,17 +795,17 @@ describe('doctor — where a tool takes skills', () => {
     expect(check?.fix).toContain(`opencode does not read ${path.join(homeDir, '.opencode', 'skills')}`);
   });
 
-  it('notes that OpenCode\'s other files stay in its default home while its skills follow the moved one', async () => {
+  it('notes nothing left in OpenCode\'s default home once its skills follow the moved one (#1221)', async () => {
     const xdg = path.join(tempDir, 'xdg');
     await fse.ensureDir(path.join(xdg, 'opencode'));
     vi.stubEnv('XDG_CONFIG_HOME', xdg);
 
     const { notes } = await report();
 
-    expect(notes).toContain(`opencode takes skills from ${path.join(xdg, 'opencode', 'skills')}, but teamai still writes some of its other files under ${path.join(homeDir, '.config', 'opencode')}.`);
+    expect(notes?.some((note) => note.includes('still writes some of its other files'))).toBe(false);
   });
 
-  it('notes that Pi\'s other files stay in its default home while its skills follow the moved one', async () => {
+  it('notes nothing left in Pi\'s default home once its skills follow the moved one (#1221)', async () => {
     const pi = path.join(tempDir, 'pi-agent');
     await fse.ensureDir(pi);
     vi.stubEnv('PI_CODING_AGENT_DIR', pi);
@@ -813,9 +813,7 @@ describe('doctor — where a tool takes skills', () => {
 
     const { notes } = await report();
 
-    expect(notes?.filter((note) => note.startsWith('pi '))).toEqual([
-      `pi takes skills from ${path.join(pi, 'skills')}, but teamai still writes some of its other files under ${path.join(homeDir, '.pi', 'agent')}.`,
-    ]);
+    expect(notes?.filter((note) => note.startsWith('pi '))).toEqual([]);
   });
 
   it('notes a project directory a tool reads only from a session started at the project root', async () => {
