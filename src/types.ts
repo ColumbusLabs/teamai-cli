@@ -2634,8 +2634,8 @@ function isAddressableRootSegment(segment: string): boolean {
  * the variables say. `toolPaths.cursor` therefore has to stay put, and a key
  * named `cursor` would move it: `applyToolRoots` re-roots the `toolPaths` entry
  * of every key it finds. So the two names below stand for roots, not tools, and
- * only the two writers that address those roots read them (`getCursorProjectsDir`
- * in `session-flow/fs.ts` and `cursorConfigDir` below).
+ * only the two writers that address those roots read them (`sessionStoreDir`
+ * in `locate.ts` and `cursorConfigDir` below).
  *
  * Those two keys carry no `toolPaths` entry, which is also why `doctor`'s
  * `buildToolRootChecks` skips them: the check compares where teamai would write
@@ -3317,11 +3317,21 @@ export function hookToolPathsForConfig(teamConfig: TeamaiConfig, localConfig: Lo
 export function resolveToolRootDir(
   tool: string,
   defaultRoot: string,
-  toolRoots?: Record<string, string>,
+  toolRoots?: Readonly<Record<string, string>>,
+  at: HomePaths = processHomePaths(),
 ): string {
+  return recordedToolRootDir(tool, toolRoots, at) ?? at.path.join(at.home, ...defaultRoot.split('/'));
+}
+
+/** The member's recorded root of `tool` under `at.home`, or null when none is recorded or it is ignored (and warned). */
+export function recordedToolRootDir(
+  tool: string,
+  toolRoots: Readonly<Record<string, string>> | undefined,
+  at: HomePaths = processHomePaths(),
+): string | null {
   const configured = toolRoots?.[tool];
-  const segment = configured ? toolRootSegment(tool, configured) : null;
-  return path.join(getUserHome(), segment ?? defaultRoot);
+  const segment = configured ? toolRootSegment(tool, configured, at) : null;
+  return segment === null ? null : at.path.join(at.home, ...segment.split('/'));
 }
 
 /**

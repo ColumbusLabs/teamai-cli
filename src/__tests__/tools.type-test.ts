@@ -34,3 +34,14 @@ export const invariants: [InlineRulesWithoutBlocksFile, ToolsWithTwoMcpFormats] 
 // @ts-expect-error Pi has no agents channel in either scope, so renderForTool never takes it
 export const pi: AgentToolId = 'pi';
 
+
+declare const withoutSessions: Omit<ToolDescriptor, 'sessions'>;
+
+// @ts-expect-error every tool states the session platforms teamai reads, 'none' or 'unknown'
+export const noSessions: ToolDescriptor = withoutSessions;
+
+// @ts-expect-error a listed platform has a store teamai resolves; the CodeBuddy IDE's is found by its adapter
+export const ideStore: ToolDescriptor = { ...full, sessions: ['codebuddy-ide'] };
+
+// @ts-expect-error a tool with no session platform says 'none' or 'unknown'
+export const emptySessions: ToolDescriptor = { ...full, sessions: [] };

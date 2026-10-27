@@ -1,5 +1,6 @@
 import type { McpFormat } from './resources/mcp-format.js';
 import type { RuleFormatId } from './resources/rule-format.js';
+import type { SessionPlatform, StoredSessionPlatform } from './session-flow/adapters/platform-facts.js';
 import type { ToolId } from './types.js';
 
 export type Evidence = 'verified' | 'source' | 'docs' | 'assumed';
@@ -206,6 +207,12 @@ export type ToolDescriptor = {
   readonly blocks: BlocksChannels;
   readonly agents: AgentsChannels;
   readonly mcp: McpChannels;
+  /**
+   * The session platforms teamai reads for the tool, first the one its
+   * launched sessions write. `'none'`: the tool keeps sessions teamai has no
+   * adapter for. `'unknown'`: where it keeps them is unknown.
+   */
+  readonly sessions: readonly [StoredSessionPlatform, ...StoredSessionPlatform[]] | 'none' | 'unknown';
 };
 
 const UNKNOWN_READS = { user: 'unknown', project: 'unknown' } as const;
@@ -254,6 +261,7 @@ export const TOOLS = {
         reads: [{ base: 'project', path: '.mcp.json', when: 'workspaceUnder', evidence: 'verified' }],
       },
     },
+    sessions: ['claude-code'],
   },
   codex: {
     home: { dir: '.codex' },
@@ -280,6 +288,7 @@ export const TOOLS = {
       user: { format: 'codex', reads: [{ base: 'home', path: '.codex/config.toml', evidence: 'verified' }] },
       project: { format: 'codex', reads: [{ base: 'project', path: '.codex/config.toml', when: 'workspaceUnder', evidence: 'verified' }], readGates: ['codex-project-trust'] },
     },
+    sessions: ['codex'],
   },
   'codex-internal': {
     home: { dir: '.codex-internal' },
@@ -293,6 +302,7 @@ export const TOOLS = {
     },
     agents: { user: { reads: 'unknown' }, project: { reads: 'unknown' } },
     mcp: UNKNOWN,
+    sessions: ['codex-internal'],
   },
   'claude-internal': {
     home: { dir: '.claude-internal' },
@@ -302,6 +312,7 @@ export const TOOLS = {
     blocks: { user: { channel: 'file', file: { in: 'claudemd' }, reads: 'unknown' }, project: { channel: 'file', file: { in: 'claudemd' }, reads: 'unknown' } },
     agents: { user: { reads: 'unknown' }, project: { reads: 'unknown' } },
     mcp: UNKNOWN,
+    sessions: ['claude-internal'],
   },
   tclaude: {
     home: { dir: '.tclaude' },
@@ -314,6 +325,7 @@ export const TOOLS = {
       user: { format: 'claude', reads: 'unknown' },
       project: { format: 'claude', writtenBy: 'claude', reads: [{ base: 'project', path: '.mcp.json', when: 'workspaceUnder', evidence: 'assumed' }] },
     },
+    sessions: ['tclaude'],
   },
   tcodex: {
     home: { dir: '.tcodex' },
@@ -327,6 +339,7 @@ export const TOOLS = {
     },
     agents: { user: { reads: 'unknown' }, project: { reads: 'unknown' } },
     mcp: UNKNOWN,
+    sessions: ['tcodex'],
   },
   // Cursor reads `<ancestor>/.cursor/rules` walking up from the workspace (cursor-user-rules.ts).
   cursor: {
@@ -358,6 +371,7 @@ export const TOOLS = {
       user: { format: 'cursor', reads: [{ base: 'home', path: '.cursor/mcp.json', evidence: 'source' }] },
       project: { format: 'cursor', reads: [{ base: 'project', path: '.cursor/mcp.json', when: 'workspaceUnder', evidence: 'source' }] },
     },
+    sessions: ['cursor'],
   },
   copilot: {
     home: { dir: '.copilot', moves: { by: [{ kind: 'env', name: 'COPILOT_HOME', evidence: 'verified' }] } },
@@ -390,6 +404,7 @@ export const TOOLS = {
       user: { format: 'copilot', reads: [{ base: 'home', path: '.copilot/mcp-config.json', evidence: 'verified' }] },
       project: { format: 'copilot', reads: [{ base: 'project', path: '.github/mcp.json', when: 'workspaceUnder', evidence: 'verified' }] },
     },
+    sessions: 'none',
   },
   joycode: {
     home: { dir: '.joycode' },
@@ -406,6 +421,7 @@ export const TOOLS = {
     // JoyCode loads an agent only through its `.joycode/agent.json` index, which teamai does not write.
     agents: { user: { reads: 'unknown' }, project: { reads: 'unknown' } },
     mcp: NONE,
+    sessions: 'unknown',
   },
   qoder: {
     home: { dir: '.qoder' },
@@ -425,6 +441,8 @@ export const TOOLS = {
       user: { format: 'claude', reads: [{ base: 'home', path: '.qoder/settings.json', evidence: 'source' }] },
       project: { format: 'claude', reads: [{ base: 'project', path: '.qoder/settings.json', when: 'workspaceUnder', evidence: 'source' }] },
     },
+    // Qoder CLI 1.1.78: <id>.jsonl under ~/.qoder/projects/<cwd>, moved by QODER_CONFIG_DIR.
+    sessions: 'none',
   },
   'qoder-cn': {
     home: { dir: '.qoder-cn' },
@@ -444,6 +462,8 @@ export const TOOLS = {
       user: { format: 'claude', reads: [{ base: 'home', path: '.qoder-cn/settings.json', evidence: 'source' }] },
       project: { format: 'claude', reads: [{ base: 'project', path: '.qoder/settings.json', when: 'workspaceUnder', evidence: 'assumed' }] },
     },
+    // Qoder CN: the same layout under ~/.qoder-cn, moved by the QODERCN_ variables.
+    sessions: 'none',
   },
   kiro: {
     home: { dir: '.kiro' },
@@ -462,6 +482,8 @@ export const TOOLS = {
       user: { format: 'claude', reads: [{ base: 'home', path: '.kiro/settings/mcp.json', evidence: 'docs' }] },
       project: { format: 'claude', reads: [{ base: 'project', path: '.kiro/settings/mcp.json', when: 'workspaceUnder', evidence: 'docs' }] },
     },
+    // Kiro CLI docs: sessions under ~/.kiro, moved by KIRO_HOME.
+    sessions: 'none',
   },
   // Trae keeps user MCP servers in its app-support directory, which teamai does not write.
   trae: {
@@ -479,6 +501,8 @@ export const TOOLS = {
       user: 'none',
       project: { format: 'claude', reads: [{ base: 'project', path: '.trae/mcp.json', when: 'workspaceUnder', evidence: 'docs' }] },
     },
+    // Trae docs: chat history in the IDE's ModularData database, which no variable moves.
+    sessions: 'none',
   },
   'trae-cn': {
     home: { dir: '.trae-cn' },
@@ -495,6 +519,8 @@ export const TOOLS = {
       user: 'none',
       project: { format: 'claude', reads: [{ base: 'project', path: '.trae/mcp.json', when: 'workspaceUnder', evidence: 'docs' }] },
     },
+    // Trae CN docs: the same database under Trae CN's application data.
+    sessions: 'none',
   },
   // ZCode 3.16.2 source; 3.15.1 not certified. Its CLI runs only user-level hooks, and reads servers under `mcp.servers` of its own config files.
   zcode: {
@@ -519,6 +545,7 @@ export const TOOLS = {
       project: { format: 'claude', key: ['mcp', 'servers'], reads: [{ base: 'project', path: '.zcode/config.json', when: 'workspaceUnder', evidence: 'source' }] },
       retired: { user: ['.agents/mcp.json'] },
     },
+    sessions: 'none',
   },
   // Extensions capture the installed Node/CLI launcher instead of depending on the host PATH.
   omp: {
@@ -544,6 +571,7 @@ export const TOOLS = {
       user: { format: 'claude', reads: [{ base: 'home', path: '.omp/agent/mcp.json', evidence: 'verified' }] },
       project: { format: 'claude', reads: [{ base: 'project', path: '.omp/mcp.json', when: 'cwdOnly', evidence: 'verified' }] },
     },
+    sessions: 'none',
   },
   pi: {
     home: { dir: '.pi', moves: { root: '.pi/agent', by: [{ kind: 'env', name: 'PI_CODING_AGENT_DIR', evidence: 'verified' }], settingsAtDefault: true } },
@@ -566,6 +594,8 @@ export const TOOLS = {
       user: { format: 'pi', reads: [{ base: 'home', path: '.pi/agent/mcp.json', evidence: 'verified' }] },
       project: { format: 'pi', reads: [{ base: 'project', path: '.pi/mcp.json', when: 'cwdOnly', evidence: 'verified' }] },
     },
+    // Pi 0.99: <ts>_<uuid>.jsonl under ~/.pi/agent/sessions/<cwd>, moved by PI_CODING_AGENT_SESSION_DIR or PI_CODING_AGENT_DIR.
+    sessions: 'none',
   },
   // Model switching follows the same recorded home for models.json.
   // The CodeBuddy IDE sends `skill` (src/utils/tool-names.ts). CODEBUDDY_CONFIG_DIR replaces ~/.codebuddy, and ~/.codebuddy.json moves into it.
@@ -601,6 +631,7 @@ export const TOOLS = {
         reads: [{ base: 'project', firstOf: ['.mcp.json', 'mcp.json'], when: 'cwdOnly', evidence: 'source' }],
       },
     },
+    sessions: ['codebuddy'],
   },
   // Hermes (`skill_view`) and OpenClaw (`skills_read`) have skill tools, but teamai installs no post-tool-use hook for them yet.
   // OpenClaw's skills sit in its workspace.
@@ -621,6 +652,8 @@ export const TOOLS = {
     },
     agents: NONE,
     mcp: NONE,
+    // OpenClaw 2026.10: rows in ~/.openclaw/agents/<id>/agent/openclaw-agent.sqlite, moved by OPENCLAW_STATE_DIR.
+    sessions: 'none',
   },
   // hermes_constants.py: HERMES_HOME, else %LOCALAPPDATA%\hermes on Windows, else ~/.hermes. Hermes reads it in either scope.
   hermes: {
@@ -642,6 +675,7 @@ export const TOOLS = {
     },
     agents: NONE,
     mcp: NONE,
+    sessions: 'none',
   },
   dsh: {
     home: { dir: '.dsh', moves: { by: [{ kind: 'env', name: 'DSH_HOME', evidence: 'source' }] } },
@@ -657,6 +691,7 @@ export const TOOLS = {
     },
     agents: NONE,
     mcp: NONE,
+    sessions: 'none',
   },
   // CodeBuddy engine 2.168.0; the WorkBuddy launcher's binding of ~/.workbuddy is not certified.
   workbuddy: {
@@ -693,6 +728,7 @@ export const TOOLS = {
       },
       retired: { project: ['.workbuddy/mcp.json'] },
     },
+    sessions: ['workbuddy'],
   },
   // opencode v2.1.1 Global.Path: OPENCODE_CONFIG_DIR, else (XDG_CONFIG_HOME || ~/.config)/opencode.
   opencode: {
@@ -744,6 +780,7 @@ export const TOOLS = {
         ],
       },
     },
+    sessions: ['opencode'],
   },
   // muse-bin 1.4.11: $XDG_CONFIG_HOME/muse, else ~/.config/muse; with XDG_CONFIG_HOME set, ~/.config/muse is never read.
   muse: {
@@ -774,6 +811,7 @@ export const TOOLS = {
       user: { format: 'muse', reads: [{ base: 'home', path: '.config/muse/settings.json', evidence: 'source' }] },
       project: { format: 'muse', writtenBy: 'claude', reads: [{ base: 'project', path: '.mcp.json', when: 'workspaceUnder', evidence: 'source' }] },
     },
+    sessions: 'none',
   },
 } as const satisfies Record<ToolId, ToolDescriptor>;
 
@@ -839,6 +877,18 @@ export type ToolsWithTwoMcpFormats = {
 export type AgentToolId = {
   [T in ToolId]: Entry<T>['agents'] extends { readonly user: 'none' | 'unknown'; readonly project: 'none' | 'unknown' } ? never : T
 }[ToolId];
+
+/** The session platforms teamai reads for `tool`, first the one its launched sessions write; none for a custom tool id. */
+export function sessionPlatformsOf(tool: string): readonly SessionPlatform[] {
+  if (!isToolId(tool)) return [];
+  const { sessions }: ToolDescriptor = TOOLS[tool];
+  return typeof sessions === 'string' ? [] : sessions;
+}
+
+/** The tool whose `sessions` lists `platform`, if one does. */
+export function sessionPlatformOwner(platform: string): ToolId | undefined {
+  return Object.keys(TOOLS).filter(isToolId).find((tool) => sessionPlatformsOf(tool).some((listed) => listed === platform));
+}
 
 const CUSTOM_TOOL = {
   rules: { user: { channel: 'dir', format: 'verbatim', reads: 'unknown' }, project: { channel: 'dir', format: 'verbatim', reads: 'unknown' } },

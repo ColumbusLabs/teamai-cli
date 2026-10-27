@@ -9,13 +9,14 @@
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { MCP_SERVER_KEY } from './resources/mcp-format.js';
+import { SESSION_PLATFORM_FACTS, type SessionPlatform, type StoredSessionPlatform } from './session-flow/adapters/platform-facts.js';
 import {
   channelsOf, installGateOf, isToolId, TOOLS,
   type Activation, type BlocksFile, type BlocksHeader, type ChannelProbe, type FirstExistingRead, type HomeRead, type McpProject,
   type McpUser, type ProjectRead, type ReadGateKind, type RunTime, type RunTimeVia,
 } from './tools.js';
 import {
-  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, resolveBaseDir, scopedToolPaths, toolGateRoot,
+  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, recordedToolRootDir, resolveBaseDir, scopedToolPaths, toolGateRoot,
   WORKBUDDY_NEW_GENERATION_ROOT, WORKBUDDY_TOOL_ID, WORKBUDDY_TOOL_ROOT,
   type HomePaths, type LocalConfig, type Scope, type TeamaiConfig, type ToolId,
 } from './types.js';
@@ -75,7 +76,7 @@ export function installOf(
 }
 
 /** Resources `locate` answers for. */
-export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp';
+export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp' | 'sessions';
 
 /** A directory teamai writes one file or folder per item into: skills, agents, rule files. */
 export type DirPlace = { readonly kind: 'dir'; readonly path: string };
@@ -103,6 +104,7 @@ export type PlaceOf = {
   readonly blocks: FilePlace;
   readonly agents: DirPlace;
   readonly mcp: EntryPlace;
+  readonly sessions: DirPlace;
 };
 
 /**
@@ -212,6 +214,11 @@ type LocationOf = {
     /** `own` is the first of `files` that exists (#993); `mapped` is the one the team's mapping names, where teamai wrote before #993. */
     readonly lookup: McpLookup | null;
   }) | SilentChannel<EntryPlace>;
+  /**
+   * `own`: the store of the first of the tool's `sessions`, `platform`, where its launched sessions
+   * go and a copy to it is written. `none` and `unknown` as the tool's `sessions` say.
+   */
+  readonly sessions: (FilesChannel<DirPlace> & { readonly platform: SessionPlatform }) | SilentChannel<DirPlace>;
 };
 
 /** Files a tool tries in order, reading only the first that exists. */
@@ -231,6 +238,7 @@ const LOCATORS: { readonly [R in Resource]: Locator<R> } = {
   blocks: locateBlocks,
   agents: locateAgents,
   mcp: locateMcp,
+  sessions: locateSessions,
 };
 
 /** Where `tool` takes `resource` on `host` under `install`. */
@@ -919,4 +927,42 @@ async function mcpFilesOf(
     ],
     reads: await readsOf(channel.reads, roots, host, key),
   };
+}
+
+/**
+ * Where `platform`'s sessions sit on `host`. A `tool-home` store follows the member's recorded
+ * root first, then its tool's home, as that tool's other files do. A recorded root is checked
+ * against `host.home`, the home `teamai init` accepted it under. A default store sits under
+ * `host.profileHome`, where the tools write it.
+ */
+export function sessionStoreDir(
+  platform: StoredSessionPlatform,
+  toolRoots: Readonly<Record<string, string>> | undefined,
+  host: Host = realHost(),
+): string {
+  const { store } = SESSION_PLATFORM_FACTS[platform];
+  const p = host.path;
+  switch (store.in) {
+    case 'tool-home': {
+      const dir = recordedToolRootDir('root' in store ? store.root : store.home, toolRoots, host)
+        ?? toolHome(store.home, { ...host, home: host.profileHome });
+      return p.join(dir, store.dir);
+    }
+    case 'xdg-data':
+      return p.join(host.env.XDG_DATA_HOME || p.join(host.profileHome, '.local', 'share'), store.child);
+    default: {
+      const unhandled: never = store;
+      return unhandled;
+    }
+  }
+}
+
+async function locateSessions(tool: string, install: Install, host: Host): Promise<Location<'sessions'>> {
+  if (!isToolId(tool)) return { channel: 'unknown', retired: [], gates: [] };
+  const { sessions } = TOOLS[tool];
+  if (typeof sessions === 'string') return { channel: sessions, retired: [], gates: [] };
+  const [platform] = sessions;
+  const { toolRoots } = install.scope === 'user' ? install : await userViewOf(install, host);
+  const own: DirPlace = { kind: 'dir', path: sessionStoreDir(platform, toolRoots, host) };
+  return { channel: 'files', own, platform, reads: [{ path: own.path, when: 'always' }], readGates: [], retired: [], gates: [] };
 }
