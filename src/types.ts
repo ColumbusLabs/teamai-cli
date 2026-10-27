@@ -278,11 +278,16 @@ export function isUnmigratedDataHome(localConfig: { scope?: string; projectRoot?
   return scope === 'project' && !!projectRoot && !!dataHome && path.resolve(dataHome) === path.resolve(projectRoot, '.teamai');
 }
 
-/** Resolve whether recall is enabled: user override > team config > default (false). */
+/**
+ * Resolve whether recall is enabled: env kill switch > user override >
+ * team config > default (false).
+ */
 export function isRecallEnabled(
   localConfig: { recallEnabled?: boolean },
   teamConfig: { sharing?: { recall?: { enabled?: boolean } } },
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (env.TEAMAI_RECALL_DISABLED === '1') return false;
   if (localConfig.recallEnabled !== undefined) return localConfig.recallEnabled;
   return getRecallSharing(teamConfig).enabled;
 }

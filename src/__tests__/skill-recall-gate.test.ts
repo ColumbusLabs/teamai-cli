@@ -67,6 +67,16 @@ describe('recall gate on served skills', () => {
     expect(stderr).toContain('teamai recall enable');
   });
 
+  it('blocks share when TEAMAI_RECALL_DISABLED=1, even with recall on (#1457)', async () => {
+    withRecall(true);
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+    try {
+      expect(await resolveServableSkill('share')).toEqual({ kind: 'blocked', name: 'share', reason: 'recall' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('serves share when recall is enabled', async () => {
     withRecall(true);
 

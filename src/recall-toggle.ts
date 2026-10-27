@@ -135,6 +135,9 @@ export async function recallStatus(_opts: GlobalOptions): Promise<void> {
   const userOverride = localConfig.recallEnabled;
 
   console.log(`Recall: ${effective ? 'enabled' : 'disabled'}`);
+  if (process.env.TEAMAI_RECALL_DISABLED === '1') {
+    console.log('  Env override (TEAMAI_RECALL_DISABLED=1): disabled');
+  }
   console.log(`  Team config (sharing.recall.enabled): ${teamSetting}`);
   if (userOverride !== undefined) {
     console.log(`  User override (recallEnabled): ${userOverride}`);
