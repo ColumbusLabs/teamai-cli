@@ -64,3 +64,11 @@ export const projectHookReadInUserScope: ToolDescriptor = {
     self: 'user',
   },
 };
+
+declare const withoutFeatures: Omit<ToolDescriptor, 'features'>;
+
+// @ts-expect-error every tool states its run-time and AI rows, '?' included
+export const noFeatures: ToolDescriptor = withoutFeatures;
+
+// @ts-expect-error a cell carries its evidence after the mark
+export const bareMark: ToolDescriptor = { ...full, features: { ...full.features, env: '✓' } };

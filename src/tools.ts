@@ -209,6 +209,37 @@ export type HooksChannels = {
  */
 export type InstallGate = 'home-edition' | 'home' | 'own-root';
 
+/**
+ * A cell of #1221's matrix: the state, then the evidence. `✓` works. `◐` works
+ * by default, and a condition breaks it while doctor still reports it
+ * delivered. `✗` broken in the default setup. `+` the tool supports it and
+ * teamai does not build it. `—` the tool has no such feature. Evidence: `v` a
+ * real tool run, or the tool's own loader run on teamai's output; `s` the
+ * tool's source; `d` its docs; `t` teamai's code only. `?` unknown.
+ */
+export type SupportCell = `${'✓' | '◐' | '✗' | '+' | '—'}${'v' | 's' | 'd' | 't'}` | '?';
+
+/** A cell, with what the mark alone does not say: a later fix not rerun, another surface of the tool. */
+export type Support = SupportCell | { readonly cell: SupportCell; readonly note: string };
+
+/** What reaches the tool at run time, and what teamai's own AI does with it, in user scope. */
+export type ToolFeatures = {
+  /** The team env in teamai's shell profile block reaches the tool's sessions. */
+  readonly env: Support;
+  /** `teamai workflow` runs steps on the tool. */
+  readonly workflows: Support;
+  /** The recall skill and its session-start reminder. */
+  readonly recall: Support;
+  /** The tool's skill calls are recorded for usage stats. */
+  readonly stats: Support;
+  /** teamai's own AI calls (enrich, codebase, import, maintenance) run on the tool's CLI (`ai-client`). */
+  readonly aiBackend: Support;
+  /** The votes judge reads the tool's session replies. */
+  readonly votesJudge: Support;
+  /** The HTTP local agent installs server-pushed hooks for the tool. */
+  readonly agentHooks: Support;
+};
+
 export type ToolDescriptor = {
   readonly home: Home;
   readonly skillLoad: SkillLoad;
@@ -234,6 +265,8 @@ export type ToolDescriptor = {
    * adapter for. `'unknown'`: where it keeps them is unknown.
    */
   readonly sessions: readonly [StoredSessionPlatform, ...StoredSessionPlatform[]] | 'none' | 'unknown';
+  /** Data only: nothing reads it but the support page (`tool-support.ts`). */
+  readonly features: ToolFeatures;
 };
 
 const UNKNOWN_READS = { user: 'unknown', project: 'unknown' } as const;
@@ -284,6 +317,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.claude/settings.json', evidence: 'verified' }] }, self: { channel: 'settings', format: 'claude', reads: [{ base: 'project', path: '.claude/settings.json', when: 'workspaceUnder', evidence: 'verified' }, { base: 'project', path: '.claude/settings.local.json', when: 'workspaceUnder', evidence: 'verified' }] } },
     sessions: ['claude-code'],
+    features: {
+      env: '✓t',
+      workflows: '✓v',
+      recall: '✓v',
+      stats: '✓v',
+      aiBackend: '✓v',
+      votesJudge: '✓v',
+      agentHooks: '✓v',
+    },
   },
   codex: {
     home: { dir: '.codex' },
@@ -312,6 +354,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'codex', reads: [{ base: 'home', path: '.codex/hooks.json', evidence: 'verified' }] }, self: { channel: 'settings', format: 'codex', reads: [{ base: 'project', path: '.codex/hooks.json', when: 'workspaceUnder', evidence: 'verified' }] } },
     sessions: ['codex'],
+    features: {
+      env: '✓t',
+      workflows: '✓t',
+      recall: '✓v',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '✓v',
+      votesJudge: { cell: '✓t', note: '#1374 judges the reply in its Stop payload; not rerun' },
+      agentHooks: { cell: '✓t', note: '#1224 runs the Codex trust pass; not rerun' },
+    },
   },
   'codex-internal': {
     home: { dir: '.codex-internal' },
@@ -327,6 +378,15 @@ export const TOOLS = {
     mcp: UNKNOWN,
     hooks: { user: { channel: 'settings', format: 'codex', reads: [{ base: 'home', path: '.codex-internal/hooks.json', evidence: 'assumed' }] }, self: { channel: 'settings', format: 'codex', reads: 'unknown' } },
     sessions: ['codex-internal'],
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '✓t',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   'claude-internal': {
     home: { dir: '.claude-internal' },
@@ -338,6 +398,15 @@ export const TOOLS = {
     mcp: UNKNOWN,
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.claude-internal/settings.json', evidence: 'assumed' }] }, self: { channel: 'settings', format: 'claude', reads: 'unknown' } },
     sessions: ['claude-internal'],
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '✓t',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   tclaude: {
     home: { dir: '.tclaude' },
@@ -352,6 +421,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.tclaude/settings.json', evidence: 'assumed' }] }, self: { channel: 'settings', format: 'claude', reads: 'unknown' } },
     sessions: ['tclaude'],
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '✓t',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   tcodex: {
     home: { dir: '.tcodex' },
@@ -367,6 +445,15 @@ export const TOOLS = {
     mcp: UNKNOWN,
     hooks: { user: { channel: 'settings', format: 'codex', reads: [{ base: 'home', path: '.tcodex/hooks.json', evidence: 'assumed' }] }, self: { channel: 'settings', format: 'codex', reads: 'unknown' } },
     sessions: ['tcodex'],
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '✓t',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   // Cursor reads `<ancestor>/.cursor/rules` walking up from the workspace (cursor-user-rules.ts).
   cursor: {
@@ -400,6 +487,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'cursor', reads: [{ base: 'home', path: '.cursor/hooks.json', evidence: 'source' }] }, self: { channel: 'settings', format: 'cursor', reads: [{ base: 'project', path: '.cursor/hooks.json', when: 'workspaceUnder', evidence: 'source' }] } },
     sessions: ['cursor'],
+    features: {
+      env: '?',
+      workflows: { cell: '+s', note: 'Cursor IDE: —' },
+      recall: { cell: '✗v', note: 'Cursor IDE: ✓v' },
+      stats: { cell: '✓v', note: 'Cursor IDE: ✓t' },
+      aiBackend: '+s',
+      votesJudge: '+s',
+      agentHooks: { cell: '+t', note: 'teamai refuses agent hooks in the Cursor hook format' },
+    },
   },
   copilot: {
     home: { dir: '.copilot', moves: { by: [{ kind: 'env', name: 'COPILOT_HOME', evidence: 'verified' }] } },
@@ -434,6 +530,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'copilot', reads: [{ base: 'home', path: '.copilot/hooks/teamai.json', evidence: 'source' }] }, self: { channel: 'settings', format: 'copilot', reads: [{ base: 'project', path: '.github/hooks/teamai.json', when: 'workspaceUnder', evidence: 'source' }] } },
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '+s',
+      recall: '✓v',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '+s',
+      votesJudge: '?',
+      agentHooks: '—t',
+    },
   },
   joycode: {
     home: { dir: '.joycode' },
@@ -452,6 +557,15 @@ export const TOOLS = {
     mcp: NONE,
     hooks: { user: 'none', self: 'none' },
     sessions: 'unknown',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '◐s',
+      stats: '?',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   qoder: {
     home: { dir: '.qoder' },
@@ -474,6 +588,15 @@ export const TOOLS = {
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.qoder/settings.json', evidence: 'source' }] }, self: { channel: 'settings', format: 'claude', reads: [{ base: 'project', path: '.qoder/settings.json', when: 'cwdOnly', evidence: 'source' }] } },
     // Qoder CLI 1.1.78: <id>.jsonl under ~/.qoder/projects/<cwd>, moved by QODER_CONFIG_DIR.
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '◐s',
+      stats: '✓s',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '✓s',
+    },
   },
   'qoder-cn': {
     home: { dir: '.qoder-cn' },
@@ -496,6 +619,15 @@ export const TOOLS = {
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.qoder-cn/settings.json', evidence: 'source' }] }, self: { channel: 'settings', format: 'claude', reads: [{ base: 'project', path: '.qoder/settings.json', when: 'cwdOnly', evidence: 'source' }] } },
     // Qoder CN: the same layout under ~/.qoder-cn, moved by the QODERCN_ variables.
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '◐s',
+      stats: '✓s',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: { cell: '✓t', note: '#1224 writes ~/.qoder-cn/settings.json; not rerun' },
+    },
   },
   kiro: {
     home: { dir: '.kiro' },
@@ -518,6 +650,15 @@ export const TOOLS = {
     hooks: { user: { channel: 'adapter', adapter: 'kiro-hooks', evidence: 'docs' }, self: 'user' },
     // Kiro CLI docs: sessions under ~/.kiro, moved by KIRO_HOME.
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '◐d',
+      stats: '?',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   // Trae keeps user MCP servers in its app-support directory, which teamai does not write.
   trae: {
@@ -538,6 +679,15 @@ export const TOOLS = {
     hooks: { user: 'unknown', self: 'unknown' },
     // Trae docs: chat history in the IDE's ModularData database, which no variable moves.
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   'trae-cn': {
     home: { dir: '.trae-cn' },
@@ -557,6 +707,15 @@ export const TOOLS = {
     hooks: { user: 'unknown', self: 'unknown' },
     // Trae CN docs: the same database under Trae CN's application data.
     sessions: 'none',
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '?',
+      stats: '?',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   // ZCode 3.16.2 source; 3.15.1 not certified. Its CLI runs only user-level hooks, and reads servers under `mcp.servers` of its own config files.
   zcode: {
@@ -583,6 +742,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'zcode', reads: [{ base: 'home', path: '.zcode/cli/config.json', evidence: 'source' }] }, self: 'user' },
     sessions: 'none',
+    features: {
+      env: '✓t',
+      workflows: '+s',
+      recall: '✓s',
+      stats: '✓s',
+      aiBackend: '+s',
+      votesJudge: { cell: '✓t', note: '#1374 judges the reply in its Stop payload; not rerun' },
+      agentHooks: { cell: '+t', note: 'refused until teamai writes the hooks.events shape (#1224)' },
+    },
   },
   // Extensions capture the installed Node/CLI launcher instead of depending on the host PATH.
   omp: {
@@ -610,6 +778,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'adapter', adapter: 'omp-extension', evidence: 'verified' }, self: 'user' },
     sessions: 'none',
+    features: {
+      env: '✓s',
+      workflows: '+s',
+      recall: '✓v',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '+s',
+      votesJudge: '?',
+      agentHooks: '—t',
+    },
   },
   pi: {
     home: { dir: '.pi', moves: { root: '.pi/agent', by: [{ kind: 'env', name: 'PI_CODING_AGENT_DIR', evidence: 'verified' }], defaultHomeLeftovers: true } },
@@ -635,6 +812,15 @@ export const TOOLS = {
     hooks: { user: { channel: 'adapter', adapter: 'pi-extension', evidence: 'verified' }, self: 'user' },
     // Pi 0.99: <ts>_<uuid>.jsonl under ~/.pi/agent/sessions/<cwd>, moved by PI_CODING_AGENT_SESSION_DIR or PI_CODING_AGENT_DIR.
     sessions: 'none',
+    features: {
+      env: '✓s',
+      workflows: '+v',
+      recall: '✓v',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '+v',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   // Model switching follows the same recorded home for models.json.
   // The CodeBuddy IDE sends `skill` (src/utils/tool-names.ts). CODEBUDDY_CONFIG_DIR replaces ~/.codebuddy, and ~/.codebuddy.json moves into it.
@@ -672,6 +858,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.codebuddy/settings.json', evidence: 'source' }] }, self: { channel: 'settings', format: 'claude', reads: [{ base: 'project', path: '.codebuddy/settings.json', when: 'cwdOnly', evidence: 'source' }] } },
     sessions: ['codebuddy'],
+    features: {
+      env: '?',
+      workflows: '+t',
+      recall: '✓s',
+      stats: '✓v',
+      aiBackend: '?',
+      votesJudge: '+v',
+      agentHooks: '✓s',
+    },
   },
   // Hermes (`skill_view`) and OpenClaw (`skills_read`) have skill tools, but teamai installs no post-tool-use hook for them yet.
   // OpenClaw's skills sit in its workspace.
@@ -695,6 +890,15 @@ export const TOOLS = {
     hooks: { user: { channel: 'adapter', adapter: 'openclaw-hook', evidence: 'verified' }, self: 'user' },
     // OpenClaw 2026.10: rows in ~/.openclaw/agents/<id>/agent/openclaw-agent.sqlite, moved by OPENCLAW_STATE_DIR.
     sessions: 'none',
+    features: {
+      env: '◐d',
+      workflows: '+d',
+      recall: '✓s',
+      stats: '+s',
+      aiBackend: { cell: '✓t', note: 'runs `openclaw agent --message`; each call leaves a session behind (#1308)' },
+      votesJudge: '—t',
+      agentHooks: '◐s',
+    },
   },
   // hermes_constants.py: HERMES_HOME, else %LOCALAPPDATA%\hermes on Windows, else ~/.hermes. Hermes reads it in either scope.
   hermes: {
@@ -718,6 +922,15 @@ export const TOOLS = {
     mcp: NONE,
     hooks: { user: { channel: 'adapter', adapter: 'hermes-plugin', evidence: 'verified' }, self: 'user' },
     sessions: 'none',
+    features: {
+      env: '◐s',
+      workflows: '+s',
+      recall: '✓v',
+      stats: '+s',
+      aiBackend: '+s',
+      votesJudge: '—t',
+      agentHooks: { cell: '✓t', note: '#1224 maps the events to Hermes\'s; not rerun' },
+    },
   },
   dsh: {
     home: { dir: '.dsh', moves: { by: [{ kind: 'env', name: 'DSH_HOME', evidence: 'source' }] } },
@@ -735,6 +948,15 @@ export const TOOLS = {
     mcp: NONE,
     hooks: { user: { channel: 'adapter', adapter: 'dsh-hooks', evidence: 'source' }, self: 'user' },
     sessions: 'none',
+    features: {
+      env: '✗s',
+      workflows: '+s',
+      recall: '✓s',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '+s',
+      votesJudge: '?',
+      agentHooks: '—t',
+    },
   },
   // CodeBuddy engine 2.168.0; the WorkBuddy launcher's binding of ~/.workbuddy is not certified.
   workbuddy: {
@@ -773,6 +995,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'settings', format: 'claude', reads: [{ base: 'home', path: '.workbuddy/settings.json', evidence: 'assumed' }] }, self: { channel: 'settings', format: 'claude', reads: 'unknown' } },
     sessions: ['workbuddy'],
+    features: {
+      env: '?',
+      workflows: '?',
+      recall: '✓t',
+      stats: '?',
+      aiBackend: '?',
+      votesJudge: '?',
+      agentHooks: '?',
+    },
   },
   // opencode v2.1.1 Global.Path: OPENCODE_CONFIG_DIR, else (XDG_CONFIG_HOME || ~/.config)/opencode.
   opencode: {
@@ -826,6 +1057,15 @@ export const TOOLS = {
     },
     hooks: { user: { channel: 'adapter', adapter: 'opencode-plugin', evidence: 'source' }, self: 'user' },
     sessions: ['opencode'],
+    features: {
+      env: '?',
+      workflows: '✓t',
+      recall: '✓v',
+      stats: { cell: '✓t', note: 'A1 (#1245) records its skill loads; not rerun' },
+      aiBackend: '+v',
+      votesJudge: '?',
+      agentHooks: '◐t',
+    },
   },
   // muse-bin 1.4.11: $XDG_CONFIG_HOME/muse, else ~/.config/muse; with XDG_CONFIG_HOME set, ~/.config/muse is never read.
   muse: {
@@ -859,6 +1099,15 @@ export const TOOLS = {
     // Muse takes Codex's hook shape: it drops a group carrying any key but `matcher` and `hooks`, so Claude's described groups never reach it.
     hooks: { user: { channel: 'settings', format: 'codex', reads: [{ base: 'home', path: '.config/muse/settings.json', evidence: 'verified' }] }, self: { channel: 'settings', format: 'codex', reads: [{ base: 'project', path: '.muse/hooks.json', when: 'workspaceUnder', evidence: 'verified' }] } },
     sessions: 'none',
+    features: {
+      env: '✓t',
+      workflows: '+v',
+      recall: '✓t',
+      stats: '✓v',
+      aiBackend: '+v',
+      votesJudge: { cell: '✓t', note: '#1374 judges the reply in its Stop payload; not rerun' },
+      agentHooks: { cell: '✓t', note: '#1224 writes them to settings.json; not rerun' },
+    },
   },
 } as const satisfies Record<ToolId, ToolDescriptor>;
 
